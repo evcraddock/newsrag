@@ -35,5 +35,9 @@ htmlcov/
 # Type checking
 .mypy_cache/
 
+# Local runtime data
+.newsrag/
+.overmind.sock
+
 # AI agent config
 .claude/
