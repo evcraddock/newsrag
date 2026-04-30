@@ -1,0 +1,40 @@
+[project]
+name = "newsrag"
+version = "0.1.0"
+description = "Local-first CLI evidence retrieval tool for city hall PDFs with OCR, hybrid search, and cited Markdown source packets."
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18.0",
+    "pytest>=9.0.0",
+    "ruff>=0.14.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.coverage.run]
+source = ["newsrag"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
