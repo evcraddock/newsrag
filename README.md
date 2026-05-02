@@ -2,27 +2,36 @@
 
 Local-first CLI evidence retrieval tool for city hall PDFs with OCR, hybrid search, and cited Markdown source packets.
 
-## Prerequisites
+## Development prerequisites
 
-- Python 3.11+
+NewsRAG uses a local-first stack:
+- SQLite with FTS5 for metadata and keyword search
+- LanceDB for vector search
+- OCRmyPDF, Tesseract, Ghostscript, and qpdf for OCR normalization
+- Ollama with `nomic-embed-text` for local embeddings
+- Overmind for `make dev`
+
+The default development path does not require Docker or `compose.yaml` because SQLite and LanceDB are embedded/local.
+
+For the full macOS setup, installation commands, and validation steps, see [docs/development.md](docs/development.md).
 
 ## Installation
 
 ```bash
-uv sync
+uv sync --dev
 ```
 
-## How to Work on This Project
+## How to work on this project
 
-### Start the Dev Environment
+### Start the dev environment
 
 ```bash
 make dev
 ```
 
-This starts all services defined in `Procfile.dev`. The command returns immediately (daemonized).
+This starts all processes defined in `Procfile.dev`. Right now the Procfile runs a placeholder long-lived process until `newsrag daemon run` exists.
 
-### View Logs
+### View logs
 
 ```bash
 # Stream all logs (Ctrl+C to stop)
@@ -32,39 +41,39 @@ make dev-logs
 make dev-tail
 ```
 
-### Check Status
+### Check status
 
 ```bash
 make dev-status
 ```
 
-### Stop the Dev Environment
+### Stop the dev environment
 
 ```bash
 make dev-stop
 ```
 
-### Run Tests and Linting
+### Run verification
 
 ```bash
 make check
 ```
 
-### Before Opening a PR
+### Before opening a PR
 
 ```bash
 make pre-pr
 ```
 
-### Available Make Commands
+### Available Make commands
 
 ```bash
 make help
 ```
 
-## Dev Environment Setup
+## Environment configuration
 
-If `make dev` fails, the dev environment needs configuration. See the Set up dev environment (`task-0698bed3`) task for details on configuring `Procfile.dev` and any required services.
+Copy `.env.example` to `.env` and adjust values as needed for your local corpus path, config path, and embedding provider settings.
 
 ## License
 
