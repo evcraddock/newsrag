@@ -21,6 +21,13 @@ For the full macOS setup, installation commands, and validation steps, see [docs
 uv sync --dev
 ```
 
+## CLI quick start
+
+```bash
+uv run newsrag --help
+uv run newsrag doctor
+```
+
 ## How to work on this project
 
 ### Start the dev environment
