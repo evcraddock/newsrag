@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from newsrag.config import AppConfig, RuntimeSettings
+from newsrag.config import AppConfig, EmbeddingConfig, RuntimeSettings
 from newsrag.doctor import DoctorCheck, DoctorReport, format_report, run_doctor
 
 
@@ -59,17 +59,15 @@ def test_run_doctor_handles_malformed_ollama_response(
         data_dir=tmp_path / ".newsrag",
         config=AppConfig(
             source_path=tmp_path / "config.yaml",
-            embedding_provider="ollama",
+            embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text"),
         ),
     )
 
-    def fake_get(url: str, timeout: float) -> httpx.Response:
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
         request = httpx.Request("GET", url)
-        response = httpx.Response(200, request=request, content=b"not-json")
-        return response
+        return httpx.Response(200, request=request, content=b"not-json")
 
     monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
-    monkeypatch.setattr("newsrag.doctor.shutil.which", lambda command: f"/usr/bin/{command}")
 
     report = run_doctor(settings)
 
@@ -78,20 +76,69 @@ def test_run_doctor_handles_malformed_ollama_response(
     assert "malformed JSON" in embedding_check.detail
 
 
-def test_run_doctor_checks_generic_openai_compatible_provider(tmp_path: Path) -> None:
+def test_run_doctor_checks_generic_openai_compatible_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = RuntimeSettings(
         config_path=tmp_path / "config.yaml",
         data_dir=tmp_path / ".newsrag",
         config=AppConfig(
             source_path=tmp_path / "config.yaml",
-            embedding_provider="openai_compatible",
-            embedding_base_url="http://localhost:1234/v1",
-            embedding_model="text-embedding-3-small",
+            embedding=EmbeddingConfig(
+                provider="openai_compatible",
+                base_url="http://localhost:1234/v1",
+                model="text-embedding-3-small",
+            ),
         ),
     )
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        request = httpx.Request("GET", url, headers=headers)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"data": [{"id": "text-embedding-3-small"}]},
+        )
+
+    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
 
     report = run_doctor(settings)
 
     embedding_check = next(check for check in report.checks if check.name == "embedding")
     assert embedding_check.status == "ok"
     assert "provider=openai_compatible" in embedding_check.detail
+
+
+def test_run_doctor_checks_ollama_provider_when_selected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RuntimeSettings(
+        config_path=tmp_path / "config.yaml",
+        data_dir=tmp_path / ".newsrag",
+        config=AppConfig(
+            source_path=tmp_path / "config.yaml",
+            embedding=EmbeddingConfig(
+                provider="ollama",
+                base_url="http://127.0.0.1:11434",
+                model="nomic-embed-text",
+            ),
+        ),
+    )
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"models": [{"name": "nomic-embed-text:latest"}]},
+        )
+
+    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "ok"
+    assert "provider=ollama" in embedding_check.detail

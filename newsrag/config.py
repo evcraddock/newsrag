@@ -8,8 +8,6 @@ import yaml
 
 DEFAULT_CONFIG_PATH = Path("~/.config/newsrag/config.yaml").expanduser()
 DEFAULT_DATA_DIR_NAME = ".newsrag"
-DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
 
 
 class ConfigError(Exception):
@@ -17,11 +15,13 @@ class ConfigError(Exception):
 
 
 @dataclass(frozen=True)
-class OllamaConfig:
-    """Settings for the local Ollama embedding provider."""
+class EmbeddingConfig:
+    """Embedding provider configuration."""
 
-    host: str = DEFAULT_OLLAMA_HOST
-    model: str = DEFAULT_OLLAMA_MODEL
+    provider: str | None = None
+    base_url: str | None = None
+    model: str | None = None
+    api_key_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -37,11 +37,7 @@ class AppConfig:
 
     source_path: Path
     data_dir: Path | None = None
-    embedding_provider: str | None = None
-    embedding_base_url: str | None = None
-    embedding_model: str | None = None
-    embedding_api_key_env: str | None = None
-    ollama: OllamaConfig = OllamaConfig()
+    embedding: EmbeddingConfig = EmbeddingConfig()
     daemon: DaemonConfig = DaemonConfig()
 
 
@@ -88,28 +84,10 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     else:
         raise ConfigError(f"Config file {resolved_path} must contain a top-level mapping.")
 
-    embedding_data = _mapping_value(data, "embedding", default={})
-
     return AppConfig(
         source_path=resolved_path,
         data_dir=_optional_path(data.get("data_dir"), field_name="data_dir"),
-        embedding_provider=_optional_string(
-            embedding_data.get("provider"),
-            field_name="embedding.provider",
-        ),
-        embedding_base_url=_optional_string(
-            embedding_data.get("base_url"),
-            field_name="embedding.base_url",
-        ),
-        embedding_model=_optional_string(
-            embedding_data.get("model"),
-            field_name="embedding.model",
-        ),
-        embedding_api_key_env=_optional_string(
-            embedding_data.get("api_key_env"),
-            field_name="embedding.api_key_env",
-        ),
-        ollama=_load_ollama_config(embedding_data),
+        embedding=_load_embedding_config(_mapping_value(data, "embedding", default={})),
         daemon=_load_daemon_config(_mapping_value(data, "daemon", default={})),
     )
 
@@ -154,13 +132,15 @@ def resolve_runtime_settings(
     )
 
 
-def _load_ollama_config(embedding_data: Mapping[str, object]) -> OllamaConfig:
-    ollama_data = _mapping_value(embedding_data, "ollama", default={})
-    return OllamaConfig(
-        host=_optional_string(ollama_data.get("host"), field_name="embedding.ollama.host")
-        or DEFAULT_OLLAMA_HOST,
-        model=_optional_string(ollama_data.get("model"), field_name="embedding.ollama.model")
-        or DEFAULT_OLLAMA_MODEL,
+def _load_embedding_config(embedding_data: Mapping[str, object]) -> EmbeddingConfig:
+    return EmbeddingConfig(
+        provider=_optional_string(embedding_data.get("provider"), field_name="embedding.provider"),
+        base_url=_optional_string(embedding_data.get("base_url"), field_name="embedding.base_url"),
+        model=_optional_string(embedding_data.get("model"), field_name="embedding.model"),
+        api_key_env=_optional_string(
+            embedding_data.get("api_key_env"),
+            field_name="embedding.api_key_env",
+        ),
     )
 
 
