@@ -31,6 +31,18 @@ class DoctorReport:
     def has_errors(self) -> bool:
         return any(check.status == "error" for check in self.checks)
 
+    @property
+    def has_warnings(self) -> bool:
+        return any(check.status == "warn" for check in self.checks)
+
+    @property
+    def summary(self) -> str:
+        if self.has_errors:
+            return "error"
+        if self.has_warnings:
+            return "warn"
+        return "ok"
+
 
 def run_doctor(
     settings: RuntimeSettings,
@@ -61,8 +73,7 @@ def format_report(report: DoctorReport, *, settings: RuntimeSettings) -> str:
     for check in report.checks:
         lines.append(f"{check.name}: {check.status} - {check.detail}")
 
-    summary = "error" if report.has_errors else "ok"
-    lines.append(f"summary: {summary}")
+    lines.append(f"summary: {report.summary}")
     return "\n".join(lines)
 
 
@@ -109,15 +120,23 @@ def _command_check(name: str, command: str) -> DoctorCheck:
 
 
 def _embedding_check(config: AppConfig, *, timeout_seconds: float) -> DoctorCheck:
-    provider = config.embedding_provider.lower()
-    if provider == "ollama":
+    provider = config.embedding_provider
+    if provider is None:
+        return DoctorCheck(
+            "embedding",
+            "warn",
+            "no embedding provider configured",
+        )
+
+    normalized_provider = provider.lower()
+    if normalized_provider == "ollama":
         return _ollama_check(config, timeout_seconds=timeout_seconds)
-    if provider == "openai":
-        return _openai_check()
+    if normalized_provider in {"openai", "openai_compatible"}:
+        return _openai_compatible_check(config)
     return DoctorCheck(
         "embedding",
         "error",
-        f"unsupported provider '{config.embedding_provider}'",
+        f"unsupported provider '{provider}'",
     )
 
 
@@ -144,6 +163,12 @@ def _ollama_check(config: AppConfig, *, timeout_seconds: float) -> DoctorCheck:
                 f"{config.ollama.host}; start Ollama and run 'ollama pull {config.ollama.model}'"
             ),
         )
+    except ValueError:
+        return DoctorCheck(
+            "embedding",
+            "warn",
+            f"provider=ollama returned malformed JSON from {config.ollama.host}",
+        )
 
     model_names = _extract_ollama_model_names(payload)
     if _ollama_model_available(config.ollama.model, model_names):
@@ -163,13 +188,34 @@ def _ollama_check(config: AppConfig, *, timeout_seconds: float) -> DoctorCheck:
     )
 
 
-def _openai_check() -> DoctorCheck:
-    if os.getenv("OPENAI_API_KEY"):
-        return DoctorCheck("embedding", "ok", "provider=openai and OPENAI_API_KEY is set")
+def _openai_compatible_check(config: AppConfig) -> DoctorCheck:
+    provider = config.embedding_provider or "openai_compatible"
+    if config.embedding_model is None:
+        return DoctorCheck(
+            "embedding",
+            "warn",
+            f"provider={provider} is configured but embedding.model is missing",
+        )
+
+    api_key_env = config.embedding_api_key_env
+    if api_key_env is not None and not os.getenv(api_key_env):
+        return DoctorCheck(
+            "embedding",
+            "warn",
+            f"provider={provider} expects environment variable {api_key_env}",
+        )
+
+    if config.embedding_base_url is None:
+        return DoctorCheck(
+            "embedding",
+            "ok",
+            f"provider={provider} model={config.embedding_model}",
+        )
+
     return DoctorCheck(
         "embedding",
-        "warn",
-        "provider=openai but OPENAI_API_KEY is not set",
+        "ok",
+        f"provider={provider} base_url={config.embedding_base_url} model={config.embedding_model}",
     )
 
 

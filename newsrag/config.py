@@ -37,7 +37,10 @@ class AppConfig:
 
     source_path: Path
     data_dir: Path | None = None
-    embedding_provider: str = "ollama"
+    embedding_provider: str | None = None
+    embedding_base_url: str | None = None
+    embedding_model: str | None = None
+    embedding_api_key_env: str | None = None
     ollama: OllamaConfig = OllamaConfig()
     daemon: DaemonConfig = DaemonConfig()
 
@@ -85,15 +88,28 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     else:
         raise ConfigError(f"Config file {resolved_path} must contain a top-level mapping.")
 
+    embedding_data = _mapping_value(data, "embedding", default={})
+
     return AppConfig(
         source_path=resolved_path,
         data_dir=_optional_path(data.get("data_dir"), field_name="data_dir"),
         embedding_provider=_optional_string(
-            _mapping_value(data, "embedding", default={}).get("provider"),
+            embedding_data.get("provider"),
             field_name="embedding.provider",
-        )
-        or "ollama",
-        ollama=_load_ollama_config(_mapping_value(data, "embedding", default={})),
+        ),
+        embedding_base_url=_optional_string(
+            embedding_data.get("base_url"),
+            field_name="embedding.base_url",
+        ),
+        embedding_model=_optional_string(
+            embedding_data.get("model"),
+            field_name="embedding.model",
+        ),
+        embedding_api_key_env=_optional_string(
+            embedding_data.get("api_key_env"),
+            field_name="embedding.api_key_env",
+        ),
+        ollama=_load_ollama_config(embedding_data),
         daemon=_load_daemon_config(_mapping_value(data, "daemon", default={})),
     )
 

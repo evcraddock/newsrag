@@ -5,7 +5,14 @@ from pathlib import Path
 
 import typer
 
-from newsrag.config import AppConfig, ConfigError, RuntimeSettings, load_config, resolve_data_dir
+from newsrag.config import (
+    DEFAULT_CONFIG_PATH,
+    AppConfig,
+    ConfigError,
+    RuntimeSettings,
+    load_config,
+    resolve_data_dir,
+)
 from newsrag.doctor import format_report, run_doctor
 
 CONFIG_PATH_OPTION = typer.Option(
@@ -43,7 +50,7 @@ def main(
     """Run NewsRAG commands."""
 
     ctx.obj = CliState(
-        config_path=(config_path or Path("~/.config/newsrag/config.yaml")).expanduser(),
+        config_path=(config_path or DEFAULT_CONFIG_PATH).expanduser(),
         data_dir=data_dir,
     )
 
@@ -84,6 +91,6 @@ def _get_state(ctx: typer.Context) -> CliState:
     if isinstance(state, CliState):
         return state
     return CliState(
-        config_path=Path("~/.config/newsrag/config.yaml").expanduser(),
+        config_path=DEFAULT_CONFIG_PATH,
         data_dir=None,
     )

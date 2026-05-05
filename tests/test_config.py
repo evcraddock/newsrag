@@ -30,9 +30,32 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
 
     assert config.source_path == config_path
     assert config.data_dir is None
-    assert config.embedding_provider == "ollama"
+    assert config.embedding_provider is None
+    assert config.embedding_base_url is None
+    assert config.embedding_model is None
     assert config.ollama.host == "http://127.0.0.1:11434"
     assert config.ollama.model == "nomic-embed-text"
+
+
+def test_load_config_reads_generic_embedding_provider(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+embedding:
+  provider: openai_compatible
+  base_url: http://localhost:1234/v1
+  model: text-embedding-3-small
+  api_key_env: OPENAI_API_KEY
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.embedding_provider == "openai_compatible"
+    assert config.embedding_base_url == "http://localhost:1234/v1"
+    assert config.embedding_model == "text-embedding-3-small"
+    assert config.embedding_api_key_env == "OPENAI_API_KEY"
 
 
 def test_load_config_invalid_yaml_raises(tmp_path: Path) -> None:
