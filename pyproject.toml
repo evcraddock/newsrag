@@ -14,11 +14,15 @@ dependencies = [
     "watchfiles",
 ]
 
+[project.scripts]
+newsrag = "newsrag.cli:run"
+
 [dependency-groups]
 dev = [
     "mypy>=1.18.0",
     "pytest>=9.0.0",
     "ruff>=0.14.0",
+    "types-pyyaml>=6.0.12.20250915",
 ]
 
 [build-system]
