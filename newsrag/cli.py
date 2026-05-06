@@ -14,6 +14,12 @@ from newsrag.config import (
     resolve_data_dir,
 )
 from newsrag.doctor import format_report, run_doctor
+from newsrag.storage import (
+    StorageError,
+    format_status_report,
+    get_storage_status,
+    initialize_storage,
+)
 
 CONFIG_PATH_OPTION = typer.Option(
     None,
@@ -59,6 +65,52 @@ def main(
 def doctor(ctx: typer.Context) -> None:
     """Validate the local NewsRAG environment and configuration."""
 
+    settings, config_error = _resolve_runtime_settings(ctx)
+    report = run_doctor(settings, config_error=config_error)
+    typer.echo(format_report(report, settings=settings))
+
+    if report.has_errors:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def status(
+    ctx: typer.Context,
+    initialize: bool = typer.Option(
+        False,
+        "--initialize",
+        help="Create the storage layout before reporting status.",
+    ),
+) -> None:
+    """Report storage layout health for the active data directory."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+
+    if initialize:
+        try:
+            initialize_storage(settings.data_dir)
+        except StorageError as exc:
+            typer.echo(
+                format_status_report(
+                    get_storage_status(settings.data_dir), data_dir=settings.data_dir
+                )
+            )
+            raise typer.Exit(code=1) from exc
+
+    report = get_storage_status(settings.data_dir)
+    typer.echo(format_status_report(report, data_dir=settings.data_dir))
+
+    if report.has_errors:
+        raise typer.Exit(code=1)
+
+
+def run() -> None:
+    """Run the Typer application."""
+
+    app()
+
+
+def _resolve_runtime_settings(ctx: typer.Context) -> tuple[RuntimeSettings, str | None]:
     state = _get_state(ctx)
     config_error: str | None = None
 
@@ -73,17 +125,7 @@ def doctor(ctx: typer.Context) -> None:
         data_dir=resolve_data_dir(state.data_dir, config),
         config=config,
     )
-    report = run_doctor(settings, config_error=config_error)
-    typer.echo(format_report(report, settings=settings))
-
-    if report.has_errors:
-        raise typer.Exit(code=1)
-
-
-def run() -> None:
-    """Run the Typer application."""
-
-    app()
+    return settings, config_error
 
 
 def _get_state(ctx: typer.Context) -> CliState:

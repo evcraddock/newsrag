@@ -26,6 +26,7 @@ uv sync --dev
 ```bash
 uv run newsrag --help
 uv run newsrag doctor
+uv run newsrag status --initialize
 ```
 
 ## How to work on this project
