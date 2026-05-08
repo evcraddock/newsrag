@@ -23,6 +23,7 @@ from newsrag.storage import (
     get_storage_status,
     initialize_storage,
 )
+from newsrag.watches import add_watch, list_watches
 
 CONFIG_PATH_OPTION = typer.Option(
     None,
@@ -42,8 +43,10 @@ DATA_DIR_OPTION = typer.Option(
 app = typer.Typer(help="Local-first evidence retrieval for city hall PDFs.")
 daemon_app = typer.Typer(help="Run the NewsRAG background daemon.")
 jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
+watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
+app.add_typer(watch_app, name="watch")
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,65 @@ def jobs_list_command(ctx: typer.Context) -> None:
         if job.error is not None:
             line = f"{line} error={job.error}"
         typer.echo(line)
+
+
+@watch_app.command("add")
+def watch_add_command(
+    ctx: typer.Context,
+    path: Path,
+    body: str | None = typer.Option(None, help="Default civic body for files in this watch."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Default document type for files in this watch.",
+    ),
+    meeting_date_default: str | None = typer.Option(
+        None,
+        "--meeting-date-default",
+        help="Default meeting date metadata for files in this watch.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Default jurisdiction metadata for files in this watch.",
+    ),
+) -> None:
+    """Register one watched folder."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    watch = add_watch(
+        database_path,
+        path=path,
+        metadata={
+            key: value
+            for key, value in {
+                "body": body,
+                "document_type": document_type,
+                "meeting_date_default": meeting_date_default,
+                "jurisdiction": jurisdiction,
+            }.items()
+            if value is not None
+        },
+    )
+    typer.echo(f"Added watch {watch.id} {watch.path}")
+
+
+@watch_app.command("list")
+def watch_list_command(ctx: typer.Context) -> None:
+    """List watched folders."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    watches = list_watches(database_path)
+
+    typer.echo("NewsRAG Watches")
+    typer.echo(f"data_dir: {settings.data_dir}")
+    if not watches:
+        typer.echo("watches: none")
+        return
+
+    for watch in watches:
+        typer.echo(f"{watch.id} {watch.path} metadata={watch.metadata}")
 
 
 def run() -> None:

@@ -72,6 +72,7 @@ REQUIRED_TABLES = {
     "chunks",
     "jobs",
     "watches",
+    "watch_files",
     "metadata",
 }
 SCHEMA_STATEMENTS = (
@@ -128,6 +129,15 @@ SCHEMA_STATEMENTS = (
         path TEXT NOT NULL UNIQUE,
         metadata_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS watch_files (
+        path TEXT PRIMARY KEY,
+        watch_id TEXT NOT NULL,
+        content_signature TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(watch_id) REFERENCES watches(id)
     )
     """,
 )
