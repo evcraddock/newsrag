@@ -62,6 +62,13 @@ class Reranker(Protocol):
         """Return results in reranked order."""
 
 
+class VectorSearcher(Protocol):
+    """Protocol for vector candidate retrieval."""
+
+    def search(self, query_embedding: QueryEmbedding, *, limit: int) -> list[SearchCandidate]:
+        """Return vector candidates for one embedded query."""
+
+
 @dataclass(frozen=True)
 class NoOpReranker:
     """Default reranker hook that preserves result order."""
@@ -113,7 +120,7 @@ class SearchEngine:
     """Hybrid keyword/vector search over one corpus."""
 
     database_path: Path
-    vector_searcher: LanceDbVectorSearcher
+    vector_searcher: VectorSearcher
     embedding_provider: EmbeddingProvider
     reranker: Reranker = NoOpReranker()
     keyword_weight: float = DEFAULT_KEYWORD_WEIGHT
@@ -132,7 +139,10 @@ class SearchEngine:
             limit=limit,
         )
         query_embedding = self.embedding_provider.embed_query(normalized_query)
-        vector_candidates = self.vector_searcher.search(query_embedding, limit=limit)
+        vector_candidates = _filter_vector_candidates(
+            keyword_candidates,
+            self.vector_searcher.search(query_embedding, limit=limit),
+        )
         results = merge_search_candidates(
             keyword_candidates,
             vector_candidates,
@@ -150,7 +160,7 @@ def build_search_engine(
     lancedb_path: Path,
     embedding_config: EmbeddingConfig,
     embedding_provider: EmbeddingProvider | None = None,
-    vector_searcher: LanceDbVectorSearcher | None = None,
+    vector_searcher: VectorSearcher | None = None,
     reranker: Reranker | None = None,
 ) -> SearchEngine:
     """Build the default hybrid search engine for one corpus."""
@@ -165,6 +175,17 @@ def build_search_engine(
         embedding_provider=resolved_embedding_provider,
         reranker=reranker or NoOpReranker(),
     )
+
+
+def _filter_vector_candidates(
+    keyword_candidates: Sequence[SearchCandidate],
+    vector_candidates: Sequence[SearchCandidate],
+) -> list[SearchCandidate]:
+    if not keyword_candidates:
+        return list(vector_candidates)
+
+    keyword_chunk_ids = {candidate.chunk_id for candidate in keyword_candidates}
+    return [candidate for candidate in vector_candidates if candidate.chunk_id in keyword_chunk_ids]
 
 
 def search_keyword_candidates(

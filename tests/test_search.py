@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -42,6 +42,15 @@ class FakeQueryEmbeddingProvider:
         return []
 
 
+@dataclass(frozen=True)
+class FakeVectorSearcher:
+    candidates: list[SearchCandidate] = field(default_factory=list)
+
+    def search(self, query_embedding: QueryEmbedding, *, limit: int) -> list[SearchCandidate]:
+        del query_embedding
+        return self.candidates[:limit]
+
+
 def test_search_over_indexed_chunks_returns_ranked_cited_passages(tmp_path: Path) -> None:
     paths = initialize_storage(tmp_path / ".newsrag")
     _seed_search_corpus(paths)
@@ -55,9 +64,80 @@ def test_search_over_indexed_chunks_returns_ranked_cited_passages(tmp_path: Path
 
     results = engine.search("stormwater downtown")
 
-    assert [result.chunk_id for result in results] == ["chunk-a", "chunk-b"]
+    assert [result.chunk_id for result in results] == ["chunk-a"]
     assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 3"
     assert "downtown stormwater improvements" in results[0].text
+
+
+def test_search_uses_vector_candidates_when_keyword_search_is_empty(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    _seed_search_corpus(paths)
+
+    engine = build_search_engine(
+        database_path=paths.database,
+        lancedb_path=paths.lancedb,
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            [
+                SearchCandidate(
+                    chunk_id="chunk-c",
+                    document_id="document-c",
+                    page_start=2,
+                    page_end=2,
+                    text="zoning map amendments",
+                    title=None,
+                    meeting_date=None,
+                    vector_score=0.2,
+                )
+            ]
+        ),
+    )
+
+    results = engine.search("semantic zoning")
+
+    assert [result.chunk_id for result in results] == ["chunk-c"]
+    assert results[0].citation == "Zoning Packet — 2026-03-15 — p. 2"
+
+
+def test_search_drops_vector_only_candidates_when_keyword_hits_exist(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    _seed_search_corpus(paths)
+
+    engine = build_search_engine(
+        database_path=paths.database,
+        lancedb_path=paths.lancedb,
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            [
+                SearchCandidate(
+                    chunk_id="chunk-a",
+                    document_id="document-a",
+                    page_start=3,
+                    page_end=3,
+                    text="downtown stormwater improvements",
+                    title=None,
+                    meeting_date=None,
+                    vector_score=0.1,
+                ),
+                SearchCandidate(
+                    chunk_id="chunk-c",
+                    document_id="document-c",
+                    page_start=2,
+                    page_end=2,
+                    text="zoning map amendments",
+                    title=None,
+                    meeting_date=None,
+                    vector_score=0.2,
+                ),
+            ]
+        ),
+    )
+
+    results = engine.search("stormwater downtown")
+
+    assert [result.chunk_id for result in results] == ["chunk-a"]
 
 
 def test_unrelated_query_returns_no_results_even_with_indexed_chunks(tmp_path: Path) -> None:
