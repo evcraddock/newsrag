@@ -20,6 +20,7 @@ from newsrag.doctor import format_report, run_doctor
 from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
 from newsrag.jobs import list_jobs
 from newsrag.manifests import ManifestError, load_manifest
+from newsrag.search import SearchError, build_search_engine, format_search_results
 from newsrag.storage import (
     StorageError,
     format_status_report,
@@ -290,6 +291,27 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
     typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
     for job in jobs:
         typer.echo(f"{job.id} {job.payload['path']}")
+
+
+@app.command("search")
+def search_command(ctx: typer.Context, query: str) -> None:
+    """Search indexed evidence passages with hybrid keyword/vector retrieval."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    storage_paths = initialize_storage(settings.data_dir)
+
+    try:
+        engine = build_search_engine(
+            database_path=storage_paths.database,
+            lancedb_path=storage_paths.lancedb,
+            embedding_config=settings.config.embedding,
+        )
+        results = engine.search(query)
+    except SearchError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_search_results(results, query=query))
 
 
 @jobs_app.command("list")

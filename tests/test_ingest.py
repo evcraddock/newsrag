@@ -442,7 +442,8 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert len(pages) == 2
     assert len(chunks) == 2
     assert len(vectors) == 2
-    assert len(embedding_records) == 2
+    assert len(embedding_records) == 4
+    assert {record.source_kind for record in embedding_records} == {"chunk", "passage"}
     assert {record.provider for record in embedding_records} == {"ollama"}
     assert {vector["document_id"] for vector in vectors} == {documents[0].id}
 
@@ -487,7 +488,7 @@ def test_reingesting_unchanged_pdf_does_not_duplicate_records(tmp_path: Path) ->
     assert len(list_pages(paths.database)) == 1
     assert len(list_chunks(paths.database)) == 1
     assert len(list_chunk_vectors(paths.lancedb)) == 1
-    assert len(list_embedding_records(paths.database)) == 1
+    assert len(list_embedding_records(paths.database)) == 2
 
 
 def test_ingest_failures_are_recorded_with_context(tmp_path: Path) -> None:

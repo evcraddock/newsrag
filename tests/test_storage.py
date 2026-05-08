@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,56 @@ def test_initialize_storage_is_idempotent(tmp_path: Path) -> None:
 
     assert first_paths == second_paths
     assert REQUIRED_TABLES == REQUIRED_TABLES.intersection(_existing_tables(second_paths.database))
+
+
+def test_initialize_storage_backfills_passages_from_existing_chunks(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO documents(id, source_path, title, source_hash, normalized_path, metadata_json)
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "document-1",
+                "/tmp/report.pdf",
+                "Report",
+                "hash-1",
+                "/tmp/report-ocr.pdf",
+                "{}",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks(id, document_id, page_start, page_end, text)
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                "chunk-1",
+                "document-1",
+                10,
+                10,
+                "City Manager's Report\nMay 1, 2026\nPage 10 of 16\n\n• Paperbacks & Playdates Book Club – A low-pressure book club.\n\n• Brown Bag Book Club – Bring your own lunch.",
+            ),
+        )
+        connection.commit()
+
+    initialize_storage(data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        passage_rows = connection.execute(
+            "SELECT id, text FROM passages ORDER BY ordinal ASC"
+        ).fetchall()
+        fts_rows = connection.execute(
+            "SELECT passage_id, text FROM passages_fts ORDER BY passage_id ASC"
+        ).fetchall()
+
+    assert len(passage_rows) == 2
+    assert "Paperbacks & Playdates Book Club" in passage_rows[0][1]
+    assert "Brown Bag Book Club" in passage_rows[1][1]
+    assert len(fts_rows) == 2
 
 
 def test_initialize_storage_rejects_file_path(tmp_path: Path) -> None:
