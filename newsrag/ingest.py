@@ -9,10 +9,13 @@ import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import unquote, urlparse
 
 import fitz  # type: ignore[import-untyped]
+import httpx
 import lancedb  # type: ignore[import-untyped]
 
 from newsrag.config import EmbeddingConfig
@@ -30,6 +33,7 @@ INGEST_JOB_KIND = "ingest-file"
 DEFAULT_EMBEDDING_PROVIDER = "ollama"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 VECTOR_TABLE_NAME = "chunk_embeddings"
 
 
@@ -104,6 +108,23 @@ class ChunkVectorRecord:
     metadata: EmbeddingMetadata
 
 
+@dataclass(frozen=True)
+class DownloadedPdf:
+    """One downloaded direct-PDF artifact."""
+
+    path: Path
+    source_url: str
+    retrieved_at: str
+    content_hash: str
+
+
+class PdfDownloader(Protocol):
+    """Protocol for direct PDF downloads."""
+
+    def download_pdf(self, url: str, destination_dir: Path) -> DownloadedPdf:
+        """Download one direct PDF into the corpus data directory."""
+
+
 class OcrRunner(Protocol):
     """Protocol for OCR normalization."""
 
@@ -130,6 +151,38 @@ class VectorStore(Protocol):
 
     def add_chunks(self, chunks: Sequence[ChunkVectorRecord]) -> None:
         """Persist embedded chunk vectors."""
+
+
+@dataclass(frozen=True)
+class HttpxPdfDownloader:
+    """Direct-PDF downloader backed by `httpx`."""
+
+    timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
+
+    def download_pdf(self, url: str, destination_dir: Path) -> DownloadedPdf:
+        try:
+            response = httpx.get(url, follow_redirects=True, timeout=self.timeout_seconds)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise IngestError(f"Failed downloading {url}: {exc}") from exc
+
+        content = response.content
+        if not _looks_like_pdf(response.headers.get("Content-Type"), content):
+            raise IngestError(f"URL did not return a PDF-like response: {url}")
+
+        content_hash = _hash_bytes(content)
+        filename = _download_filename(response.url)
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination_path = destination_dir / f"{content_hash}-{filename}"
+        if not destination_path.exists():
+            destination_path.write_bytes(content)
+
+        return DownloadedPdf(
+            path=destination_path,
+            source_url=url,
+            retrieved_at=_current_timestamp(),
+            content_hash=content_hash,
+        )
 
 
 @dataclass(frozen=True)
@@ -270,6 +323,7 @@ class IngestionPipeline:
     def process_job(self, job: Job) -> None:
         source_path = _payload_path(job.payload)
         metadata = _payload_metadata(job.payload)
+        source_url = _metadata_source_url(metadata)
 
         try:
             source_hash = _hash_file(source_path)
@@ -307,6 +361,7 @@ class IngestionPipeline:
                 self.storage_paths.database,
                 document_id=document_id,
                 source_path=source_path,
+                source_url=source_url,
                 title=_resolve_document_title(metadata, source_path),
                 source_hash=source_hash,
                 normalized_path=normalized_path,
@@ -344,6 +399,33 @@ def enqueue_ingest_jobs(
             )
         )
     return jobs
+
+
+def enqueue_ingest_url_job(
+    database_path: Path,
+    *,
+    storage_paths: StoragePaths,
+    url: str,
+    metadata: dict[str, Any] | None = None,
+    downloader: PdfDownloader | None = None,
+) -> Job:
+    """Download one direct PDF URL and enqueue it for ingestion."""
+
+    resolved_downloader = downloader or HttpxPdfDownloader()
+    downloaded_pdf = resolved_downloader.download_pdf(url, storage_paths.downloaded_pdfs)
+    payload_metadata = dict(metadata or {})
+    payload_metadata["source_url"] = downloaded_pdf.source_url
+    payload_metadata["retrieved_at"] = downloaded_pdf.retrieved_at
+
+    return create_job(
+        database_path,
+        kind=INGEST_JOB_KIND,
+        payload={
+            "path": str(downloaded_pdf.path),
+            "metadata": payload_metadata,
+            "source": "ingest-url",
+        },
+    )
 
 
 def build_ingest_handler(
@@ -546,12 +628,40 @@ def _payload_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _metadata_source_url(metadata: dict[str, Any]) -> str | None:
+    source_url = metadata.get("source_url")
+    if isinstance(source_url, str) and source_url.strip():
+        return source_url.strip()
+    return None
+
+
+def _hash_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
 def _hash_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as file_handle:
         for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _current_timestamp() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _looks_like_pdf(content_type: str | None, content: bytes) -> bool:
+    normalized_content_type = (content_type or "").lower()
+    return "application/pdf" in normalized_content_type or content.startswith(b"%PDF-")
+
+
+def _download_filename(final_url: httpx.URL) -> str:
+    parsed_path = urlparse(str(final_url)).path
+    candidate_name = Path(unquote(parsed_path)).name or "downloaded.pdf"
+    if not candidate_name.lower().endswith(".pdf"):
+        return f"{candidate_name}.pdf"
+    return candidate_name
 
 
 def _copy_source_pdf(storage_paths: StoragePaths, source_path: Path, source_hash: str) -> Path:
@@ -623,6 +733,7 @@ def _persist_document_bundle(
     *,
     document_id: str,
     source_path: Path,
+    source_url: str | None,
     title: str,
     source_hash: str,
     normalized_path: Path,
@@ -645,11 +756,12 @@ def _persist_document_bundle(
                 normalized_path,
                 metadata_json
             )
-            VALUES(?, ?, NULL, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
                 str(source_path),
+                source_url,
                 title,
                 source_hash,
                 str(normalized_path),

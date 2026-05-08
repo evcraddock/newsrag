@@ -17,7 +17,7 @@ from newsrag.config import (
 )
 from newsrag.daemon import DaemonConfig, run_daemon
 from newsrag.doctor import format_report, run_doctor
-from newsrag.ingest import IngestError, enqueue_ingest_jobs
+from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
 from newsrag.jobs import list_jobs
 from newsrag.storage import (
     StorageError,
@@ -191,17 +191,13 @@ def ingest_command(
 
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
-    metadata = {
-        key: value
-        for key, value in {
-            "title": title,
-            "body": body,
-            "document_type": document_type,
-            "meeting_date": meeting_date,
-            "jurisdiction": jurisdiction,
-        }.items()
-        if value is not None
-    }
+    metadata = _build_document_metadata_options(
+        title=title,
+        body=body,
+        document_type=document_type,
+        meeting_date=meeting_date,
+        jurisdiction=jurisdiction,
+    )
 
     try:
         jobs = enqueue_ingest_jobs(database_path, source_path=path, metadata=metadata)
@@ -212,6 +208,54 @@ def ingest_command(
     typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
     for job in jobs:
         typer.echo(f"{job.id} {job.payload['path']}")
+
+
+@app.command("ingest-url")
+def ingest_url_command(
+    ctx: typer.Context,
+    url: str,
+    title: str | None = typer.Option(None, help="Document title override for the downloaded PDF."),
+    body: str | None = typer.Option(None, help="Civic body metadata for the downloaded PDF."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Document type metadata for the downloaded PDF.",
+    ),
+    meeting_date: str | None = typer.Option(
+        None,
+        "--meeting-date",
+        help="Meeting date metadata for the downloaded PDF.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Jurisdiction metadata for the downloaded PDF.",
+    ),
+) -> None:
+    """Download one direct PDF URL and enqueue it for ingestion."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    storage_paths = initialize_storage(settings.data_dir)
+    metadata = _build_document_metadata_options(
+        title=title,
+        body=body,
+        document_type=document_type,
+        meeting_date=meeting_date,
+        jurisdiction=jurisdiction,
+    )
+
+    try:
+        job = enqueue_ingest_url_job(
+            storage_paths.database,
+            storage_paths=storage_paths,
+            url=url,
+            metadata=metadata,
+        )
+    except IngestError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo("Enqueued 1 ingest job(s)")
+    typer.echo(f"{job.id} {job.payload['path']}")
 
 
 @jobs_app.command("list")
@@ -298,6 +342,27 @@ def run() -> None:
     """Run the Typer application."""
 
     app()
+
+
+def _build_document_metadata_options(
+    *,
+    title: str | None,
+    body: str | None,
+    document_type: str | None,
+    meeting_date: str | None,
+    jurisdiction: str | None,
+) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in {
+            "title": title,
+            "body": body,
+            "document_type": document_type,
+            "meeting_date": meeting_date,
+            "jurisdiction": jurisdiction,
+        }.items()
+        if value is not None
+    }
 
 
 def _resolve_runtime_settings(
