@@ -226,6 +226,35 @@ def test_citation_format_uses_concise_terminal_style() -> None:
     )
 
 
+def test_format_search_results_prefers_matching_paragraph_without_header_noise() -> None:
+    output = format_search_results(
+        [
+            SearchResult(
+                chunk_id="chunk-a",
+                document_id="document-a",
+                page_start=3,
+                page_end=3,
+                text=(
+                    "City Manager's Report\nMay 1, 2026\nPage 3 of 16\n\n"
+                    "Belt Filter Press - Contractors are 95% complete with the replacement of the Belt Filter\n"
+                    "Press at the Sewer Treatment Plant. The previous Belt Filter Press had been in service for\n"
+                    "decades. The new Belt Filter Press is currently undergoing performance testing.\n\n"
+                    "Water Infrastructure Project - Construction continues."
+                ),
+                citation="Budget Packet — 2026-04-20 — p. 1",
+                score=1.0,
+                keyword_score=0.1,
+                vector_score=0.1,
+            )
+        ],
+        query="Belt Filter Press",
+    )
+
+    assert "City Manager's Report" not in output
+    assert "Water Infrastructure Project" not in output
+    assert output.count("Belt Filter Press") >= 3
+
+
 def test_format_search_results_uses_concise_snippets() -> None:
     output = format_search_results(
         [

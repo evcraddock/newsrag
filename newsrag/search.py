@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ DEFAULT_KEYWORD_WEIGHT = 0.5
 DEFAULT_VECTOR_WEIGHT = 0.5
 DEFAULT_MAX_VECTOR_DISTANCE = 1.0
 DEFAULT_SNIPPET_LENGTH = 320
+DEFAULT_PASSAGE_LENGTH = 700
 DEFAULT_EMBEDDING_PROVIDER = "ollama"
 
 
@@ -314,30 +316,64 @@ def format_search_results(results: Sequence[SearchResult], *, query: str | None 
 
 
 def _build_display_snippet(text: str, *, query: str | None) -> str:
-    normalized_text = " ".join(text.split())
-    if len(normalized_text) <= DEFAULT_SNIPPET_LENGTH:
-        return normalized_text
+    passage = _select_relevant_passage(text, query=query)
+    normalized_passage = " ".join(passage.split())
+    if len(normalized_passage) <= DEFAULT_PASSAGE_LENGTH:
+        return normalized_passage
+    return _truncate_text(normalized_passage, query=query, max_length=DEFAULT_SNIPPET_LENGTH)
+
+
+def _select_relevant_passage(text: str, *, query: str | None) -> str:
+    paragraphs = [
+        paragraph.strip() for paragraph in re.split(r"\n\s*\n+", text) if paragraph.strip()
+    ]
+    if not paragraphs:
+        return text
+
+    scored_paragraphs = [
+        (_score_passage(paragraph, query=query), index, paragraph)
+        for index, paragraph in enumerate(paragraphs)
+    ]
+    best_score, _, best_paragraph = max(scored_paragraphs, key=lambda item: (item[0], -item[1]))
+    if best_score > 0:
+        return best_paragraph
+    return text
+
+
+def _score_passage(text: str, *, query: str | None) -> int:
+    normalized_text = " ".join(text.split()).casefold()
+    normalized_query = " ".join((query or "").split()).casefold()
+    query_terms = [term.casefold() for term in (query or "").split() if term.strip()]
+    phrase_hits = normalized_text.count(normalized_query) if normalized_query else 0
+    unique_term_hits = sum(1 for term in set(query_terms) if term in normalized_text)
+    term_hits = sum(normalized_text.count(term) for term in query_terms)
+    return phrase_hits * 100 + unique_term_hits * 10 + term_hits
+
+
+def _truncate_text(text: str, *, query: str | None, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
 
     query_terms = [term.casefold() for term in (query or "").split() if term.strip()]
-    lowered_text = normalized_text.casefold()
+    lowered_text = text.casefold()
     match_index = min(
         (index for term in query_terms if (index := lowered_text.find(term)) >= 0),
         default=-1,
     )
 
     if match_index >= 0:
-        half_window = DEFAULT_SNIPPET_LENGTH // 2
+        half_window = max_length // 2
         start = max(0, match_index - half_window)
-        end = min(len(normalized_text), start + DEFAULT_SNIPPET_LENGTH)
-        start = max(0, end - DEFAULT_SNIPPET_LENGTH)
+        end = min(len(text), start + max_length)
+        start = max(0, end - max_length)
     else:
         start = 0
-        end = min(len(normalized_text), DEFAULT_SNIPPET_LENGTH)
+        end = min(len(text), max_length)
 
-    snippet = normalized_text[start:end].strip()
+    snippet = text[start:end].strip()
     if start > 0:
         snippet = f"…{snippet}"
-    if end < len(normalized_text):
+    if end < len(text):
         snippet = f"{snippet}…"
     return snippet
 
