@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from watchfiles import awatch
+
 from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
 from newsrag.storage import initialize_storage
+from newsrag.watches import enqueue_watch_changes, list_watches
 
 JobHandler = Callable[[Job], Awaitable[None]]
 
@@ -67,10 +70,14 @@ class DaemonRunner:
         await handler(job)
 
 
+WatchStreamFactory = Callable[[tuple[str, ...]], AsyncIterator[set[tuple[object, str]]]]
+
+
 async def run_daemon(
     config: DaemonConfig,
     *,
     handlers: Mapping[str, JobHandler] | None = None,
+    watch_stream_factory: WatchStreamFactory | None = None,
 ) -> None:
     """Start the foreground daemon loop."""
 
@@ -80,4 +87,36 @@ async def run_daemon(
         handlers=handlers,
         poll_interval=config.poll_interval,
     )
-    await runner.run(max_loops=config.max_loops)
+    watches = list_watches(storage_paths.database)
+    if not watches:
+        await runner.run(max_loops=config.max_loops)
+        return
+
+    watch_paths = tuple(str(watch.path) for watch in watches)
+    watch_task = _run_watch_loop(
+        storage_paths.database,
+        watch_paths,
+        watch_stream_factory=watch_stream_factory or _default_watch_stream,
+        max_batches=config.max_loops,
+    )
+    await asyncio.gather(runner.run(max_loops=config.max_loops), watch_task)
+
+
+async def _run_watch_loop(
+    database_path: Path,
+    watch_paths: tuple[str, ...],
+    *,
+    watch_stream_factory: WatchStreamFactory,
+    max_batches: int | None,
+) -> None:
+    batches = 0
+    async for changes in watch_stream_factory(watch_paths):
+        await asyncio.to_thread(enqueue_watch_changes, database_path, changes)
+        batches += 1
+        if max_batches is not None and batches >= max_batches:
+            return
+
+
+async def _default_watch_stream(paths: tuple[str, ...]) -> AsyncIterator[set[tuple[object, str]]]:
+    async for changes in awatch(*paths):
+        yield {(change, str(path)) for change, path in changes}

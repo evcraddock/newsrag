@@ -17,6 +17,7 @@ def test_help_shows_cli_commands() -> None:
     assert "status" in result.stdout
     assert "daemon" in result.stdout
     assert "jobs" in result.stdout
+    assert "watch" in result.stdout
 
 
 def test_doctor_runs_without_crashing(tmp_path: Path) -> None:
