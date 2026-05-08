@@ -9,6 +9,7 @@ from newsrag.config import (
     AppConfig,
     ConfigError,
     EmbeddingConfig,
+    apply_embedding_overrides,
     load_config,
     resolve_data_dir,
     resolve_runtime_settings,
@@ -93,3 +94,25 @@ def test_resolve_data_dir_defaults_to_local_newsrag(tmp_path: Path) -> None:
     data_dir = resolve_data_dir(None, config, cwd=tmp_path)
 
     assert data_dir == (tmp_path / ".newsrag").resolve()
+
+
+def test_apply_embedding_overrides_replaces_selected_fields() -> None:
+    embedding = EmbeddingConfig(
+        provider="openai_compatible",
+        base_url="http://localhost:1234/v1",
+        model="text-embedding-3-small",
+        api_key_env="OPENAI_API_KEY",
+    )
+
+    updated = apply_embedding_overrides(
+        embedding,
+        provider="ollama",
+        model="nomic-embed-text",
+    )
+
+    assert updated == EmbeddingConfig(
+        provider="ollama",
+        base_url="http://localhost:1234/v1",
+        model="nomic-embed-text",
+        api_key_env="OPENAI_API_KEY",
+    )

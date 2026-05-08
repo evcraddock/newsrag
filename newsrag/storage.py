@@ -73,6 +73,7 @@ REQUIRED_TABLES = {
     "jobs",
     "watches",
     "watch_files",
+    "embedding_records",
     "metadata",
 }
 SCHEMA_STATEMENTS = (
@@ -138,6 +139,18 @@ SCHEMA_STATEMENTS = (
         content_signature TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(watch_id) REFERENCES watches(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS embedding_records (
+        id TEXT PRIMARY KEY,
+        source_kind TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        version TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
 )

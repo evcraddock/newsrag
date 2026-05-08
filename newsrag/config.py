@@ -132,6 +132,24 @@ def resolve_runtime_settings(
     )
 
 
+def apply_embedding_overrides(
+    embedding: EmbeddingConfig,
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    api_key_env: str | None = None,
+) -> EmbeddingConfig:
+    """Apply optional CLI-style overrides to embedding configuration."""
+
+    return EmbeddingConfig(
+        provider=provider if provider is not None else embedding.provider,
+        base_url=base_url if base_url is not None else embedding.base_url,
+        model=model if model is not None else embedding.model,
+        api_key_env=api_key_env if api_key_env is not None else embedding.api_key_env,
+    )
+
+
 def _load_embedding_config(embedding_data: Mapping[str, object]) -> EmbeddingConfig:
     return EmbeddingConfig(
         provider=_optional_string(embedding_data.get("provider"), field_name="embedding.provider"),

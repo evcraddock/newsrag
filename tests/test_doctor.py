@@ -110,6 +110,53 @@ def test_run_doctor_checks_generic_openai_compatible_provider(
     assert "provider=openai_compatible" in embedding_check.detail
 
 
+def test_run_doctor_warns_when_ollama_model_is_missing(tmp_path: Path) -> None:
+    settings = RuntimeSettings(
+        config_path=tmp_path / "config.yaml",
+        data_dir=tmp_path / ".newsrag",
+        config=AppConfig(
+            source_path=tmp_path / "config.yaml",
+            embedding=EmbeddingConfig(provider="ollama"),
+        ),
+    )
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "warn"
+    assert "embedding.model is missing" in embedding_check.detail
+
+
+def test_run_doctor_warns_when_ollama_is_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = RuntimeSettings(
+        config_path=tmp_path / "config.yaml",
+        data_dir=tmp_path / ".newsrag",
+        config=AppConfig(
+            source_path=tmp_path / "config.yaml",
+            embedding=EmbeddingConfig(
+                provider="ollama",
+                base_url="http://127.0.0.1:11434",
+                model="nomic-embed-text",
+            ),
+        ),
+    )
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        request = httpx.Request("GET", url, headers=headers)
+        raise httpx.ConnectError("boom", request=request)
+
+    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "warn"
+    assert "is unreachable" in embedding_check.detail
+
+
 def test_run_doctor_checks_ollama_provider_when_selected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
