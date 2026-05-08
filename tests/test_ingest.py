@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
+import pytest
 from typer.testing import CliRunner
 
 from newsrag.cli import app
@@ -19,8 +21,10 @@ from newsrag.embeddings import (
 from newsrag.ingest import (
     INGEST_JOB_KIND,
     ExtractedPage,
+    IngestError,
     LanceDbVectorStore,
     build_ingest_handler,
+    enqueue_ingest_url_job,
     list_chunk_vectors,
     list_chunks,
     list_documents,
@@ -64,6 +68,138 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     assert jobs[0].payload["metadata"]["body"] == "City Council"
     assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
     assert jobs[1].payload["metadata"]["body"] == "City Council"
+
+
+def test_ingest_url_command_downloads_pdf_and_enqueues_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    url = "https://example.gov/packet.pdf"
+
+    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nurl-pdf"))
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "ingest-url",
+            url,
+            "--body",
+            "City Council",
+            "--document-type",
+            "agenda_packet",
+        ],
+    )
+
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+
+    assert result.exit_code == 0
+    assert "Enqueued 1 ingest job(s)" in result.stdout
+    assert len(jobs) == 1
+    assert jobs[0].kind == INGEST_JOB_KIND
+    assert Path(jobs[0].payload["path"]).parent == paths.downloaded_pdfs
+    assert Path(jobs[0].payload["path"]).is_file()
+    assert jobs[0].payload["metadata"]["body"] == "City Council"
+    assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
+    assert jobs[0].payload["metadata"]["source_url"] == url
+    assert "retrieved_at" in jobs[0].payload["metadata"]
+
+
+def test_enqueue_ingest_url_job_reuses_hash_named_download_for_unchanged_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    url = "https://example.gov/packet.pdf"
+
+    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nunchanged"))
+
+    first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    second_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+
+    assert first_job.payload["path"] == second_job.payload["path"]
+    assert Path(first_job.payload["path"]).is_file()
+
+
+def test_url_ingest_stores_source_url_and_retrieved_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    url = "https://example.gov/packet.pdf"
+
+    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nurl-pdf"))
+
+    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    retrieved_at = str(job.payload["metadata"]["retrieved_at"])
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[ExtractedPage(page_number=1, text="Agenda")]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    documents = list_documents(paths.database)
+
+    assert len(documents) == 1
+    assert documents[0].source_url == url
+    assert documents[0].metadata["retrieved_at"] == retrieved_at
+
+
+def test_ingest_url_rejects_non_pdf_responses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    url = "https://example.gov/not-a-pdf"
+
+    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
+        del follow_redirects, timeout
+        request = httpx.Request("GET", target_url)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"Content-Type": "text/html"},
+            content=b"<html>nope</html>",
+        )
+
+    monkeypatch.setattr("newsrag.ingest.httpx.get", fake_get)
+
+    with pytest.raises(IngestError, match="PDF-like response"):
+        enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+
+
+def test_ingest_url_download_failures_fail_clearly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    url = "https://example.gov/packet.pdf"
+
+    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
+        del follow_redirects, timeout
+        request = httpx.Request("GET", target_url)
+        raise httpx.ConnectError("boom", request=request)
+
+    monkeypatch.setattr("newsrag.ingest.httpx.get", fake_get)
+
+    with pytest.raises(IngestError, match="Failed downloading"):
+        enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
 
 def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
@@ -248,3 +384,21 @@ class FakeEmbeddingProvider:
             )
             for index, text in enumerate(texts)
         ]
+
+
+def _fake_pdf_getter(
+    url: str,
+    content: bytes,
+) -> Callable[..., httpx.Response]:
+    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
+        del follow_redirects, timeout
+        assert target_url == url
+        request = httpx.Request("GET", target_url)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"Content-Type": "application/pdf"},
+            content=content,
+        )
+
+    return fake_get
