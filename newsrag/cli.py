@@ -11,6 +11,7 @@ from newsrag.config import (
     AppConfig,
     ConfigError,
     RuntimeSettings,
+    apply_embedding_overrides,
     load_config,
     resolve_data_dir,
 )
@@ -72,10 +73,38 @@ def main(
 
 
 @app.command()
-def doctor(ctx: typer.Context) -> None:
+def doctor(
+    ctx: typer.Context,
+    embedding_provider: str | None = typer.Option(
+        None,
+        "--embedding-provider",
+        help="Override the embedding provider for this doctor run.",
+    ),
+    embedding_base_url: str | None = typer.Option(
+        None,
+        "--embedding-base-url",
+        help="Override the embedding provider base URL for this doctor run.",
+    ),
+    embedding_model: str | None = typer.Option(
+        None,
+        "--embedding-model",
+        help="Override the embedding model for this doctor run.",
+    ),
+    embedding_api_key_env: str | None = typer.Option(
+        None,
+        "--embedding-api-key-env",
+        help="Override the embedding API key environment variable for this doctor run.",
+    ),
+) -> None:
     """Validate the local NewsRAG environment and configuration."""
 
-    settings, config_error = _resolve_runtime_settings(ctx)
+    settings, config_error = _resolve_runtime_settings(
+        ctx,
+        embedding_provider=embedding_provider,
+        embedding_base_url=embedding_base_url,
+        embedding_model=embedding_model,
+        embedding_api_key_env=embedding_api_key_env,
+    )
     report = run_doctor(settings, config_error=config_error)
     typer.echo(format_report(report, settings=settings))
 
@@ -221,7 +250,14 @@ def run() -> None:
     app()
 
 
-def _resolve_runtime_settings(ctx: typer.Context) -> tuple[RuntimeSettings, str | None]:
+def _resolve_runtime_settings(
+    ctx: typer.Context,
+    *,
+    embedding_provider: str | None = None,
+    embedding_base_url: str | None = None,
+    embedding_model: str | None = None,
+    embedding_api_key_env: str | None = None,
+) -> tuple[RuntimeSettings, str | None]:
     state = _get_state(ctx)
     config_error: str | None = None
 
@@ -230,6 +266,28 @@ def _resolve_runtime_settings(ctx: typer.Context) -> tuple[RuntimeSettings, str 
     except ConfigError as exc:
         config = AppConfig(source_path=state.config_path)
         config_error = str(exc)
+
+    if any(
+        override is not None
+        for override in (
+            embedding_provider,
+            embedding_base_url,
+            embedding_model,
+            embedding_api_key_env,
+        )
+    ):
+        config = AppConfig(
+            source_path=config.source_path,
+            data_dir=config.data_dir,
+            embedding=apply_embedding_overrides(
+                config.embedding,
+                provider=embedding_provider,
+                base_url=embedding_base_url,
+                model=embedding_model,
+                api_key_env=embedding_api_key_env,
+            ),
+            daemon=config.daemon,
+        )
 
     settings = RuntimeSettings(
         config_path=state.config_path,
