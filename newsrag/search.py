@@ -16,6 +16,7 @@ from newsrag.ingest import VECTOR_TABLE_NAME
 DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_KEYWORD_WEIGHT = 0.5
 DEFAULT_VECTOR_WEIGHT = 0.5
+DEFAULT_MAX_VECTOR_DISTANCE = 1.0
 DEFAULT_EMBEDDING_PROVIDER = "ollama"
 
 
@@ -74,6 +75,7 @@ class LanceDbVectorSearcher:
 
     lancedb_path: Path
     table_name: str = VECTOR_TABLE_NAME
+    max_vector_distance: float | None = DEFAULT_MAX_VECTOR_DISTANCE
 
     def search(self, query_embedding: QueryEmbedding, *, limit: int) -> list[SearchCandidate]:
         database = lancedb.connect(self.lancedb_path)
@@ -83,20 +85,26 @@ class LanceDbVectorSearcher:
             return []
 
         rows = table.search(list(query_embedding.vector)).limit(limit).to_list()
-        return [
-            SearchCandidate(
-                chunk_id=str(row["chunk_id"]),
-                document_id=str(row["document_id"]),
-                page_start=int(row["page_start"]),
-                page_end=int(row["page_end"]),
-                text=str(row["text"]),
-                title=None,
-                meeting_date=None,
-                vector_score=float(row["_distance"]),
+        candidates: list[SearchCandidate] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            distance = float(row["_distance"])
+            if self.max_vector_distance is not None and distance > self.max_vector_distance:
+                continue
+            candidates.append(
+                SearchCandidate(
+                    chunk_id=str(row["chunk_id"]),
+                    document_id=str(row["document_id"]),
+                    page_start=int(row["page_start"]),
+                    page_end=int(row["page_end"]),
+                    text=str(row["text"]),
+                    title=None,
+                    meeting_date=None,
+                    vector_score=distance,
+                )
             )
-            for row in rows
-            if isinstance(row, dict)
-        ]
+        return candidates
 
 
 @dataclass(frozen=True)

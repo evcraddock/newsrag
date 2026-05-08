@@ -33,7 +33,7 @@ class FakeQueryEmbeddingProvider:
     def embed_query(self, text: str) -> QueryEmbedding:
         if text == "stormwater downtown":
             return QueryEmbedding(text=text, vector=(0.1, 0.1), metadata=self.metadata)
-        return QueryEmbedding(text=text, vector=(0.9, 0.9), metadata=self.metadata)
+        return QueryEmbedding(text=text, vector=(2.0, 2.0), metadata=self.metadata)
 
     def embed_chunks(self, texts: Sequence[str]) -> list[ChunkEmbedding]:
         del texts
@@ -56,6 +56,22 @@ def test_search_over_indexed_chunks_returns_ranked_cited_passages(tmp_path: Path
     assert [result.chunk_id for result in results] == ["chunk-a", "chunk-b"]
     assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 3"
     assert "downtown stormwater improvements" in results[0].text
+
+
+def test_unrelated_query_returns_no_results_even_with_indexed_chunks(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    _seed_search_corpus(paths)
+
+    engine = build_search_engine(
+        database_path=paths.database,
+        lancedb_path=paths.lancedb,
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+    )
+
+    results = engine.search("banana telescope")
+
+    assert results == []
 
 
 def test_keyword_vector_and_overlapping_candidates_merge_deterministically(
