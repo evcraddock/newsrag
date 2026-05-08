@@ -89,6 +89,9 @@ SCHEMA_STATEMENTS = (
         source_path TEXT,
         source_url TEXT,
         title TEXT,
+        source_hash TEXT,
+        normalized_path TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
     """,
@@ -288,11 +291,31 @@ def _initialize_database(database_path: Path) -> None:
         connection.execute("PRAGMA foreign_keys = ON")
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        _ensure_column(connection, "documents", "source_hash", "TEXT")
+        _ensure_column(connection, "documents", "normalized_path", "TEXT")
+        _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash)"
+        )
         connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES(?, ?)",
             ("schema_version", SCHEMA_VERSION),
         )
         connection.commit()
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    existing_columns = {
+        str(row[1]) for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in existing_columns:
+        return
+    connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
 
 def _existing_tables(database_path: Path) -> set[str]:

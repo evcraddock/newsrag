@@ -7,6 +7,8 @@ from pathlib import Path
 
 from watchfiles import awatch
 
+from newsrag.config import EmbeddingConfig
+from newsrag.ingest import INGEST_JOB_KIND, build_ingest_handler
 from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
 from newsrag.storage import initialize_storage
 from newsrag.watches import enqueue_watch_changes, list_watches
@@ -23,6 +25,7 @@ class DaemonConfig:
     """Runtime settings for the NewsRAG daemon loop."""
 
     data_dir: Path
+    embedding_config: EmbeddingConfig = EmbeddingConfig()
     poll_interval: float = 0.5
     max_loops: int | None = None
 
@@ -82,9 +85,17 @@ async def run_daemon(
     """Start the foreground daemon loop."""
 
     storage_paths = initialize_storage(config.data_dir)
+    resolved_handlers: dict[str, JobHandler] = {
+        INGEST_JOB_KIND: build_ingest_handler(
+            data_dir=config.data_dir,
+            embedding_config=config.embedding_config,
+        )
+    }
+    resolved_handlers.update(handlers or {})
+
     runner = DaemonRunner(
         database_path=storage_paths.database,
-        handlers=handlers,
+        handlers=resolved_handlers,
         poll_interval=config.poll_interval,
     )
     watches = list_watches(storage_paths.database)

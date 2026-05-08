@@ -17,6 +17,7 @@ from newsrag.config import (
 )
 from newsrag.daemon import DaemonConfig, run_daemon
 from newsrag.doctor import format_report, run_doctor
+from newsrag.ingest import IngestError, enqueue_ingest_jobs
 from newsrag.jobs import list_jobs
 from newsrag.storage import (
     StorageError,
@@ -157,11 +158,60 @@ def daemon_run(
         run_daemon(
             DaemonConfig(
                 data_dir=settings.data_dir,
+                embedding_config=settings.config.embedding,
                 poll_interval=poll_interval,
                 max_loops=max_loops,
             )
         )
     )
+
+
+@app.command("ingest")
+def ingest_command(
+    ctx: typer.Context,
+    path: Path,
+    title: str | None = typer.Option(None, help="Document title override for the ingested PDFs."),
+    body: str | None = typer.Option(None, help="Civic body metadata for the ingested PDFs."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Document type metadata for the ingested PDFs.",
+    ),
+    meeting_date: str | None = typer.Option(
+        None,
+        "--meeting-date",
+        help="Meeting date metadata for the ingested PDFs.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Jurisdiction metadata for the ingested PDFs.",
+    ),
+) -> None:
+    """Enqueue one local PDF or directory of PDFs for ingestion."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    metadata = {
+        key: value
+        for key, value in {
+            "title": title,
+            "body": body,
+            "document_type": document_type,
+            "meeting_date": meeting_date,
+            "jurisdiction": jurisdiction,
+        }.items()
+        if value is not None
+    }
+
+    try:
+        jobs = enqueue_ingest_jobs(database_path, source_path=path, metadata=metadata)
+    except IngestError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
+    for job in jobs:
+        typer.echo(f"{job.id} {job.payload['path']}")
 
 
 @jobs_app.command("list")

@@ -20,6 +20,7 @@ def test_help_shows_cli_commands() -> None:
     assert "doctor" in result.stdout
     assert "status" in result.stdout
     assert "daemon" in result.stdout
+    assert "ingest" in result.stdout
     assert "jobs" in result.stdout
     assert "watch" in result.stdout
 
