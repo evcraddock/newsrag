@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from newsrag.config import (
     load_config,
     resolve_data_dir,
 )
+from newsrag.daemon import DaemonConfig, run_daemon
 from newsrag.doctor import format_report, run_doctor
+from newsrag.jobs import list_jobs
 from newsrag.storage import (
     StorageError,
     format_status_report,
@@ -37,6 +40,10 @@ DATA_DIR_OPTION = typer.Option(
 )
 
 app = typer.Typer(help="Local-first evidence retrieval for city hall PDFs.")
+daemon_app = typer.Typer(help="Run the NewsRAG background daemon.")
+jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
+app.add_typer(daemon_app, name="daemon")
+app.add_typer(jobs_app, name="jobs")
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,48 @@ def status(
 
     if report.has_errors:
         raise typer.Exit(code=1)
+
+
+@daemon_app.command("run")
+def daemon_run(
+    ctx: typer.Context,
+    poll_interval: float = typer.Option(0.5, help="Seconds to wait between queue polls."),
+    max_loops: int | None = typer.Option(None, hidden=True),
+) -> None:
+    """Run the foreground NewsRAG daemon loop."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    typer.echo(f"NewsRAG daemon running for {settings.data_dir}")
+    asyncio.run(
+        run_daemon(
+            DaemonConfig(
+                data_dir=settings.data_dir,
+                poll_interval=poll_interval,
+                max_loops=max_loops,
+            )
+        )
+    )
+
+
+@jobs_app.command("list")
+def jobs_list_command(ctx: typer.Context) -> None:
+    """List durable NewsRAG jobs."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    jobs = list_jobs(database_path)
+
+    typer.echo("NewsRAG Jobs")
+    typer.echo(f"data_dir: {settings.data_dir}")
+    if not jobs:
+        typer.echo("jobs: none")
+        return
+
+    for job in jobs:
+        line = f"{job.id} {job.status} {job.kind}"
+        if job.error is not None:
+            line = f"{line} error={job.error}"
+        typer.echo(line)
 
 
 def run() -> None:

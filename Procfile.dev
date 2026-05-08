@@ -1,2 +1,1 @@
-# Replace the placeholder command below with `uv run newsrag daemon run` once the daemon entrypoint exists.
-newsrag: ./scripts/dev-placeholder.sh
+newsrag: uv run newsrag daemon run

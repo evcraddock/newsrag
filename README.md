@@ -37,7 +37,7 @@ uv run newsrag status --initialize
 make dev
 ```
 
-This starts all processes defined in `Procfile.dev`. Right now the Procfile runs a placeholder long-lived process until `newsrag daemon run` exists.
+This starts all processes defined in `Procfile.dev`, including the foreground `newsrag daemon run` process managed by Overmind.
 
 ### View logs
 
@@ -47,6 +47,9 @@ make dev-logs
 
 # Quick peek at recent logs
 make dev-tail
+
+# Attach to one service terminal (default: SERVICE=newsrag)
+make dev-connect
 ```
 
 ### Check status

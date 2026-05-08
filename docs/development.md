@@ -76,6 +76,14 @@ Start the development environment:
 make dev
 ```
 
+Attach to one service terminal:
+
+```bash
+make dev-connect
+# or choose a different process name
+make dev-connect SERVICE=newsrag
+```
+
 Check status:
 
 ```bash
@@ -90,8 +98,7 @@ make dev-stop
 
 Current behavior:
 - `Procfile.dev` is present and wired into `make dev`.
-- The long-running process is a placeholder until `newsrag daemon run` is implemented.
-- When the daemon entrypoint lands, replace `./scripts/dev-placeholder.sh` in `Procfile.dev` with the real command.
+- The long-running process is `uv run newsrag daemon run` managed by Overmind.
 
 ## Verification commands
 
