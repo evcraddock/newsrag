@@ -311,7 +311,7 @@ def search_command(ctx: typer.Context, query: str) -> None:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
-    typer.echo(format_search_results(results))
+    typer.echo(format_search_results(results, query=query))
 
 
 @jobs_app.command("list")

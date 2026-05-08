@@ -17,6 +17,7 @@ DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_KEYWORD_WEIGHT = 0.5
 DEFAULT_VECTOR_WEIGHT = 0.5
 DEFAULT_MAX_VECTOR_DISTANCE = 1.0
+DEFAULT_SNIPPET_LENGTH = 320
 DEFAULT_EMBEDDING_PROVIDER = "ollama"
 
 
@@ -277,7 +278,7 @@ def format_citation(*, title: str | None, meeting_date: str | None, page_number:
     return " — ".join(parts)
 
 
-def format_search_results(results: Sequence[SearchResult]) -> str:
+def format_search_results(results: Sequence[SearchResult], *, query: str | None = None) -> str:
     """Format ranked search results for terminal output."""
 
     if not results:
@@ -286,9 +287,38 @@ def format_search_results(results: Sequence[SearchResult]) -> str:
     lines = ["NewsRAG Search"]
     for result in results:
         lines.append(result.citation)
-        lines.append(result.text)
+        lines.append(_build_display_snippet(result.text, query=query))
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def _build_display_snippet(text: str, *, query: str | None) -> str:
+    normalized_text = " ".join(text.split())
+    if len(normalized_text) <= DEFAULT_SNIPPET_LENGTH:
+        return normalized_text
+
+    query_terms = [term.casefold() for term in (query or "").split() if term.strip()]
+    lowered_text = normalized_text.casefold()
+    match_index = min(
+        (index for term in query_terms if (index := lowered_text.find(term)) >= 0),
+        default=-1,
+    )
+
+    if match_index >= 0:
+        half_window = DEFAULT_SNIPPET_LENGTH // 2
+        start = max(0, match_index - half_window)
+        end = min(len(normalized_text), start + DEFAULT_SNIPPET_LENGTH)
+        start = max(0, end - DEFAULT_SNIPPET_LENGTH)
+    else:
+        start = 0
+        end = min(len(normalized_text), DEFAULT_SNIPPET_LENGTH)
+
+    snippet = normalized_text[start:end].strip()
+    if start > 0:
+        snippet = f"…{snippet}"
+    if end < len(normalized_text):
+        snippet = f"{snippet}…"
+    return snippet
 
 
 def _resolve_embedding_config(embedding_config: EmbeddingConfig) -> EmbeddingConfig:

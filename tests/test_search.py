@@ -13,8 +13,10 @@ from newsrag.embeddings import ChunkEmbedding, EmbeddingMetadata, QueryEmbedding
 from newsrag.ingest import ChunkVectorRecord, LanceDbVectorStore
 from newsrag.search import (
     SearchCandidate,
+    SearchResult,
     build_search_engine,
     format_citation,
+    format_search_results,
     merge_search_candidates,
 )
 from newsrag.storage import StoragePaths, initialize_storage
@@ -142,6 +144,36 @@ def test_citation_format_uses_concise_terminal_style() -> None:
         format_citation(title="Stormwater Report", meeting_date="2026-05-01", page_number=3)
         == "Stormwater Report — 2026-05-01 — p. 3"
     )
+
+
+def test_format_search_results_uses_concise_snippets() -> None:
+    output = format_search_results(
+        [
+            SearchResult(
+                chunk_id="chunk-a",
+                document_id="document-a",
+                page_start=1,
+                page_end=1,
+                text=(
+                    "Header line " * 30
+                    + "budget work session starts here and should be shown near the middle "
+                    + "trailing detail " * 30
+                ),
+                citation="Budget Packet — 2026-04-20 — p. 1",
+                score=1.0,
+                keyword_score=0.1,
+                vector_score=0.1,
+            )
+        ],
+        query="budget work session",
+    )
+
+    assert "budget work session starts here" in output
+    assert (
+        "Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line trailing detail trailing detail trailing detail trailing detail"
+        not in output
+    )
+    assert "…" in output
 
 
 def test_search_command_reports_no_evidence_for_empty_corpus(tmp_path: Path) -> None:
