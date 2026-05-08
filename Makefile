@@ -1,7 +1,8 @@
-.PHONY: dev dev-stop dev-status dev-logs dev-tail check pre-pr help
+.PHONY: dev dev-stop dev-status dev-logs dev-tail dev-connect check pre-pr help
 
 SOCKET := ./.overmind.sock
 SETUP_DOC := docs/development.md
+SERVICE ?= newsrag
 
 define require_command
 	@command -v $(1) >/dev/null 2>&1 || { \
@@ -63,6 +64,15 @@ dev-tail: ## Show last 100 lines of logs (non-blocking)
 		done; \
 	else \
 		echo "Dev environment not running"; \
+	fi
+
+dev-connect: ## Attach to one dev process terminal (default: SERVICE=newsrag)
+	$(call require_command,overmind)
+	@if [ -S $(SOCKET) ] && overmind ps -s $(SOCKET) > /dev/null 2>&1; then \
+		overmind connect -s $(SOCKET) $(SERVICE); \
+	else \
+		echo "Dev environment not running"; \
+		exit 1; \
 	fi
 
 check: ## Run formatting checks, linting, type checking, and tests
