@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from newsrag.ingest import INGEST_JOB_KIND
 from newsrag.jobs import Job, create_job
 
-WATCH_JOB_KIND = "ingest-file"
+WATCH_JOB_KIND = INGEST_JOB_KIND
 
 
 @dataclass(frozen=True)
@@ -108,7 +109,7 @@ def enqueue_watch_changes(
 
         job = create_job(
             database_path,
-            kind=WATCH_JOB_KIND,
+            kind=INGEST_JOB_KIND,
             payload={
                 "path": str(changed_path),
                 "watch_id": watch.id,
