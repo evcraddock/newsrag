@@ -22,6 +22,7 @@ def test_help_shows_cli_commands() -> None:
     assert "daemon" in result.stdout
     assert "ingest" in result.stdout
     assert "ingest-url" in result.stdout
+    assert "ingest-manifest" in result.stdout
     assert "jobs" in result.stdout
     assert "watch" in result.stdout
 

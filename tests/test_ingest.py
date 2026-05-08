@@ -31,6 +31,7 @@ from newsrag.ingest import (
     list_pages,
 )
 from newsrag.jobs import FAILED, create_job, get_job, list_jobs
+from newsrag.manifests import ManifestError, load_manifest
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
@@ -61,7 +62,7 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     paths = initialize_storage(data_dir)
     jobs = list_jobs(paths.database)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 0, result.stdout
     assert "Enqueued 2 ingest job(s)" in result.stdout
     assert len(jobs) == 2
     assert all(job.kind == INGEST_JOB_KIND for job in jobs)
@@ -182,6 +183,192 @@ def test_ingest_url_rejects_non_pdf_responses(
 
     with pytest.raises(IngestError, match="PDF-like response"):
         enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+
+
+def test_ingest_manifest_enqueues_one_job_per_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - url: https://example.gov/packet-1.pdf
+            title: Packet One
+            meeting_date: 2026-05-01
+            body: City Council
+            document_type: agenda_packet
+          - url: https://example.gov/packet-2.pdf
+            jurisdiction: Example City
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "newsrag.ingest.httpx.get",
+        _fake_pdf_url_map_getter(
+            {
+                "https://example.gov/packet-1.pdf": b"%PDF-1.4\npacket-1",
+                "https://example.gov/packet-2.pdf": b"%PDF-1.4\npacket-2",
+            }
+        ),
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+
+    assert result.exit_code == 0
+    assert "Enqueued 2 ingest job(s)" in result.stdout
+    assert len(jobs) == 2
+
+    jobs_by_url = {str(job.payload["metadata"]["source_url"]): job for job in jobs}
+    first_job = jobs_by_url["https://example.gov/packet-1.pdf"]
+    second_job = jobs_by_url["https://example.gov/packet-2.pdf"]
+
+    assert first_job.payload["metadata"]["title"] == "Packet One"
+    assert first_job.payload["metadata"]["meeting_date"] == "2026-05-01"
+    assert second_job.payload["metadata"]["jurisdiction"] == "Example City"
+
+
+def test_invalid_manifest_missing_url_fails_without_enqueuing(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - title: Missing URL
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+    paths = initialize_storage(data_dir)
+
+    assert result.exit_code == 1
+    assert "missing a non-empty 'url'" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_invalid_manifest_invalid_meeting_date_fails_without_enqueuing(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - url: https://example.gov/packet.pdf
+            meeting_date: 05-01-2026
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+    paths = initialize_storage(data_dir)
+
+    assert result.exit_code == 1
+    assert "must be YYYY-MM-DD" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_invalid_manifest_duplicate_urls_fail_without_partial_work(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - url: https://example.gov/packet.pdf
+          - url: https://example.gov/packet.pdf
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+    paths = initialize_storage(data_dir)
+
+    assert result.exit_code == 1
+    assert "duplicate URL" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_invalid_manifest_unsupported_fields_fail(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - url: https://example.gov/packet.pdf
+            committee: Finance
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestError, match="unsupported fields"):
+        load_manifest(manifest_path)
+
+
+def test_manifest_metadata_is_preserved_on_created_documents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - url: https://example.gov/packet.pdf
+            title: Manifest Packet
+            meeting_date: 2026-05-01
+            body: City Council
+            document_type: agenda_packet
+            jurisdiction: Example City
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "newsrag.ingest.httpx.get",
+        _fake_pdf_getter("https://example.gov/packet.pdf", b"%PDF-1.4\nmanifest"),
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+    assert result.exit_code == 0, result.stdout
+
+    paths = initialize_storage(data_dir)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[ExtractedPage(page_number=1, text="Agenda")]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    documents = list_documents(paths.database)
+    assert len(documents) == 1
+    assert documents[0].title == "Manifest Packet"
+    assert documents[0].metadata["meeting_date"] == "2026-05-01"
+    assert documents[0].metadata["body"] == "City Council"
+    assert documents[0].metadata["document_type"] == "agenda_packet"
+    assert documents[0].metadata["jurisdiction"] == "Example City"
 
 
 def test_ingest_url_download_failures_fail_clearly(
@@ -399,6 +586,23 @@ def _fake_pdf_getter(
             request=request,
             headers={"Content-Type": "application/pdf"},
             content=content,
+        )
+
+    return fake_get
+
+
+def _fake_pdf_url_map_getter(
+    url_map: dict[str, bytes],
+) -> Callable[..., httpx.Response]:
+    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
+        del follow_redirects, timeout
+        assert target_url in url_map
+        request = httpx.Request("GET", target_url)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"Content-Type": "application/pdf"},
+            content=url_map[target_url],
         )
 
     return fake_get

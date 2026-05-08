@@ -19,6 +19,7 @@ from newsrag.daemon import DaemonConfig, run_daemon
 from newsrag.doctor import format_report, run_doctor
 from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
 from newsrag.jobs import list_jobs
+from newsrag.manifests import ManifestError, load_manifest
 from newsrag.storage import (
     StorageError,
     format_status_report,
@@ -256,6 +257,39 @@ def ingest_url_command(
 
     typer.echo("Enqueued 1 ingest job(s)")
     typer.echo(f"{job.id} {job.payload['path']}")
+
+
+@app.command("ingest-manifest")
+def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
+    """Load a YAML manifest and enqueue one URL-ingest job per document."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    storage_paths = initialize_storage(settings.data_dir)
+
+    try:
+        manifest = load_manifest(path)
+    except ManifestError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    jobs = []
+    try:
+        for document in manifest.documents:
+            jobs.append(
+                enqueue_ingest_url_job(
+                    storage_paths.database,
+                    storage_paths=storage_paths,
+                    url=document.url,
+                    metadata=document.metadata,
+                )
+            )
+    except IngestError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
+    for job in jobs:
+        typer.echo(f"{job.id} {job.payload['path']}")
 
 
 @jobs_app.command("list")
