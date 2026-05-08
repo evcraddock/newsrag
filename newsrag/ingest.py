@@ -782,6 +782,13 @@ def _persist_document_bundle(
             """,
             chunks,
         )
+        connection.executemany(
+            """
+            INSERT INTO chunks_fts(chunk_id, text)
+            VALUES(?, ?)
+            """,
+            [(chunk_id, text) for chunk_id, _, _, _, text in chunks],
+        )
         connection.commit()
 
     for chunk_row, embedding in zip(chunks, chunk_embeddings, strict=True):

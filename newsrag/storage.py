@@ -70,6 +70,7 @@ REQUIRED_TABLES = {
     "documents",
     "pages",
     "chunks",
+    "chunks_fts",
     "jobs",
     "watches",
     "watch_files",
@@ -114,6 +115,12 @@ SCHEMA_STATEMENTS = (
         text TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(document_id) REFERENCES documents(id)
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+        chunk_id UNINDEXED,
+        text
     )
     """,
     """
@@ -296,6 +303,14 @@ def _initialize_database(database_path: Path) -> None:
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash)"
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks_fts(chunk_id, text)
+            SELECT chunks.id, chunks.text
+            FROM chunks
+            WHERE chunks.id NOT IN (SELECT chunk_id FROM chunks_fts)
+            """
         )
         connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES(?, ?)",
