@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from newsrag.passages import build_passage_rows
+
 
 class StorageError(Exception):
     """Raised when the NewsRAG storage layout cannot be initialized or inspected."""
@@ -71,6 +73,8 @@ REQUIRED_TABLES = {
     "pages",
     "chunks",
     "chunks_fts",
+    "passages",
+    "passages_fts",
     "jobs",
     "watches",
     "watch_files",
@@ -121,6 +125,27 @@ SCHEMA_STATEMENTS = (
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
         chunk_id UNINDEXED,
         text
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS passages (
+        id TEXT PRIMARY KEY,
+        chunk_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        page_start INTEGER NOT NULL,
+        page_end INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(chunk_id) REFERENCES chunks(id),
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
+        passage_id UNINDEXED,
+        text,
+        tokenize='porter unicode61'
     )
     """,
     """
@@ -312,11 +337,63 @@ def _initialize_database(database_path: Path) -> None:
             WHERE chunks.id NOT IN (SELECT chunk_id FROM chunks_fts)
             """
         )
+        _backfill_passages(connection)
+        connection.execute(
+            """
+            INSERT INTO passages_fts(passage_id, text)
+            SELECT passages.id, passages.text
+            FROM passages
+            WHERE passages.id NOT IN (SELECT passage_id FROM passages_fts)
+            """
+        )
         connection.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES(?, ?)",
             ("schema_version", SCHEMA_VERSION),
         )
         connection.commit()
+
+
+def _backfill_passages(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT id, document_id, page_start, page_end, text
+        FROM chunks
+        WHERE id NOT IN (SELECT DISTINCT chunk_id FROM passages)
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    passage_rows = []
+    for row in rows:
+        passage_rows.extend(
+            build_passage_rows(
+                chunk_id=str(row[0]),
+                document_id=str(row[1]),
+                page_start=int(row[2]),
+                page_end=int(row[3]),
+                text=str(row[4]),
+            )
+        )
+    if not passage_rows:
+        return
+
+    connection.executemany(
+        """
+        INSERT INTO passages(id, chunk_id, document_id, page_start, page_end, ordinal, text)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                row.id,
+                row.chunk_id,
+                row.document_id,
+                row.page_start,
+                row.page_end,
+                row.ordinal,
+                row.text,
+            )
+            for row in passage_rows
+        ],
+    )
 
 
 def _ensure_column(

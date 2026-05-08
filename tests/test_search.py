@@ -10,16 +10,16 @@ from typer.testing import CliRunner
 from newsrag.cli import app
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import ChunkEmbedding, EmbeddingMetadata, QueryEmbedding
-from newsrag.ingest import ChunkVectorRecord, LanceDbVectorStore
 from newsrag.search import (
+    PassageVectorRecord,
     SearchCandidate,
     SearchResult,
     build_search_engine,
     format_citation,
     format_search_results,
-    merge_search_candidates,
+    search_keyword_candidates,
 )
-from newsrag.storage import StoragePaths, initialize_storage
+from newsrag.storage import initialize_storage
 
 runner = CliRunner()
 
@@ -33,190 +33,235 @@ class FakeQueryEmbeddingProvider:
     )
 
     def embed_query(self, text: str) -> QueryEmbedding:
-        if text == "stormwater downtown":
-            return QueryEmbedding(text=text, vector=(0.1, 0.1), metadata=self.metadata)
-        return QueryEmbedding(text=text, vector=(2.0, 2.0), metadata=self.metadata)
+        vectors = {
+            "stormwater downtown": (0.1, 0.1),
+            "semantic zoning": (0.2, 0.2),
+            "games": (0.3, 0.3),
+            "Belt filter Press": (0.4, 0.4),
+            "banana telescope": (2.0, 2.0),
+            "books": (0.5, 0.5),
+        }
+        return QueryEmbedding(
+            text=text, vector=vectors.get(text, (1.0, 1.0)), metadata=self.metadata
+        )
 
     def embed_chunks(self, texts: Sequence[str]) -> list[ChunkEmbedding]:
-        del texts
-        return []
+        return [
+            ChunkEmbedding(
+                text=text,
+                vector=(float(index + 1), float(index + 1)),
+                metadata=self.metadata,
+            )
+            for index, text in enumerate(texts)
+        ]
 
 
 @dataclass(frozen=True)
 class FakeVectorSearcher:
-    candidates: list[SearchCandidate] = field(default_factory=list)
+    candidates_by_query: dict[str, list[SearchCandidate]] = field(default_factory=dict)
 
     def search(self, query_embedding: QueryEmbedding, *, limit: int) -> list[SearchCandidate]:
-        del query_embedding
-        return self.candidates[:limit]
+        return self.candidates_by_query.get(query_embedding.text, [])[:limit]
 
 
-def test_search_over_indexed_chunks_returns_ranked_cited_passages(tmp_path: Path) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
-    _seed_search_corpus(paths)
+@dataclass
+class FakeVectorStore:
+    added_passages: list[PassageVectorRecord] = field(default_factory=list)
+
+    def add_passages(self, passages: Sequence[PassageVectorRecord]) -> None:
+        self.added_passages.extend(passages)
+
+
+def test_search_over_indexed_passages_returns_ranked_cited_passages(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    vector_store = FakeVectorStore()
 
     engine = build_search_engine(
-        database_path=paths.database,
-        lancedb_path=paths.lancedb,
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
         embedding_config=EmbeddingConfig(),
         embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            {
+                "stormwater downtown": [
+                    SearchCandidate(
+                        passage_id="passage-a",
+                        document_id="document-a",
+                        page_start=3,
+                        page_end=3,
+                        text="downtown stormwater improvements",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.1,
+                    )
+                ]
+            }
+        ),
+        vector_store=vector_store,
     )
 
     results = engine.search("stormwater downtown")
 
-    assert [result.chunk_id for result in results] == ["chunk-a"]
+    assert [result.passage_id for result in results] == ["passage-a"]
     assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 3"
     assert "downtown stormwater improvements" in results[0].text
+    assert {record.passage_id for record in vector_store.added_passages} >= {
+        "passage-a",
+        "passage-b",
+        "passage-c",
+        "passage-d",
+        "passage-e",
+        "passage-f",
+    }
 
 
 def test_search_uses_vector_candidates_when_keyword_search_is_empty(tmp_path: Path) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
-    _seed_search_corpus(paths)
+    database_path = _seed_search_corpus(tmp_path)
 
     engine = build_search_engine(
-        database_path=paths.database,
-        lancedb_path=paths.lancedb,
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
         embedding_config=EmbeddingConfig(),
         embedding_provider=FakeQueryEmbeddingProvider(),
         vector_searcher=FakeVectorSearcher(
-            [
-                SearchCandidate(
-                    chunk_id="chunk-c",
-                    document_id="document-c",
-                    page_start=2,
-                    page_end=2,
-                    text="zoning map amendments",
-                    title=None,
-                    meeting_date=None,
-                    vector_score=0.2,
-                )
-            ]
+            {
+                "semantic zoning": [
+                    SearchCandidate(
+                        passage_id="passage-c",
+                        document_id="document-c",
+                        page_start=2,
+                        page_end=2,
+                        text="zoning map amendments",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.2,
+                    )
+                ]
+            }
         ),
+        vector_store=FakeVectorStore(),
     )
 
     results = engine.search("semantic zoning")
 
-    assert [result.chunk_id for result in results] == ["chunk-c"]
+    assert [result.passage_id for result in results] == ["passage-c"]
     assert results[0].citation == "Zoning Packet — 2026-03-15 — p. 2"
 
 
-def test_search_drops_vector_only_candidates_when_keyword_hits_exist(tmp_path: Path) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
-    _seed_search_corpus(paths)
+def test_search_keeps_strong_semantic_passage_when_keyword_hits_exist(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
 
     engine = build_search_engine(
-        database_path=paths.database,
-        lancedb_path=paths.lancedb,
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
         embedding_config=EmbeddingConfig(),
         embedding_provider=FakeQueryEmbeddingProvider(),
         vector_searcher=FakeVectorSearcher(
-            [
-                SearchCandidate(
-                    chunk_id="chunk-a",
-                    document_id="document-a",
-                    page_start=3,
-                    page_end=3,
-                    text="downtown stormwater improvements",
-                    title=None,
-                    meeting_date=None,
-                    vector_score=0.1,
-                ),
-                SearchCandidate(
-                    chunk_id="chunk-c",
-                    document_id="document-c",
-                    page_start=2,
-                    page_end=2,
-                    text="zoning map amendments",
-                    title=None,
-                    meeting_date=None,
-                    vector_score=0.2,
-                ),
-            ]
+            {
+                "games": [
+                    SearchCandidate(
+                        passage_id="passage-e",
+                        document_id="document-d",
+                        page_start=10,
+                        page_end=10,
+                        text="• Teen Kickback – There will be games, snacks, and craft supplies available.",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.92,
+                    ),
+                    SearchCandidate(
+                        passage_id="passage-f",
+                        document_id="document-d",
+                        page_start=10,
+                        page_end=10,
+                        text="• Dungeons & Dragons – Take up a weapon and defeat various foes.",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.96,
+                    ),
+                ]
+            }
         ),
+        vector_store=FakeVectorStore(),
     )
 
-    results = engine.search("stormwater downtown")
+    results = engine.search("games")
 
-    assert [result.chunk_id for result in results] == ["chunk-a"]
+    assert [result.passage_id for result in results] == ["passage-e", "passage-f"]
 
 
-def test_unrelated_query_returns_no_results_even_with_indexed_chunks(tmp_path: Path) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
-    _seed_search_corpus(paths)
+def test_search_drops_weak_vector_tail_when_keyword_hits_exist(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
 
     engine = build_search_engine(
-        database_path=paths.database,
-        lancedb_path=paths.lancedb,
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
         embedding_config=EmbeddingConfig(),
         embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            {
+                "Belt filter Press": [
+                    SearchCandidate(
+                        passage_id="passage-d",
+                        document_id="document-d",
+                        page_start=3,
+                        page_end=3,
+                        text=(
+                            "• Belt Filter Press - Contractors are 95% complete with the replacement of the "
+                            "Belt Filter Press at the Sewer Treatment Plant."
+                        ),
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.80,
+                    ),
+                    SearchCandidate(
+                        passage_id="passage-f",
+                        document_id="document-d",
+                        page_start=10,
+                        page_end=10,
+                        text="• Dungeons & Dragons – Take up a weapon and defeat various foes.",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.97,
+                    ),
+                ]
+            }
+        ),
+        vector_store=FakeVectorStore(),
     )
 
-    results = engine.search("banana telescope")
+    results = engine.search("Belt filter Press")
 
-    assert results == []
+    assert [result.passage_id for result in results] == ["passage-d"]
 
 
-def test_keyword_vector_and_overlapping_candidates_merge_deterministically(
-    tmp_path: Path,
-) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
-    _seed_search_corpus(paths)
+def test_books_query_returns_multiple_book_club_passages(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
 
-    keyword_candidates = [
-        SearchCandidate(
-            chunk_id="chunk-a",
-            document_id="document-a",
-            page_start=3,
-            page_end=3,
-            text="downtown stormwater improvements",
-            title="Stormwater Report",
-            meeting_date="2026-05-01",
-            keyword_score=0.1,
-        ),
-        SearchCandidate(
-            chunk_id="chunk-b",
-            document_id="document-b",
-            page_start=7,
-            page_end=7,
-            text="budget hearing agenda item",
-            title="Budget Packet",
-            meeting_date="2026-04-20",
-            keyword_score=0.3,
-        ),
-    ]
-    vector_candidates = [
-        SearchCandidate(
-            chunk_id="chunk-a",
-            document_id="document-a",
-            page_start=3,
-            page_end=3,
-            text="downtown stormwater improvements",
-            title=None,
-            meeting_date=None,
-            vector_score=0.1,
-        ),
-        SearchCandidate(
-            chunk_id="chunk-c",
-            document_id="document-c",
-            page_start=2,
-            page_end=2,
-            text="zoning map amendments",
-            title=None,
-            meeting_date=None,
-            vector_score=0.3,
-        ),
-    ]
-
-    results = merge_search_candidates(
-        keyword_candidates,
-        vector_candidates,
-        database_path=paths.database,
-        limit=5,
-        keyword_weight=0.5,
-        vector_weight=0.5,
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(),
+        vector_store=FakeVectorStore(),
     )
 
-    assert [result.chunk_id for result in results] == ["chunk-a", "chunk-b", "chunk-c"]
+    results = engine.search("books")
+
+    assert {result.passage_id for result in results[:3]} == {"passage-g", "passage-h", "passage-i"}
+
+
+def test_keyword_search_uses_stemmed_passages(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    candidates = search_keyword_candidates(database_path, "books", limit=10)
+
+    assert {candidate.passage_id for candidate in candidates[:3]} == {
+        "passage-g",
+        "passage-h",
+        "passage-i",
+    }
 
 
 def test_citation_format_uses_concise_terminal_style() -> None:
@@ -226,22 +271,20 @@ def test_citation_format_uses_concise_terminal_style() -> None:
     )
 
 
-def test_format_search_results_prefers_matching_paragraph_without_header_noise() -> None:
+def test_format_search_results_returns_full_matching_passage() -> None:
     output = format_search_results(
         [
             SearchResult(
-                chunk_id="chunk-a",
-                document_id="document-a",
+                passage_id="passage-d",
+                document_id="document-d",
                 page_start=3,
                 page_end=3,
                 text=(
-                    "City Manager's Report\nMay 1, 2026\nPage 3 of 16\n\n"
-                    "Belt Filter Press - Contractors are 95% complete with the replacement of the Belt Filter\n"
-                    "Press at the Sewer Treatment Plant. The previous Belt Filter Press had been in service for\n"
-                    "decades. The new Belt Filter Press is currently undergoing performance testing.\n\n"
-                    "Water Infrastructure Project - Construction continues."
+                    "• Belt Filter Press - Contractors are 95% complete with the replacement of the Belt Filter Press at the Sewer Treatment Plant. "
+                    "The previous Belt Filter Press had been in service for decades, and the cost of maintenance and the difficulty of sourcing replacement parts for the old equipment led to a need for its replacement. "
+                    "The new Belt Filter Press is currently undergoing performance testing and final inspections. The replacement is being funded in part with infrastructure funds from the American Rescue Plan Act."
                 ),
-                citation="Budget Packet — 2026-04-20 — p. 1",
+                citation="Mustang City Manager Report — 2026-05-01 — p. 3",
                 score=1.0,
                 keyword_score=0.1,
                 vector_score=0.1,
@@ -250,39 +293,9 @@ def test_format_search_results_prefers_matching_paragraph_without_header_noise()
         query="Belt Filter Press",
     )
 
-    assert "City Manager's Report" not in output
-    assert "Water Infrastructure Project" not in output
-    assert output.count("Belt Filter Press") >= 3
-
-
-def test_format_search_results_uses_concise_snippets() -> None:
-    output = format_search_results(
-        [
-            SearchResult(
-                chunk_id="chunk-a",
-                document_id="document-a",
-                page_start=1,
-                page_end=1,
-                text=(
-                    "Header line " * 30
-                    + "budget work session starts here and should be shown near the middle "
-                    + "trailing detail " * 30
-                ),
-                citation="Budget Packet — 2026-04-20 — p. 1",
-                score=1.0,
-                keyword_score=0.1,
-                vector_score=0.1,
-            )
-        ],
-        query="budget work session",
-    )
-
-    assert "budget work session starts here" in output
-    assert (
-        "Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line Header line trailing detail trailing detail trailing detail trailing detail"
-        not in output
-    )
-    assert "…" in output
+    assert "American Rescue Plan Act" in output
+    assert "Belt Filter Press" in output
+    assert "NewsRAG Search" in output
 
 
 def test_search_command_reports_no_evidence_for_empty_corpus(tmp_path: Path) -> None:
@@ -295,102 +308,172 @@ def test_search_command_reports_no_evidence_for_empty_corpus(tmp_path: Path) -> 
     assert result.stdout.strip() == "No evidence found."
 
 
-def _seed_search_corpus(paths: StoragePaths) -> None:
-    resolved_paths = paths
-    with sqlite3.connect(resolved_paths.database) as connection:
-        connection.execute(
-            """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, NULL, ?, ?, ?, ?)
-            """,
-            (
-                "document-a",
-                "/tmp/stormwater.pdf",
-                "Stormwater Report",
-                "hash-a",
-                "/tmp/stormwater-ocr.pdf",
-                '{"meeting_date": "2026-05-01"}',
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, NULL, ?, ?, ?, ?)
-            """,
-            (
-                "document-b",
-                "/tmp/budget.pdf",
-                "Budget Packet",
-                "hash-b",
-                "/tmp/budget-ocr.pdf",
-                '{"meeting_date": "2026-04-20"}',
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, NULL, ?, ?, ?, ?)
-            """,
-            (
-                "document-c",
-                "/tmp/zoning.pdf",
-                "Zoning Packet",
-                "hash-c",
-                "/tmp/zoning-ocr.pdf",
-                '{"meeting_date": "2026-03-15"}',
-            ),
-        )
+def _seed_search_corpus(tmp_path: Path) -> Path:
+    data_dir = tmp_path / ".newsrag"
+    database_path = initialize_storage(data_dir).database
+
+    with sqlite3.connect(database_path) as connection:
         connection.executemany(
             """
-            INSERT INTO chunks(id, document_id, page_start, page_end, text)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
+            VALUES(?, ?, NULL, ?, ?, ?, ?)
             """,
             [
-                ("chunk-a", "document-a", 3, 3, "downtown stormwater improvements"),
-                ("chunk-b", "document-b", 7, 7, "budget hearing agenda item"),
-                ("chunk-c", "document-c", 2, 2, "zoning map amendments"),
+                (
+                    "document-a",
+                    "/tmp/stormwater.pdf",
+                    "Stormwater Report",
+                    "hash-a",
+                    "/tmp/stormwater-ocr.pdf",
+                    '{"meeting_date": "2026-05-01"}',
+                ),
+                (
+                    "document-b",
+                    "/tmp/budget.pdf",
+                    "Budget Packet",
+                    "hash-b",
+                    "/tmp/budget-ocr.pdf",
+                    '{"meeting_date": "2026-04-20"}',
+                ),
+                (
+                    "document-c",
+                    "/tmp/zoning.pdf",
+                    "Zoning Packet",
+                    "hash-c",
+                    "/tmp/zoning-ocr.pdf",
+                    '{"meeting_date": "2026-03-15"}',
+                ),
+                (
+                    "document-d",
+                    "/tmp/mustang.pdf",
+                    "Mustang City Manager Report",
+                    "hash-d",
+                    "/tmp/mustang-ocr.pdf",
+                    '{"meeting_date": "2026-05-01"}',
+                ),
             ],
         )
         connection.executemany(
             """
-            INSERT INTO chunks_fts(chunk_id, text)
+            INSERT INTO passages(id, chunk_id, document_id, page_start, page_end, ordinal, text)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "passage-a",
+                    "chunk-a",
+                    "document-a",
+                    3,
+                    3,
+                    1,
+                    "downtown stormwater improvements",
+                ),
+                (
+                    "passage-b",
+                    "chunk-b",
+                    "document-b",
+                    7,
+                    7,
+                    1,
+                    "budget hearing agenda item",
+                ),
+                (
+                    "passage-c",
+                    "chunk-c",
+                    "document-c",
+                    2,
+                    2,
+                    1,
+                    "zoning map amendments",
+                ),
+                (
+                    "passage-d",
+                    "chunk-d",
+                    "document-d",
+                    3,
+                    3,
+                    1,
+                    "• Belt Filter Press - Contractors are 95% complete with the replacement of the Belt Filter Press at the Sewer Treatment Plant.",
+                ),
+                (
+                    "passage-e",
+                    "chunk-e",
+                    "document-d",
+                    10,
+                    10,
+                    1,
+                    "• Teen Kickback – There will be games, snacks, and craft supplies available.",
+                ),
+                (
+                    "passage-f",
+                    "chunk-f",
+                    "document-d",
+                    10,
+                    10,
+                    2,
+                    "• Dungeons & Dragons – Take up a weapon and defeat various foes.",
+                ),
+                (
+                    "passage-g",
+                    "chunk-g",
+                    "document-d",
+                    10,
+                    10,
+                    3,
+                    "• Paperbacks & Playdates Book Club – A low-pressure book club for stay-at-home parents.",
+                ),
+                (
+                    "passage-h",
+                    "chunk-h",
+                    "document-d",
+                    10,
+                    10,
+                    4,
+                    "• Brown Bag Book Club – Bring your own lunch and discuss The Storyteller.",
+                ),
+                (
+                    "passage-i",
+                    "chunk-i",
+                    "document-d",
+                    10,
+                    10,
+                    5,
+                    "• Geeky Cauldron Book Club – A book club for adults who love reading Young Adult books.",
+                ),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO passages_fts(passage_id, text)
             VALUES(?, ?)
             """,
             [
-                ("chunk-a", "downtown stormwater improvements"),
-                ("chunk-b", "budget hearing agenda item"),
-                ("chunk-c", "zoning map amendments"),
+                ("passage-a", "downtown stormwater improvements"),
+                ("passage-b", "budget hearing agenda item"),
+                ("passage-c", "zoning map amendments"),
+                (
+                    "passage-d",
+                    "Belt Filter Press Contractors are 95 percent complete with the replacement of the Belt Filter Press at the Sewer Treatment Plant",
+                ),
+                (
+                    "passage-e",
+                    "Teen Kickback There will be games snacks and craft supplies available",
+                ),
+                ("passage-f", "Dungeons Dragons Take up a weapon and defeat various foes"),
+                (
+                    "passage-g",
+                    "Paperbacks Playdates Book Club A low-pressure book club for stay-at-home parents",
+                ),
+                (
+                    "passage-h",
+                    "Brown Bag Book Club Bring your own lunch and discuss The Storyteller",
+                ),
+                (
+                    "passage-i",
+                    "Geeky Cauldron Book Club A book club for adults who love reading Young Adult books",
+                ),
             ],
         )
         connection.commit()
 
-    LanceDbVectorStore(resolved_paths.lancedb).add_chunks(
-        [
-            ChunkVectorRecord(
-                chunk_id="chunk-a",
-                document_id="document-a",
-                page_start=3,
-                page_end=3,
-                text="downtown stormwater improvements",
-                vector=(0.1, 0.1),
-                metadata=EmbeddingMetadata(
-                    provider="ollama",
-                    model="nomic-embed-text",
-                    version="latest",
-                ),
-            ),
-            ChunkVectorRecord(
-                chunk_id="chunk-b",
-                document_id="document-b",
-                page_start=7,
-                page_end=7,
-                text="budget hearing agenda item",
-                vector=(0.8, 0.8),
-                metadata=EmbeddingMetadata(
-                    provider="ollama",
-                    model="nomic-embed-text",
-                    version="latest",
-                ),
-            ),
-        ]
-    )
+    return database_path

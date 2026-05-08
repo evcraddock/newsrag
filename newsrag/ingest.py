@@ -27,6 +27,8 @@ from newsrag.embeddings import (
     create_embedding_record,
 )
 from newsrag.jobs import Job, create_job
+from newsrag.passages import build_passage_rows
+from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.storage import StoragePaths, initialize_storage
 
 INGEST_JOB_KIND = "ingest-file"
@@ -316,6 +318,7 @@ class IngestionPipeline:
             _resolve_embedding_config(embedding_config)
         )
         self.vector_store = vector_store or LanceDbVectorStore(storage_paths.lancedb)
+        self.passage_vector_store = LanceDbPassageVectorStore(storage_paths.lancedb)
 
     async def handle_job(self, job: Job) -> None:
         await asyncio.to_thread(self.process_job, job)
@@ -355,8 +358,18 @@ class IngestionPipeline:
                 chunks,
                 chunk_embeddings,
             )
+            passage_rows = _build_passage_rows_from_chunks(chunk_rows)
+            passage_embeddings = self.embedding_provider.embed_chunks(
+                [passage_row[6] for passage_row in passage_rows]
+            )
+            if len(passage_embeddings) != len(passage_rows):
+                raise IngestError(
+                    f"Embedded {len(passage_embeddings)} passages for {len(passage_rows)} passage rows"
+                )
+            passage_vector_rows = _build_passage_vector_rows(passage_rows, passage_embeddings)
 
             self.vector_store.add_chunks(vector_rows)
+            self.passage_vector_store.add_passages(passage_vector_rows)
             _persist_document_bundle(
                 self.storage_paths.database,
                 document_id=document_id,
@@ -369,6 +382,8 @@ class IngestionPipeline:
                 pages=page_rows,
                 chunks=chunk_rows,
                 chunk_embeddings=chunk_embeddings,
+                passages=passage_rows,
+                passage_embeddings=passage_embeddings,
             )
         except IngestError:
             raise
@@ -728,6 +743,52 @@ def _build_chunk_and_vector_rows(
     return chunk_rows, vector_rows
 
 
+def _build_passage_rows_from_chunks(
+    chunks: Sequence[tuple[str, str, int, int, str]],
+) -> list[tuple[str, str, str, int, int, int, str]]:
+    passage_rows: list[tuple[str, str, str, int, int, int, str]] = []
+    for chunk_id, document_id, page_start, page_end, text in chunks:
+        for passage in build_passage_rows(
+            chunk_id=chunk_id,
+            document_id=document_id,
+            page_start=page_start,
+            page_end=page_end,
+            text=text,
+        ):
+            passage_rows.append(
+                (
+                    passage.id,
+                    passage.chunk_id,
+                    passage.document_id,
+                    passage.page_start,
+                    passage.page_end,
+                    passage.ordinal,
+                    passage.text,
+                )
+            )
+    return passage_rows
+
+
+def _build_passage_vector_rows(
+    passages: Sequence[tuple[str, str, str, int, int, int, str]],
+    embeddings: Sequence[ChunkEmbedding],
+) -> list[PassageVectorRecord]:
+    return [
+        PassageVectorRecord(
+            passage_id=passage_id,
+            document_id=document_id,
+            page_start=page_start,
+            page_end=page_end,
+            text=text,
+            vector=embedding.vector,
+            metadata=embedding.metadata,
+        )
+        for (passage_id, _, document_id, page_start, page_end, _, text), embedding in zip(
+            passages, embeddings, strict=True
+        )
+    ]
+
+
 def _persist_document_bundle(
     database_path: Path,
     *,
@@ -741,6 +802,8 @@ def _persist_document_bundle(
     pages: Sequence[tuple[str, str, int, str]],
     chunks: Sequence[tuple[str, str, int, int, str]],
     chunk_embeddings: Sequence[ChunkEmbedding],
+    passages: Sequence[tuple[str, str, str, int, int, int, str]],
+    passage_embeddings: Sequence[ChunkEmbedding],
 ) -> None:
     metadata_json = json.dumps(metadata, sort_keys=True)
 
@@ -789,6 +852,20 @@ def _persist_document_bundle(
             """,
             [(chunk_id, text) for chunk_id, _, _, _, text in chunks],
         )
+        connection.executemany(
+            """
+            INSERT INTO passages(id, chunk_id, document_id, page_start, page_end, ordinal, text)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            passages,
+        )
+        connection.executemany(
+            """
+            INSERT INTO passages_fts(passage_id, text)
+            VALUES(?, ?)
+            """,
+            [(passage_id, text) for passage_id, _, _, _, _, _, text in passages],
+        )
         connection.commit()
 
     for chunk_row, embedding in zip(chunks, chunk_embeddings, strict=True):
@@ -796,6 +873,14 @@ def _persist_document_bundle(
             database_path,
             source_kind="chunk",
             source_key=chunk_row[0],
+            embedding=embedding,
+        )
+
+    for passage_row, embedding in zip(passages, passage_embeddings, strict=True):
+        create_embedding_record(
+            database_path,
+            source_kind="passage",
+            source_key=passage_row[0],
             embedding=embedding,
         )
 
