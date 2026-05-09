@@ -20,10 +20,18 @@ from newsrag.embeddings import (
 )
 from newsrag.ingest import (
     INGEST_JOB_KIND,
+    PDF_EXTRACTOR_AUTO,
+    PDF_EXTRACTOR_PDFPLUMBER,
+    PDF_EXTRACTOR_PYMUPDF,
+    PDF_EXTRACTOR_TABLE,
     ExtractedPage,
+    FallbackTextExtractor,
     IngestError,
     LanceDbVectorStore,
+    PdfPlumberTextExtractor,
+    PyMuPdfTextExtractor,
     build_ingest_handler,
+    build_pdf_text_extractor,
     enqueue_ingest_url_job,
     list_chunk_vectors,
     list_chunks,
@@ -69,6 +77,31 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     assert jobs[0].payload["metadata"]["body"] == "City Council"
     assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
     assert jobs[1].payload["metadata"]["body"] == "City Council"
+
+
+def test_ingest_command_records_pdf_extractor_mode(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "ingest",
+            str(source_pdf),
+            "--pdf-extractor",
+            PDF_EXTRACTOR_TABLE,
+        ],
+    )
+
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+
+    assert result.exit_code == 0, result.stdout
+    assert len(jobs) == 1
+    assert jobs[0].payload["pdf_extractor"] == PDF_EXTRACTOR_TABLE
 
 
 def test_ingest_url_command_downloads_pdf_and_enqueues_job(
@@ -448,6 +481,98 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert {vector["document_id"] for vector in vectors} == {documents[0].id}
 
 
+def test_build_pdf_text_extractor_can_choose_extraction_path_under_test() -> None:
+    assert isinstance(build_pdf_text_extractor(PDF_EXTRACTOR_AUTO), FallbackTextExtractor)
+    assert isinstance(build_pdf_text_extractor(PDF_EXTRACTOR_PYMUPDF), PyMuPdfTextExtractor)
+    assert isinstance(build_pdf_text_extractor(PDF_EXTRACTOR_PDFPLUMBER), PdfPlumberTextExtractor)
+    assert isinstance(build_pdf_text_extractor(PDF_EXTRACTOR_TABLE), PdfPlumberTextExtractor)
+
+
+def test_low_quality_primary_extraction_falls_back_and_persists_page_provenance(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {}},
+    )
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FallbackTextExtractor(
+            primary=FakeTextExtractor(
+                pages=[ExtractedPage(page_number=1, text="", extractor="pymupdf")]
+            ),
+            fallback=FakeTextExtractor(
+                pages=[ExtractedPage(page_number=1, text="Fallback agenda", extractor="pdfplumber")]
+            ),
+        ),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    processed = asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    pages = list_pages(paths.database)
+
+    assert processed is True
+    assert get_job(paths.database, job.id).status == "done"
+    assert len(pages) == 1
+    assert pages[0].document_id == list_documents(paths.database)[0].id
+    assert pages[0].page_number == 1
+    assert pages[0].text == "Fallback agenda"
+    assert pages[0].extractor == "pdfplumber"
+
+
+def test_extraction_failures_are_recorded_with_document_path_and_stage(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {}},
+    )
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FallbackTextExtractor(primary=FailingTextExtractor()),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, job.id)
+
+    assert updated_job.status == FAILED
+    assert str(source_pdf.resolve()) in (updated_job.error or "")
+    assert "primary PDF text extraction" in (updated_job.error or "")
+    assert "extract boom" in (updated_job.error or "")
+    assert list_pages(paths.database) == []
+
+
 def test_reingesting_unchanged_pdf_does_not_duplicate_records(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     source_pdf = tmp_path / "packet.pdf"
@@ -550,6 +675,15 @@ class FakeTextExtractor:
     def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
         del pdf_path
         return list(self.pages)
+
+
+@dataclass(frozen=True)
+class FailingTextExtractor:
+    extractor_name: str = "failing"
+
+    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
+        del pdf_path
+        raise RuntimeError("extract boom")
 
 
 @dataclass(frozen=True)

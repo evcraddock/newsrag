@@ -8,15 +8,16 @@ import sqlite3
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import unquote, urlparse
 
 import fitz  # type: ignore[import-untyped]
 import httpx
 import lancedb  # type: ignore[import-untyped]
+import pdfplumber
 
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import (
@@ -37,6 +38,19 @@ DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 VECTOR_TABLE_NAME = "chunk_embeddings"
+PDF_EXTRACTOR_AUTO: Literal["auto"] = "auto"
+PDF_EXTRACTOR_PYMUPDF: Literal["pymupdf"] = "pymupdf"
+PDF_EXTRACTOR_PDFPLUMBER: Literal["pdfplumber"] = "pdfplumber"
+PDF_EXTRACTOR_TABLE: Literal["table"] = "table"
+PDF_EXTRACTOR_MODES = frozenset(
+    {
+        PDF_EXTRACTOR_AUTO,
+        PDF_EXTRACTOR_PYMUPDF,
+        PDF_EXTRACTOR_PDFPLUMBER,
+        PDF_EXTRACTOR_TABLE,
+    }
+)
+PdfExtractorMode = Literal["auto", "pymupdf", "pdfplumber", "table"]
 
 
 class IngestError(Exception):
@@ -49,6 +63,7 @@ class ExtractedPage:
 
     page_number: int
     text: str
+    extractor: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -82,6 +97,7 @@ class PageRecord:
     document_id: str
     page_number: int
     text: str
+    extractor: str
     created_at: str
 
 
@@ -215,12 +231,101 @@ class SubprocessOcrRunner:
 class PyMuPdfTextExtractor:
     """Text extraction backed by PyMuPDF."""
 
+    extractor_name: str = PDF_EXTRACTOR_PYMUPDF
+
     def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        pages: list[ExtractedPage] = []
-        with fitz.open(pdf_path) as document:
-            for index, page in enumerate(document, start=1):
-                pages.append(ExtractedPage(page_number=index, text=page.get_text().strip()))
-        return pages
+        try:
+            pages: list[ExtractedPage] = []
+            with fitz.open(pdf_path) as document:
+                for index, page in enumerate(document, start=1):
+                    pages.append(
+                        ExtractedPage(
+                            page_number=index,
+                            text=page.get_text().strip(),
+                            extractor=self.extractor_name,
+                        )
+                    )
+            return pages
+        except Exception as exc:
+            raise IngestError(f"PyMuPDF extraction failed for {pdf_path}: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class PdfPlumberTextExtractor:
+    """Text extraction backed by pdfplumber."""
+
+    extractor_name: str = PDF_EXTRACTOR_PDFPLUMBER
+
+    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
+        try:
+            pages: list[ExtractedPage] = []
+            with pdfplumber.open(pdf_path) as document:
+                for index, page in enumerate(document.pages, start=1):
+                    text = page.extract_text() or ""
+                    pages.append(
+                        ExtractedPage(
+                            page_number=index,
+                            text=text.strip(),
+                            extractor=self.extractor_name,
+                        )
+                    )
+            return pages
+        except Exception as exc:
+            raise IngestError(f"pdfplumber extraction failed for {pdf_path}: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class FallbackTextExtractor:
+    """Run a primary extractor and fall back when page text quality is unusable."""
+
+    primary: TextExtractor = field(default_factory=PyMuPdfTextExtractor)
+    fallback: TextExtractor = field(default_factory=PdfPlumberTextExtractor)
+
+    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
+        primary_pages = _extract_with_stage_context(
+            self.primary,
+            pdf_path,
+            stage="primary",
+        )
+        if not _has_usable_page_text(primary_pages):
+            return _extract_with_stage_context(
+                self.fallback,
+                pdf_path,
+                stage="fallback",
+            )
+        return primary_pages
+
+
+def build_pdf_text_extractor(mode: PdfExtractorMode = PDF_EXTRACTOR_AUTO) -> TextExtractor:
+    """Build the configured PDF text extraction path."""
+
+    if mode == PDF_EXTRACTOR_AUTO:
+        return FallbackTextExtractor()
+    if mode == PDF_EXTRACTOR_PYMUPDF:
+        return PyMuPdfTextExtractor()
+    if mode in {PDF_EXTRACTOR_PDFPLUMBER, PDF_EXTRACTOR_TABLE}:
+        return PdfPlumberTextExtractor()
+    raise IngestError(f"Unsupported PDF extractor mode: {mode}")
+
+
+def normalize_pdf_extractor_mode(value: str | None) -> PdfExtractorMode:
+    """Normalize and validate a PDF extractor mode option."""
+
+    if value is None or not value.strip():
+        return PDF_EXTRACTOR_AUTO
+
+    normalized = value.strip().lower()
+    if normalized == PDF_EXTRACTOR_AUTO:
+        return PDF_EXTRACTOR_AUTO
+    if normalized == PDF_EXTRACTOR_PYMUPDF:
+        return PDF_EXTRACTOR_PYMUPDF
+    if normalized == PDF_EXTRACTOR_PDFPLUMBER:
+        return PDF_EXTRACTOR_PDFPLUMBER
+    if normalized == PDF_EXTRACTOR_TABLE:
+        return PDF_EXTRACTOR_TABLE
+
+    allowed = ", ".join(sorted(PDF_EXTRACTOR_MODES))
+    raise IngestError(f"Unsupported PDF extractor mode: {value}; expected one of: {allowed}")
 
 
 @dataclass(frozen=True)
@@ -312,7 +417,7 @@ class IngestionPipeline:
     ) -> None:
         self.storage_paths = storage_paths
         self.ocr_runner = ocr_runner or SubprocessOcrRunner()
-        self.text_extractor = text_extractor or PyMuPdfTextExtractor()
+        self.text_extractor = text_extractor
         self.chunker = chunker or PageChunker()
         self.embedding_provider = embedding_provider or build_embedding_provider(
             _resolve_embedding_config(embedding_config)
@@ -340,7 +445,15 @@ class IngestionPipeline:
             normalized_path = self.storage_paths.ocr_pdfs / f"{source_hash}.pdf"
             self.ocr_runner.normalize_pdf(source_copy_path, normalized_path)
 
-            pages = self.text_extractor.extract_pages(normalized_path)
+            text_extractor = self.text_extractor or build_pdf_text_extractor(
+                _payload_pdf_extractor_mode(job.payload)
+            )
+            try:
+                pages = text_extractor.extract_pages(normalized_path)
+            except IngestError as exc:
+                raise IngestError(
+                    f"Failed extracting text for {source_path} from {normalized_path}: {exc}"
+                ) from exc
             chunks = self.chunker.chunk_pages(pages)
             chunk_embeddings = self.embedding_provider.embed_chunks(
                 [chunk.text for chunk in chunks]
@@ -396,21 +509,25 @@ def enqueue_ingest_jobs(
     *,
     source_path: Path,
     metadata: dict[str, Any] | None = None,
+    pdf_extractor: str | None = None,
 ) -> list[Job]:
     """Enqueue local-PDF ingestion jobs for one file or directory."""
 
     payload_metadata = dict(metadata or {})
+    payload: dict[str, Any] = {
+        "metadata": payload_metadata,
+        "source": "cli",
+    }
+    if pdf_extractor is not None:
+        payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
+
     jobs: list[Job] = []
     for pdf_path in _iter_pdf_inputs(source_path):
         jobs.append(
             create_job(
                 database_path,
                 kind=INGEST_JOB_KIND,
-                payload={
-                    "path": str(pdf_path),
-                    "metadata": payload_metadata,
-                    "source": "cli",
-                },
+                payload={**payload, "path": str(pdf_path)},
             )
         )
     return jobs
@@ -423,6 +540,7 @@ def enqueue_ingest_url_job(
     url: str,
     metadata: dict[str, Any] | None = None,
     downloader: PdfDownloader | None = None,
+    pdf_extractor: str | None = None,
 ) -> Job:
     """Download one direct PDF URL and enqueue it for ingestion."""
 
@@ -432,14 +550,18 @@ def enqueue_ingest_url_job(
     payload_metadata["source_url"] = downloaded_pdf.source_url
     payload_metadata["retrieved_at"] = downloaded_pdf.retrieved_at
 
+    payload: dict[str, Any] = {
+        "path": str(downloaded_pdf.path),
+        "metadata": payload_metadata,
+        "source": "ingest-url",
+    }
+    if pdf_extractor is not None:
+        payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
+
     return create_job(
         database_path,
         kind=INGEST_JOB_KIND,
-        payload={
-            "path": str(downloaded_pdf.path),
-            "metadata": payload_metadata,
-            "source": "ingest-url",
-        },
+        payload=payload,
     )
 
 
@@ -527,7 +649,7 @@ def list_pages(database_path: Path) -> list[PageRecord]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, document_id, page_number, text, created_at
+            SELECT id, document_id, page_number, text, extractor, created_at
             FROM pages
             ORDER BY document_id ASC, page_number ASC, id ASC
             """
@@ -539,6 +661,7 @@ def list_pages(database_path: Path) -> list[PageRecord]:
             document_id=str(row["document_id"]),
             page_number=int(row["page_number"]),
             text=str(row["text"]),
+            extractor=str(row["extractor"]),
             created_at=str(row["created_at"]),
         )
         for row in rows
@@ -586,6 +709,34 @@ def list_chunk_vectors(
 
     rows = table.to_arrow().to_pylist()
     return [dict(row) for row in rows if isinstance(row, dict)]
+
+
+def _extract_with_stage_context(
+    extractor: TextExtractor,
+    pdf_path: Path,
+    *,
+    stage: str,
+) -> list[ExtractedPage]:
+    extractor_name = _extractor_name(extractor)
+    try:
+        return extractor.extract_pages(pdf_path)
+    except IngestError as exc:
+        raise IngestError(
+            f"{stage} PDF text extraction with {extractor_name} failed for {pdf_path}: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise IngestError(
+            f"{stage} PDF text extraction with {extractor_name} failed for {pdf_path}: {exc}"
+        ) from exc
+
+
+def _extractor_name(extractor: TextExtractor) -> str:
+    name = getattr(extractor, "extractor_name", extractor.__class__.__name__)
+    return str(name)
+
+
+def _has_usable_page_text(pages: Sequence[ExtractedPage]) -> bool:
+    return any(page.text.strip() for page in pages)
 
 
 def _iter_pdf_inputs(source_path: Path) -> tuple[Path, ...]:
@@ -641,6 +792,15 @@ def _payload_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(metadata, dict):
         return dict(metadata)
     return {}
+
+
+def _payload_pdf_extractor_mode(payload: dict[str, Any]) -> PdfExtractorMode:
+    value = payload.get("pdf_extractor")
+    if value is None:
+        return PDF_EXTRACTOR_AUTO
+    if not isinstance(value, str):
+        raise IngestError("Ingest job payload pdf_extractor must be a string")
+    return normalize_pdf_extractor_mode(value)
 
 
 def _metadata_source_url(metadata: dict[str, Any]) -> str | None:
@@ -711,9 +871,16 @@ def _resolve_document_title(metadata: dict[str, Any], source_path: Path) -> str:
 
 def _build_page_rows(
     document_id: str, pages: Sequence[ExtractedPage]
-) -> list[tuple[str, str, int, str]]:
+) -> list[tuple[str, str, int, str, str]]:
     return [
-        (f"page-{uuid.uuid4().hex[:8]}", document_id, page.page_number, page.text) for page in pages
+        (
+            f"page-{uuid.uuid4().hex[:8]}",
+            document_id,
+            page.page_number,
+            page.text,
+            page.extractor,
+        )
+        for page in pages
     ]
 
 
@@ -799,7 +966,7 @@ def _persist_document_bundle(
     source_hash: str,
     normalized_path: Path,
     metadata: dict[str, Any],
-    pages: Sequence[tuple[str, str, int, str]],
+    pages: Sequence[tuple[str, str, int, str, str]],
     chunks: Sequence[tuple[str, str, int, int, str]],
     chunk_embeddings: Sequence[ChunkEmbedding],
     passages: Sequence[tuple[str, str, str, int, int, int, str]],
@@ -833,8 +1000,8 @@ def _persist_document_bundle(
         )
         connection.executemany(
             """
-            INSERT INTO pages(id, document_id, page_number, text)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO pages(id, document_id, page_number, text, extractor)
+            VALUES(?, ?, ?, ?, ?)
             """,
             pages,
         )

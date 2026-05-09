@@ -106,6 +106,7 @@ SCHEMA_STATEMENTS = (
         document_id TEXT NOT NULL,
         page_number INTEGER NOT NULL,
         text TEXT NOT NULL DEFAULT '',
+        extractor TEXT NOT NULL DEFAULT 'unknown',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(document_id) REFERENCES documents(id)
     )
@@ -326,6 +327,7 @@ def _initialize_database(database_path: Path) -> None:
         _ensure_column(connection, "documents", "source_hash", "TEXT")
         _ensure_column(connection, "documents", "normalized_path", "TEXT")
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(connection, "pages", "extractor", "TEXT NOT NULL DEFAULT 'unknown'")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash)"
         )
