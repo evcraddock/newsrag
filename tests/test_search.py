@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from newsrag.embeddings import ChunkEmbedding, EmbeddingMetadata, QueryEmbedding
 from newsrag.search import (
     PassageVectorRecord,
     SearchCandidate,
+    SearchFilters,
     SearchResult,
     build_search_engine,
     format_citation,
@@ -22,6 +24,10 @@ from newsrag.search import (
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
+
+
+def _strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,125 @@ def test_search_over_indexed_passages_returns_ranked_cited_passages(tmp_path: Pa
         "passage-e",
         "passage-f",
     }
+
+
+def test_search_filters_by_document_metadata_and_meeting_date(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(),
+        vector_store=FakeVectorStore(),
+    )
+
+    results = engine.search(
+        "stormwater downtown",
+        filters=SearchFilters(
+            body="Planning Commission",
+            document_type="staff_report",
+            jurisdiction="Example City",
+            source_url="https://example.test/stormwater.pdf",
+            since="2025-01-01",
+        ),
+    )
+
+    assert [result.passage_id for result in results] == ["passage-a"]
+    assert results[0].body == "Planning Commission"
+    assert results[0].document_type == "staff_report"
+    assert results[0].jurisdiction == "Example City"
+    assert results[0].source_url == "https://example.test/stormwater.pdf"
+
+
+def test_search_filters_vector_candidates_without_leaking_out_of_filter_results(
+    tmp_path: Path,
+) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            {
+                "semantic zoning": [
+                    SearchCandidate(
+                        passage_id="passage-c",
+                        document_id="document-c",
+                        page_start=2,
+                        page_end=2,
+                        text="zoning map amendments",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.1,
+                    ),
+                    SearchCandidate(
+                        passage_id="passage-a",
+                        document_id="document-a",
+                        page_start=3,
+                        page_end=3,
+                        text="downtown stormwater improvements",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.2,
+                    ),
+                ]
+            }
+        ),
+        vector_store=FakeVectorStore(),
+    )
+
+    results = engine.search("semantic zoning", filters=SearchFilters(body="Planning Commission"))
+
+    assert [result.passage_id for result in results] == ["passage-a"]
+
+
+def test_filtered_no_result_output_mentions_filters(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(),
+        vector_store=FakeVectorStore(),
+    )
+
+    results = engine.search("stormwater downtown", filters=SearchFilters(body="City Council"))
+    output = format_search_results(
+        results,
+        query="stormwater downtown",
+        filters=SearchFilters(body="City Council"),
+    )
+
+    assert output == "No evidence found matching filters: body=City Council."
+
+
+def test_search_rejects_invalid_date_filters(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    initialize_storage(data_dir)
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "search", "stormwater", "--since", "bad-date"]
+    )
+
+    assert result.exit_code == 1
+    assert "Invalid --since date 'bad-date'; expected YYYY-MM-DD" in result.stdout
+
+
+def test_search_help_documents_metadata_filters() -> None:
+    result = runner.invoke(app, ["search", "--help"])
+    plain_output = _strip_ansi(result.stdout)
+
+    assert result.exit_code == 0
+    assert "--body" in plain_output
+    assert "--document-type" in plain_output
+    assert "--source-url" in plain_output
+    assert "--since" in plain_output
 
 
 def test_search_uses_vector_candidates_when_keyword_search_is_empty(tmp_path: Path) -> None:
@@ -316,40 +441,44 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
         connection.executemany(
             """
             INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, NULL, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     "document-a",
                     "/tmp/stormwater.pdf",
+                    "https://example.test/stormwater.pdf",
                     "Stormwater Report",
                     "hash-a",
                     "/tmp/stormwater-ocr.pdf",
-                    '{"meeting_date": "2026-05-01"}',
+                    '{"body": "Planning Commission", "document_type": "staff_report", "jurisdiction": "Example City", "meeting_date": "2026-05-01"}',
                 ),
                 (
                     "document-b",
                     "/tmp/budget.pdf",
+                    "https://example.test/budget.pdf",
                     "Budget Packet",
                     "hash-b",
                     "/tmp/budget-ocr.pdf",
-                    '{"meeting_date": "2026-04-20"}',
+                    '{"body": "City Council", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-04-20"}',
                 ),
                 (
                     "document-c",
                     "/tmp/zoning.pdf",
+                    "https://example.test/zoning.pdf",
                     "Zoning Packet",
                     "hash-c",
                     "/tmp/zoning-ocr.pdf",
-                    '{"meeting_date": "2026-03-15"}',
+                    '{"body": "Zoning Board", "document_type": "packet", "jurisdiction": "Example City", "meeting_date": "2026-03-15"}',
                 ),
                 (
                     "document-d",
                     "/tmp/mustang.pdf",
+                    "https://example.test/mustang.pdf",
                     "Mustang City Manager Report",
                     "hash-d",
                     "/tmp/mustang-ocr.pdf",
-                    '{"meeting_date": "2026-05-01"}',
+                    '{"body": "City Manager", "document_type": "manager_report", "jurisdiction": "Mustang", "meeting_date": "2026-05-01"}',
                 ),
             ],
         )

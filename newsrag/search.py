@@ -4,6 +4,7 @@ import json
 import sqlite3
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Protocol
 
@@ -35,6 +36,49 @@ class SearchError(Exception):
 
 
 @dataclass(frozen=True)
+class SearchFilters:
+    """Metadata filters applied to search results."""
+
+    body: str | None = None
+    document_type: str | None = None
+    jurisdiction: str | None = None
+    source_url: str | None = None
+    since: str | None = None
+    until: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """Return whether any filter is active."""
+
+        return bool(self.labels())
+
+    def labels(self) -> tuple[str, ...]:
+        """Return human-readable active filter labels."""
+
+        labels = []
+        for name, value in (
+            ("body", self.body),
+            ("document_type", self.document_type),
+            ("jurisdiction", self.jurisdiction),
+            ("source_url", self.source_url),
+            ("since", self.since),
+            ("until", self.until),
+        ):
+            resolved_value = _optional_string(value)
+            if resolved_value is not None:
+                labels.append(f"{name}={resolved_value}")
+        return tuple(labels)
+
+    def validate(self) -> None:
+        """Validate filter values before search execution."""
+
+        since_date = _parse_filter_date(self.since, option_name="--since")
+        until_date = _parse_filter_date(self.until, option_name="--until")
+        if since_date is not None and until_date is not None and since_date > until_date:
+            raise SearchError("Invalid date range: --since must be on or before --until")
+
+
+@dataclass(frozen=True)
 class PassageVectorRecord:
     """One passage vector ready for LanceDB persistence."""
 
@@ -58,6 +102,10 @@ class SearchCandidate:
     text: str
     title: str | None
     meeting_date: str | None
+    body: str | None = None
+    document_type: str | None = None
+    jurisdiction: str | None = None
+    source_url: str | None = None
     keyword_score: float | None = None
     vector_score: float | None = None
 
@@ -75,6 +123,10 @@ class SearchResult:
     score: float
     keyword_score: float | None
     vector_score: float | None
+    body: str | None = None
+    document_type: str | None = None
+    jurisdiction: str | None = None
+    source_url: str | None = None
 
 
 class Reranker(Protocol):
@@ -192,10 +244,18 @@ class SearchEngine:
     keyword_weight: float = DEFAULT_KEYWORD_WEIGHT
     vector_weight: float = DEFAULT_VECTOR_WEIGHT
 
-    def search(self, query: str, *, limit: int = DEFAULT_SEARCH_LIMIT) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        filters: SearchFilters | None = None,
+    ) -> list[SearchResult]:
         normalized_query = query.strip()
         if not normalized_query:
             raise SearchError("Search query must not be empty")
+        resolved_filters = filters or SearchFilters()
+        resolved_filters.validate()
         if _count_passages(self.database_path) == 0:
             return []
 
@@ -205,14 +265,17 @@ class SearchEngine:
             vector_store=self.vector_store,
         )
         candidate_limit = max(limit * 4, DEFAULT_SEARCH_CANDIDATE_LIMIT)
-        keyword_candidates = _expand_contextual_keyword_candidates(
-            self.database_path,
-            search_keyword_candidates(
+        keyword_candidates = _filter_candidates_by_metadata(
+            _expand_contextual_keyword_candidates(
                 self.database_path,
-                normalized_query,
+                search_keyword_candidates(
+                    self.database_path,
+                    normalized_query,
+                    limit=candidate_limit,
+                ),
                 limit=candidate_limit,
             ),
-            limit=candidate_limit,
+            filters=resolved_filters,
         )
         query_embedding = self.embedding_provider.embed_query(normalized_query)
         vector_candidates = _filter_vector_candidates(
@@ -226,6 +289,7 @@ class SearchEngine:
             limit=limit,
             keyword_weight=self.keyword_weight,
             vector_weight=self.vector_weight,
+            filters=resolved_filters,
         )
         return self.reranker.rerank(results)
 
@@ -275,6 +339,7 @@ def search_keyword_candidates(
                 passages.page_end AS page_end,
                 passages.text AS passage_text,
                 documents.title AS title,
+                documents.source_url AS source_url,
                 documents.metadata_json AS metadata_json,
                 bm25(passages_fts) AS keyword_score
             FROM passages_fts
@@ -299,6 +364,11 @@ def search_keyword_candidates(
                 text=str(row["passage_text"]),
                 title=str(row["title"]) if row["title"] is not None else None,
                 meeting_date=_optional_string(metadata.get("meeting_date")),
+                body=_optional_string(metadata.get("body")),
+                document_type=_optional_string(metadata.get("document_type")),
+                jurisdiction=_optional_string(metadata.get("jurisdiction")),
+                source_url=_optional_string(row["source_url"])
+                or _optional_string(metadata.get("source_url")),
                 keyword_score=float(row["keyword_score"]),
             )
         )
@@ -313,15 +383,29 @@ def merge_search_candidates(
     limit: int,
     keyword_weight: float,
     vector_weight: float,
+    filters: SearchFilters | None = None,
 ) -> list[SearchResult]:
     """Merge keyword and vector candidates into ranked search results."""
 
-    passage_context = _load_passage_context(database_path, keyword_candidates, vector_candidates)
+    resolved_filters = filters or SearchFilters()
+    passage_context = _filter_passage_context_by_metadata(
+        _load_passage_context(database_path, keyword_candidates, vector_candidates),
+        filters=resolved_filters,
+    )
+    filtered_passage_ids = set(passage_context)
     keyword_normalized = _normalize_lower_better_scores(
-        {candidate.passage_id: candidate.keyword_score for candidate in keyword_candidates}
+        {
+            candidate.passage_id: candidate.keyword_score
+            for candidate in keyword_candidates
+            if candidate.passage_id in filtered_passage_ids
+        }
     )
     vector_normalized = _normalize_lower_better_scores(
-        {candidate.passage_id: candidate.vector_score for candidate in vector_candidates}
+        {
+            candidate.passage_id: candidate.vector_score
+            for candidate in vector_candidates
+            if candidate.passage_id in filtered_passage_ids
+        }
     )
 
     merged: dict[str, SearchResult] = {}
@@ -344,6 +428,10 @@ def merge_search_candidates(
             score=score,
             keyword_score=context.keyword_score,
             vector_score=context.vector_score,
+            body=context.body,
+            document_type=context.document_type,
+            jurisdiction=context.jurisdiction,
+            source_url=context.source_url,
         )
 
     return sorted(
@@ -364,15 +452,28 @@ def format_citation(*, title: str | None, meeting_date: str | None, page_number:
     return " — ".join(parts)
 
 
-def format_search_results(results: Sequence[SearchResult], *, query: str | None = None) -> str:
+def format_search_results(
+    results: Sequence[SearchResult],
+    *,
+    query: str | None = None,
+    filters: SearchFilters | None = None,
+) -> str:
     """Format ranked search results for terminal output."""
 
+    resolved_filters = filters or SearchFilters()
     if not results:
+        if resolved_filters.is_active:
+            return f"No evidence found matching filters: {', '.join(resolved_filters.labels())}."
         return "No evidence found."
 
     lines = ["NewsRAG Search"]
+    if resolved_filters.is_active:
+        lines.append(f"filters: {', '.join(resolved_filters.labels())}")
     for result in results:
         lines.append(result.citation)
+        metadata_line = _format_result_metadata(result)
+        if metadata_line is not None:
+            lines.append(metadata_line)
         lines.append(_truncate_text(" ".join(result.text.split()), query=query))
         lines.append("")
     return "\n".join(lines).rstrip()
@@ -539,6 +640,10 @@ def _expand_contextual_keyword_candidates(
                     text=neighbor.text,
                     title=neighbor.title,
                     meeting_date=neighbor.meeting_date,
+                    body=neighbor.body,
+                    document_type=neighbor.document_type,
+                    jurisdiction=neighbor.jurisdiction,
+                    source_url=neighbor.source_url,
                     keyword_score=(candidate.keyword_score or 0.0) + 0.5,
                 )
             )
@@ -606,6 +711,7 @@ def _load_passage_context(
                     passages.page_end AS page_end,
                     passages.text AS passage_text,
                     documents.title AS title,
+                    documents.source_url AS source_url,
                     documents.metadata_json AS metadata_json
                 FROM passages
                 JOIN documents ON documents.id = passages.document_id
@@ -624,6 +730,11 @@ def _load_passage_context(
                 text=str(row["passage_text"]),
                 title=str(row["title"]) if row["title"] is not None else None,
                 meeting_date=_optional_string(metadata.get("meeting_date")),
+                body=_optional_string(metadata.get("body")),
+                document_type=_optional_string(metadata.get("document_type")),
+                jurisdiction=_optional_string(metadata.get("jurisdiction")),
+                source_url=_optional_string(row["source_url"])
+                or _optional_string(metadata.get("source_url")),
             )
 
     for candidate in vector_candidates:
@@ -636,6 +747,10 @@ def _load_passage_context(
             text=existing.text,
             title=existing.title,
             meeting_date=existing.meeting_date,
+            body=existing.body,
+            document_type=existing.document_type,
+            jurisdiction=existing.jurisdiction,
+            source_url=existing.source_url,
             keyword_score=existing.keyword_score,
             vector_score=candidate.vector_score,
         )
@@ -693,6 +808,7 @@ def _load_adjacent_passages(
                 passages.page_end AS page_end,
                 passages.text AS passage_text,
                 documents.title AS title,
+                documents.source_url AS source_url,
                 documents.metadata_json AS metadata_json
             FROM passages
             JOIN origin
@@ -704,18 +820,122 @@ def _load_adjacent_passages(
             (passage_id,),
         ).fetchall()
 
-    return [
-        SearchCandidate(
-            passage_id=str(row["passage_id"]),
-            document_id=str(row["document_id"]),
-            page_start=int(row["page_start"]),
-            page_end=int(row["page_end"]),
-            text=str(row["passage_text"]),
-            title=str(row["title"]) if row["title"] is not None else None,
-            meeting_date=_optional_string(_load_metadata(row["metadata_json"]).get("meeting_date")),
+    candidates: list[SearchCandidate] = []
+    for row in rows:
+        metadata = _load_metadata(row["metadata_json"])
+        candidates.append(
+            SearchCandidate(
+                passage_id=str(row["passage_id"]),
+                document_id=str(row["document_id"]),
+                page_start=int(row["page_start"]),
+                page_end=int(row["page_end"]),
+                text=str(row["passage_text"]),
+                title=str(row["title"]) if row["title"] is not None else None,
+                meeting_date=_optional_string(metadata.get("meeting_date")),
+                body=_optional_string(metadata.get("body")),
+                document_type=_optional_string(metadata.get("document_type")),
+                jurisdiction=_optional_string(metadata.get("jurisdiction")),
+                source_url=_optional_string(row["source_url"])
+                or _optional_string(metadata.get("source_url")),
+            )
         )
-        for row in rows
-    ]
+    return candidates
+
+
+def _filter_candidates_by_metadata(
+    candidates: Sequence[SearchCandidate], *, filters: SearchFilters
+) -> list[SearchCandidate]:
+    filters.validate()
+    return [candidate for candidate in candidates if _matches_search_filters(candidate, filters)]
+
+
+def _filter_passage_context_by_metadata(
+    passage_context: dict[str, SearchCandidate], *, filters: SearchFilters
+) -> dict[str, SearchCandidate]:
+    filters.validate()
+    return {
+        passage_id: candidate
+        for passage_id, candidate in passage_context.items()
+        if _matches_search_filters(candidate, filters)
+    }
+
+
+def _matches_search_filters(candidate: SearchCandidate, filters: SearchFilters) -> bool:
+    return (
+        _matches_text_filter(candidate.body, filters.body)
+        and _matches_text_filter(candidate.document_type, filters.document_type)
+        and _matches_text_filter(candidate.jurisdiction, filters.jurisdiction)
+        and _matches_text_filter(candidate.source_url, filters.source_url)
+        and _matches_date_filter(candidate.meeting_date, since=filters.since, until=filters.until)
+    )
+
+
+def _matches_text_filter(candidate_value: str | None, filter_value: str | None) -> bool:
+    resolved_filter_value = _optional_string(filter_value)
+    if resolved_filter_value is None:
+        return True
+    resolved_candidate_value = _optional_string(candidate_value)
+    if resolved_candidate_value is None:
+        return False
+    return resolved_candidate_value.casefold() == resolved_filter_value.casefold()
+
+
+def _matches_date_filter(meeting_date: str | None, *, since: str | None, until: str | None) -> bool:
+    since_date = _parse_filter_date(since, option_name="--since")
+    until_date = _parse_filter_date(until, option_name="--until")
+    if since_date is None and until_date is None:
+        return True
+
+    parsed_meeting_date = _parse_metadata_date(meeting_date)
+    if parsed_meeting_date is None:
+        return False
+    if since_date is not None and parsed_meeting_date < since_date:
+        return False
+    if until_date is not None and parsed_meeting_date > until_date:
+        return False
+    return True
+
+
+def _parse_filter_date(value: str | None, *, option_name: str) -> date | None:
+    resolved_value = _optional_string(value)
+    if resolved_value is None:
+        return None
+    try:
+        return date.fromisoformat(resolved_value)
+    except ValueError as exc:
+        raise SearchError(
+            f"Invalid {option_name} date {resolved_value!r}; expected YYYY-MM-DD"
+        ) from exc
+
+
+def _parse_metadata_date(value: str | None) -> date | None:
+    resolved_value = _optional_string(value)
+    if resolved_value is None:
+        return None
+    try:
+        return date.fromisoformat(resolved_value)
+    except ValueError:
+        return None
+
+
+def _has_text(value: str | None) -> bool:
+    return _optional_string(value) is not None
+
+
+def _format_result_metadata(result: SearchResult) -> str | None:
+    parts = []
+    for name, value in (
+        ("body", result.body),
+        ("document_type", result.document_type),
+        ("jurisdiction", result.jurisdiction),
+        ("source_url", result.source_url),
+    ):
+        resolved_value = _optional_string(value)
+        if resolved_value is not None:
+            parts.append(f"{name}={resolved_value}")
+    if not parts:
+        return None
+    return f"metadata: {'; '.join(parts)}"
 
 
 def _count_passages(database_path: Path) -> int:
