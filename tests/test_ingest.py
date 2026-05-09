@@ -38,7 +38,7 @@ from newsrag.ingest import (
     list_documents,
     list_pages,
 )
-from newsrag.jobs import FAILED, create_job, get_job, list_jobs
+from newsrag.jobs import FAILED, create_job, get_job, list_jobs, set_job_status
 from newsrag.manifests import ManifestError, load_manifest
 from newsrag.storage import initialize_storage
 
@@ -609,6 +609,58 @@ def test_reingesting_unchanged_pdf_does_not_duplicate_records(tmp_path: Path) ->
     asyncio.run(runner_instance.run_cycle())
     asyncio.run(runner_instance.run_cycle())
 
+    assert len(list_documents(paths.database)) == 1
+    assert len(list_pages(paths.database)) == 1
+    assert len(list_chunks(paths.database)) == 1
+    assert len(list_chunk_vectors(paths.lancedb)) == 1
+    assert len(list_embedding_records(paths.database)) == 2
+
+
+def test_retried_ingest_job_keeps_duplicate_detection_idempotent(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+    paths = initialize_storage(data_dir)
+
+    first_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {"body": "City Council"}},
+        job_id="job-a-first",
+    )
+    failed_duplicate_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {"body": "City Council"}},
+        job_id="job-z-duplicate",
+    )
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[ExtractedPage(page_number=1, text="Agenda")]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    runner_instance = DaemonRunner(
+        database_path=paths.database,
+        handlers={INGEST_JOB_KIND: handler},
+        poll_interval=0,
+    )
+
+    asyncio.run(runner_instance.run_cycle())
+    set_job_status(paths.database, failed_duplicate_job.id, status=FAILED, error="transient boom")
+
+    retry_result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "jobs", "retry", failed_duplicate_job.id],
+    )
+    asyncio.run(runner_instance.run_cycle())
+
+    assert retry_result.exit_code == 0
+    assert get_job(paths.database, first_job.id).status == "done"
+    assert get_job(paths.database, failed_duplicate_job.id).status == "done"
     assert len(list_documents(paths.database)) == 1
     assert len(list_pages(paths.database)) == 1
     assert len(list_chunks(paths.database)) == 1
