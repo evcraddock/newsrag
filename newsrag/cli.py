@@ -6,6 +6,7 @@ from pathlib import Path
 
 import typer
 
+from newsrag import __version__
 from newsrag.config import (
     DEFAULT_CONFIG_PATH,
     AppConfig,
@@ -62,7 +63,11 @@ PDF_EXTRACTOR_OPTION = typer.Option(
     help="PDF text extractor mode: auto, pymupdf, pdfplumber, or table.",
 )
 
-app = typer.Typer(help="Local-first evidence retrieval for city hall PDFs.")
+app = typer.Typer(
+    help="Local-first evidence retrieval for city hall PDFs.",
+    invoke_without_command=True,
+    no_args_is_help=True,
+)
 daemon_app = typer.Typer(help="Run the NewsRAG background daemon.")
 jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
 watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
@@ -84,8 +89,13 @@ def main(
     ctx: typer.Context,
     config_path: Path | None = CONFIG_PATH_OPTION,
     data_dir: Path | None = DATA_DIR_OPTION,
+    version: bool = typer.Option(False, "--version", help="Show the NewsRAG version and exit."),
 ) -> None:
     """Run NewsRAG commands."""
+
+    if version:
+        typer.echo(f"newsrag {__version__}")
+        raise typer.Exit
 
     ctx.obj = CliState(
         config_path=(config_path or DEFAULT_CONFIG_PATH).expanduser(),

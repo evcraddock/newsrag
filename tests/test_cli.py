@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from typer.testing import CliRunner
 
+from newsrag import __version__
 from newsrag.cli import app
 from newsrag.config import EmbeddingConfig
 from newsrag.doctor import DoctorCheck, DoctorReport
@@ -26,6 +27,13 @@ def test_help_shows_cli_commands() -> None:
     assert "search" in result.stdout
     assert "jobs" in result.stdout
     assert "watch" in result.stdout
+
+
+def test_version_option_shows_project_version() -> None:
+    result = runner.invoke(app, ["--version"])
+
+    assert result.exit_code == 0
+    assert f"newsrag {__version__}" in result.stdout
 
 
 def test_doctor_runs_without_crashing(tmp_path: Path) -> None:

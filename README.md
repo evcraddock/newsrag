@@ -17,6 +17,14 @@ For the full macOS setup, installation commands, and validation steps, see [docs
 
 ## Installation
 
+Install the latest version from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/evcraddock/newsrag/main/scripts/install.sh | bash
+```
+
+For development from a checkout:
+
 ```bash
 uv sync --dev
 ```
