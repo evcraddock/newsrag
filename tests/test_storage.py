@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from newsrag.cli import app
 from newsrag.storage import REQUIRED_TABLES, StorageError, _existing_tables, initialize_storage
+from newsrag.watches import add_watch
 
 runner = CliRunner()
 
@@ -133,4 +134,21 @@ def test_status_command_reports_storage_health(tmp_path: Path) -> None:
     assert third_result.exit_code == 0
     assert "database: ok" in third_result.stdout
     assert "source_pdfs: ok" in third_result.stdout
+    assert "jobs: ok" in third_result.stdout
+    assert "watcher: ok" in third_result.stdout
     assert "summary: ok" in third_result.stdout
+
+
+def test_status_reports_actionable_watcher_health_failures(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    missing_watch_dir = tmp_path / "missing"
+    paths = initialize_storage(data_dir)
+    add_watch(paths.database, path=missing_watch_dir)
+
+    result = runner.invoke(app, ["--data-dir", str(data_dir), "status"])
+
+    assert result.exit_code == 0
+    assert "watcher: warn" in result.stdout
+    assert "missing watched folder" in result.stdout
+    assert "remove/re-add the watch" in result.stdout
+    assert "summary: warn" in result.stdout

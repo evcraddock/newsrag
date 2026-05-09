@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from newsrag.ingest import INGEST_JOB_KIND
 from newsrag.jobs import Job, create_job
 
 WATCH_JOB_KIND = INGEST_JOB_KIND
+DEFAULT_WATCH_STABILITY_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -84,44 +86,126 @@ def get_watch_by_path(database_path: Path, path: Path) -> Watch:
     return _row_to_watch(row)
 
 
+@dataclass(frozen=True)
+class WatchCandidate:
+    """One pending watch candidate waiting for file stabilization."""
+
+    path: Path
+    watch: Watch
+    signature: str
+    observed_at: float
+
+
+@dataclass
+class WatchDebouncer:
+    """Debounce watch events until candidate PDFs have stable signatures."""
+
+    database_path: Path
+    stability_seconds: float = DEFAULT_WATCH_STABILITY_SECONDS
+    monotonic: Callable[[], float] | None = None
+    candidates: dict[Path, WatchCandidate] = field(default_factory=dict)
+
+    def consider_changes(self, changes: set[tuple[object, str]]) -> None:
+        """Track changed PDF paths as stabilization candidates."""
+
+        watches = list_watches(self.database_path)
+        now = self._now()
+        for _, changed_path_text in sorted(changes, key=lambda item: item[1]):
+            changed_path = Path(changed_path_text).expanduser().resolve()
+            watch = _matching_watch(changed_path, watches)
+            if watch is None or not _is_existing_pdf(changed_path):
+                continue
+
+            signature = _file_signature(changed_path)
+            candidate = self.candidates.get(changed_path)
+            if candidate is None or candidate.signature != signature:
+                self.candidates[changed_path] = WatchCandidate(
+                    path=changed_path,
+                    watch=watch,
+                    signature=signature,
+                    observed_at=now,
+                )
+
+    def flush_ready(self) -> list[Job]:
+        """Enqueue candidates whose file signatures remained stable long enough."""
+
+        now = self._now()
+        enqueued: list[Job] = []
+        for path, candidate in sorted(self.candidates.items(), key=lambda item: str(item[0])):
+            if not _is_existing_pdf(path):
+                del self.candidates[path]
+                continue
+
+            current_signature = _file_signature(path)
+            if current_signature != candidate.signature:
+                self.candidates[path] = WatchCandidate(
+                    path=path,
+                    watch=candidate.watch,
+                    signature=current_signature,
+                    observed_at=now,
+                )
+                continue
+
+            if now - candidate.observed_at < self.stability_seconds:
+                continue
+
+            job = _enqueue_stable_watch_pdf(
+                self.database_path,
+                path,
+                candidate.watch,
+                current_signature,
+            )
+            del self.candidates[path]
+            if job is not None:
+                enqueued.append(job)
+
+        return enqueued
+
+    def _now(self) -> float:
+        if self.monotonic is None:
+            import time
+
+            return time.monotonic()
+        return self.monotonic()
+
+
 def enqueue_watch_changes(
     database_path: Path,
     changes: set[tuple[object, str]],
 ) -> list[Job]:
-    """Turn relevant watch-file changes into durable ingestion jobs."""
+    """Turn relevant stable watch-file changes into durable ingestion jobs."""
 
-    watches = list_watches(database_path)
-    enqueued: list[Job] = []
+    debouncer = WatchDebouncer(database_path=database_path, stability_seconds=0)
+    debouncer.consider_changes(changes)
+    return debouncer.flush_ready()
 
-    for _, changed_path_text in sorted(changes, key=lambda item: item[1]):
-        changed_path = Path(changed_path_text).expanduser().resolve()
-        watch = _matching_watch(changed_path, watches)
-        if watch is None:
-            continue
-        if changed_path.suffix.lower() != ".pdf":
-            continue
-        if not changed_path.exists() or not changed_path.is_file():
-            continue
 
-        signature = _file_signature(changed_path)
-        if _seen_signature(database_path, changed_path, signature):
-            continue
+def _enqueue_stable_watch_pdf(
+    database_path: Path,
+    changed_path: Path,
+    watch: Watch,
+    signature: str,
+) -> Job | None:
+    if _seen_signature(database_path, changed_path, signature):
+        return None
 
-        job = create_job(
-            database_path,
-            kind=INGEST_JOB_KIND,
-            payload={
-                "path": str(changed_path),
-                "watch_id": watch.id,
-                "metadata": watch.metadata,
-                "signature": signature,
-                "source": "watch",
-            },
-        )
-        _remember_signature(database_path, changed_path, watch.id, signature)
-        enqueued.append(job)
+    job = create_job(
+        database_path,
+        kind=INGEST_JOB_KIND,
+        payload={
+            "path": str(changed_path),
+            "watch_id": watch.id,
+            "metadata": watch.metadata,
+            "signature": signature,
+            "source": "watch",
+        },
+    )
+    _remember_signature(database_path, changed_path, watch.id, signature)
+    return job
 
-    return enqueued
+
+def _is_existing_pdf(path: Path) -> bool:
+    return path.suffix.lower() == ".pdf" and path.exists() and path.is_file()
 
 
 def _matching_watch(changed_path: Path, watches: list[Watch]) -> Watch | None:

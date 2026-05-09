@@ -287,6 +287,7 @@ def get_storage_status(data_dir: Path) -> StorageStatusReport:
     else:
         checks.append(StorageCheck("database", "ok", f"schema ready at {paths.database}"))
         checks.append(_job_queue_check(paths.database))
+        checks.append(_watcher_health_check(paths.database))
 
     return StorageStatusReport(checks=tuple(checks))
 
@@ -312,6 +313,30 @@ def _job_status_counts(database_path: Path) -> dict[str, int]:
     for status, count in rows:
         counts[str(status)] = int(count)
     return counts
+
+
+def _watcher_health_check(database_path: Path) -> StorageCheck:
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute("SELECT path FROM watches ORDER BY path ASC").fetchall()
+
+    if not rows:
+        return StorageCheck("watcher", "ok", "no watched folders configured")
+
+    problems: list[str] = []
+    for (raw_path,) in rows:
+        path = Path(str(raw_path))
+        if not path.exists():
+            problems.append(
+                f"missing watched folder {path}; recreate it or remove/re-add the watch"
+            )
+        elif not path.is_dir():
+            problems.append(f"watched path {path} is not a directory; remove/re-add the watch")
+        elif not os.access(path, os.R_OK | os.X_OK):
+            problems.append(f"watched folder {path} is not readable; fix permissions")
+
+    if problems:
+        return StorageCheck("watcher", "warn", "; ".join(problems))
+    return StorageCheck("watcher", "ok", f"{len(rows)} watched folder(s) ready")
 
 
 def format_status_report(report: StorageStatusReport, *, data_dir: Path) -> str:

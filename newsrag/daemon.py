@@ -11,7 +11,7 @@ from newsrag.config import EmbeddingConfig
 from newsrag.ingest import INGEST_JOB_KIND, build_ingest_handler
 from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
 from newsrag.storage import initialize_storage
-from newsrag.watches import enqueue_watch_changes, list_watches
+from newsrag.watches import DEFAULT_WATCH_STABILITY_SECONDS, WatchDebouncer, list_watches
 
 JobHandler = Callable[[Job], Awaitable[None]]
 
@@ -28,6 +28,7 @@ class DaemonConfig:
     embedding_config: EmbeddingConfig = EmbeddingConfig()
     poll_interval: float = 0.5
     max_loops: int | None = None
+    watch_stability_seconds: float = DEFAULT_WATCH_STABILITY_SECONDS
 
 
 class DaemonRunner:
@@ -109,6 +110,7 @@ async def run_daemon(
         watch_paths,
         watch_stream_factory=watch_stream_factory or _default_watch_stream,
         max_batches=config.max_loops,
+        stability_seconds=config.watch_stability_seconds,
     )
     await asyncio.gather(runner.run(max_loops=config.max_loops), watch_task)
 
@@ -119,10 +121,18 @@ async def _run_watch_loop(
     *,
     watch_stream_factory: WatchStreamFactory,
     max_batches: int | None,
+    stability_seconds: float,
 ) -> None:
     batches = 0
+    debouncer = WatchDebouncer(
+        database_path=database_path,
+        stability_seconds=stability_seconds,
+    )
     async for changes in watch_stream_factory(watch_paths):
-        await asyncio.to_thread(enqueue_watch_changes, database_path, changes)
+        await asyncio.to_thread(debouncer.consider_changes, changes)
+        if stability_seconds > 0:
+            await asyncio.sleep(stability_seconds)
+        await asyncio.to_thread(debouncer.flush_ready)
         batches += 1
         if max_batches is not None and batches >= max_batches:
             return
