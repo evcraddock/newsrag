@@ -23,7 +23,7 @@ from newsrag.ingest import (
     enqueue_ingest_url_job,
     normalize_pdf_extractor_mode,
 )
-from newsrag.jobs import list_jobs
+from newsrag.jobs import FAILED, Job, JobRetryError, list_jobs, retry_failed_job
 from newsrag.manifests import ManifestError, load_manifest
 from newsrag.packets import PacketError, format_source_packet, write_source_packet
 from newsrag.search import SearchError, SearchFilters, build_search_engine, format_search_results
@@ -461,10 +461,22 @@ def jobs_list_command(ctx: typer.Context) -> None:
         return
 
     for job in jobs:
-        line = f"{job.id} {job.status} {job.kind}"
-        if job.error is not None:
-            line = f"{line} error={job.error}"
-        typer.echo(line)
+        typer.echo(_format_job_line(job))
+
+
+@jobs_app.command("retry")
+def jobs_retry_command(ctx: typer.Context, job_id: str) -> None:
+    """Retry one failed durable NewsRAG job."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        job = retry_failed_job(database_path, job_id)
+    except JobRetryError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Retried {job.id}; status={job.status}")
 
 
 @watch_app.command("add")
@@ -530,6 +542,19 @@ def run() -> None:
     """Run the Typer application."""
 
     app()
+
+
+def _format_job_line(job: Job) -> str:
+    parts = [job.id, job.status, job.kind, f"updated_at={job.updated_at}"]
+    source_path = job.payload.get("path")
+    if isinstance(source_path, str) and source_path.strip():
+        parts.append(f"path={source_path}")
+    if job.status == FAILED and job.error is not None:
+        parts.append(f"failed_at={job.updated_at}")
+        parts.append(f"error={job.error}")
+    elif job.error is not None:
+        parts.append(f"error={job.error}")
+    return " ".join(parts)
 
 
 def _build_search_filters(

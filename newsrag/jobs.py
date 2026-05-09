@@ -14,6 +14,10 @@ DONE: JobStatus = "done"
 FAILED: JobStatus = "failed"
 
 
+class JobRetryError(Exception):
+    """Raised when a durable job cannot be retried."""
+
+
 @dataclass(frozen=True)
 class Job:
     """One durable NewsRAG job."""
@@ -132,6 +136,20 @@ def mark_job_failed(database_path: Path, job_id: str, *, error: str) -> Job:
     """Mark a running job failed with context."""
 
     return _set_job_status(database_path, job_id, status=FAILED, error=error)
+
+
+def retry_failed_job(database_path: Path, job_id: str) -> Job:
+    """Move one failed job back to pending for daemon reprocessing."""
+
+    try:
+        job = get_job(database_path, job_id)
+    except KeyError as exc:
+        raise JobRetryError(f"Unknown job: {job_id}") from exc
+
+    if job.status != FAILED:
+        raise JobRetryError(f"Job {job_id} is {job.status}; only failed jobs can be retried")
+
+    return _set_job_status(database_path, job_id, status=PENDING, error=None)
 
 
 def set_job_status(

@@ -9,7 +9,7 @@ This document defines how to work in this project.
 3. Make the smallest change that satisfies the task.
 4. Follow [CODE_STANDARDS.md](CODE_STANDARDS.md).
 5. Do not add manual line breaks in markdown paragraphs.
-6. Before asking the user to approve planned work, show a concise summary of task readiness, current repo state, and the planned steps.
+6. Before starting implementation work, show the user a concise plan to approve, including task readiness, current repo state, and the planned steps.
 7. If blocked or requirements are ambiguous, stop and report `BLOCKED` with reason.
 8. Summarize changed files and verification results.
 

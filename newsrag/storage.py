@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+from newsrag.jobs import DONE, FAILED, PENDING, RUNNING
 from newsrag.passages import build_passage_rows
 
 
@@ -285,8 +286,32 @@ def get_storage_status(data_dir: Path) -> StorageStatusReport:
         checks.append(StorageCheck("database", "warn", f"missing tables: {table_list}"))
     else:
         checks.append(StorageCheck("database", "ok", f"schema ready at {paths.database}"))
+        checks.append(_job_queue_check(paths.database))
 
     return StorageStatusReport(checks=tuple(checks))
+
+
+def _job_queue_check(database_path: Path) -> StorageCheck:
+    counts = _job_status_counts(database_path)
+    detail = (
+        f"pending={counts[PENDING]} running={counts[RUNNING]} "
+        f"failed={counts[FAILED]} done={counts[DONE]}"
+    )
+    if counts[FAILED] > 0:
+        return StorageCheck("jobs", "warn", detail)
+    return StorageCheck("jobs", "ok", detail)
+
+
+def _job_status_counts(database_path: Path) -> dict[str, int]:
+    counts = {PENDING: 0, RUNNING: 0, FAILED: 0, DONE: 0}
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            "SELECT status, COUNT(*) FROM jobs GROUP BY status ORDER BY status ASC"
+        ).fetchall()
+
+    for status, count in rows:
+        counts[str(status)] = int(count)
+    return counts
 
 
 def format_status_report(report: StorageStatusReport, *, data_dir: Path) -> str:
