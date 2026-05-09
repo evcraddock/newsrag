@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 import httpx
 
 from newsrag.config import EmbeddingConfig, RuntimeSettings
+from newsrag.storage import build_storage_paths
 
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -64,6 +66,7 @@ def run_doctor(
     checks.append(_binary_check("qpdf", "qpdf"))
     checks.append(_embedding_check(settings.config.embedding, timeout_seconds=timeout_seconds))
     checks.append(_daemon_check(settings.config.daemon.socket_path))
+    checks.append(_watcher_check(settings.data_dir))
     return DoctorReport(checks=tuple(checks))
 
 
@@ -246,6 +249,37 @@ def _daemon_check(socket_path: Path | None) -> DoctorCheck:
     return DoctorCheck(
         "daemon", "warn", f"configured path {socket_path} exists but is not a socket"
     )
+
+
+def _watcher_check(data_dir: Path) -> DoctorCheck:
+    database_path = build_storage_paths(data_dir).database
+    if not database_path.exists():
+        return DoctorCheck("watcher", "info", "storage is not initialized; no watches to inspect")
+
+    try:
+        with sqlite3.connect(database_path) as connection:
+            rows = connection.execute("SELECT path FROM watches ORDER BY path ASC").fetchall()
+    except sqlite3.Error as exc:
+        return DoctorCheck("watcher", "warn", f"could not inspect watches: {exc}")
+
+    if not rows:
+        return DoctorCheck("watcher", "ok", "no watched folders configured")
+
+    problems: list[str] = []
+    for (raw_path,) in rows:
+        path = Path(str(raw_path))
+        if not path.exists():
+            problems.append(
+                f"missing watched folder {path}; recreate it or remove/re-add the watch"
+            )
+        elif not path.is_dir():
+            problems.append(f"watched path {path} is not a directory; remove/re-add the watch")
+        elif not os.access(path, os.R_OK | os.X_OK):
+            problems.append(f"watched folder {path} is not readable; fix permissions")
+
+    if problems:
+        return DoctorCheck("watcher", "warn", "; ".join(problems))
+    return DoctorCheck("watcher", "ok", f"{len(rows)} watched folder(s) ready")
 
 
 def _json_get(
