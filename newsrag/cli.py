@@ -20,7 +20,7 @@ from newsrag.doctor import format_report, run_doctor
 from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
 from newsrag.jobs import list_jobs
 from newsrag.manifests import ManifestError, load_manifest
-from newsrag.search import SearchError, build_search_engine, format_search_results
+from newsrag.search import SearchError, SearchFilters, build_search_engine, format_search_results
 from newsrag.storage import (
     StorageError,
     format_status_report,
@@ -294,11 +294,47 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
 
 
 @app.command("search")
-def search_command(ctx: typer.Context, query: str) -> None:
+def search_command(
+    ctx: typer.Context,
+    query: str,
+    body: str | None = typer.Option(None, help="Only search documents from this civic body."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Only search documents with this document type metadata.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Only search documents from this jurisdiction.",
+    ),
+    source_url: str | None = typer.Option(
+        None,
+        "--source-url",
+        help="Only search documents with this source URL.",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Only search documents with meeting dates on or after YYYY-MM-DD.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Only search documents with meeting dates on or before YYYY-MM-DD.",
+    ),
+) -> None:
     """Search indexed evidence passages with hybrid keyword/vector retrieval."""
 
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
+    filters = SearchFilters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+    )
 
     try:
         engine = build_search_engine(
@@ -306,12 +342,12 @@ def search_command(ctx: typer.Context, query: str) -> None:
             lancedb_path=storage_paths.lancedb,
             embedding_config=settings.config.embedding,
         )
-        results = engine.search(query)
+        results = engine.search(query, filters=filters)
     except SearchError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
-    typer.echo(format_search_results(results, query=query))
+    typer.echo(format_search_results(results, query=query, filters=filters))
 
 
 @jobs_app.command("list")
