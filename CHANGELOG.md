@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.1] - 2026-05-09
+
+### Fixed
+- Added a tag-triggered GitHub Release workflow that validates release tags, runs package checks, builds distribution artifacts, and creates or updates GitHub Releases automatically.
+- Updated the release skill and script messaging to make GitHub Actions the owner of release creation after a tag is pushed.
+- Fixed the release script so changelog-only release commits can proceed when `project.version` already matches the requested version.
+
 ## [0.2.0] - 2026-05-09
 
 Initial release of NewsRAG, a local-first CLI evidence retrieval tool for city hall PDFs.
