@@ -17,7 +17,12 @@ from newsrag.config import (
 )
 from newsrag.daemon import DaemonConfig, run_daemon
 from newsrag.doctor import format_report, run_doctor
-from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
+from newsrag.ingest import (
+    IngestError,
+    enqueue_ingest_jobs,
+    enqueue_ingest_url_job,
+    normalize_pdf_extractor_mode,
+)
 from newsrag.jobs import list_jobs
 from newsrag.manifests import ManifestError, load_manifest
 from newsrag.packets import PacketError, format_source_packet, write_source_packet
@@ -50,6 +55,11 @@ PACKET_OUT_OPTION = typer.Option(
     help="Write the Markdown source packet to this path.",
     dir_okay=False,
     resolve_path=False,
+)
+PDF_EXTRACTOR_OPTION = typer.Option(
+    "auto",
+    "--pdf-extractor",
+    help="PDF text extractor mode: auto, pymupdf, pdfplumber, or table.",
 )
 
 app = typer.Typer(help="Local-first evidence retrieval for city hall PDFs.")
@@ -196,6 +206,7 @@ def ingest_command(
         None,
         help="Jurisdiction metadata for the ingested PDFs.",
     ),
+    pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
     """Enqueue one local PDF or directory of PDFs for ingestion."""
 
@@ -210,7 +221,13 @@ def ingest_command(
     )
 
     try:
-        jobs = enqueue_ingest_jobs(database_path, source_path=path, metadata=metadata)
+        extraction_mode = normalize_pdf_extractor_mode(pdf_extractor)
+        jobs = enqueue_ingest_jobs(
+            database_path,
+            source_path=path,
+            metadata=metadata,
+            pdf_extractor=extraction_mode,
+        )
     except IngestError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
@@ -240,6 +257,7 @@ def ingest_url_command(
         None,
         help="Jurisdiction metadata for the downloaded PDF.",
     ),
+    pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
     """Download one direct PDF URL and enqueue it for ingestion."""
 
@@ -254,11 +272,13 @@ def ingest_url_command(
     )
 
     try:
+        extraction_mode = normalize_pdf_extractor_mode(pdf_extractor)
         job = enqueue_ingest_url_job(
             storage_paths.database,
             storage_paths=storage_paths,
             url=url,
             metadata=metadata,
+            pdf_extractor=extraction_mode,
         )
     except IngestError as exc:
         typer.echo(str(exc))
