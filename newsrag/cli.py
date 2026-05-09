@@ -20,6 +20,7 @@ from newsrag.doctor import format_report, run_doctor
 from newsrag.ingest import IngestError, enqueue_ingest_jobs, enqueue_ingest_url_job
 from newsrag.jobs import list_jobs
 from newsrag.manifests import ManifestError, load_manifest
+from newsrag.packets import PacketError, format_source_packet, write_source_packet
 from newsrag.search import SearchError, SearchFilters, build_search_engine, format_search_results
 from newsrag.storage import (
     StorageError,
@@ -41,6 +42,13 @@ DATA_DIR_OPTION = typer.Option(
     "--data-dir",
     help="Override the active corpus data directory.",
     file_okay=False,
+    resolve_path=False,
+)
+PACKET_OUT_OPTION = typer.Option(
+    ...,
+    "--out",
+    help="Write the Markdown source packet to this path.",
+    dir_okay=False,
     resolve_path=False,
 )
 
@@ -327,7 +335,7 @@ def search_command(
 
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
-    filters = SearchFilters(
+    filters = _build_search_filters(
         body=body,
         document_type=document_type,
         jurisdiction=jurisdiction,
@@ -348,6 +356,74 @@ def search_command(
         raise typer.Exit(code=1) from exc
 
     typer.echo(format_search_results(results, query=query, filters=filters))
+
+
+@app.command("packet")
+def packet_command(
+    ctx: typer.Context,
+    query: str,
+    out: Path = PACKET_OUT_OPTION,
+    overwrite: bool = typer.Option(
+        False,
+        "--overwrite",
+        help="Replace the output file if it already exists.",
+    ),
+    body: str | None = typer.Option(None, help="Only search documents from this civic body."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Only search documents with this document type metadata.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Only search documents from this jurisdiction.",
+    ),
+    source_url: str | None = typer.Option(
+        None,
+        "--source-url",
+        help="Only search documents with this source URL.",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Only search documents with meeting dates on or after YYYY-MM-DD.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Only search documents with meeting dates on or before YYYY-MM-DD.",
+    ),
+) -> None:
+    """Generate an extractive Markdown source packet from retrieved evidence."""
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    storage_paths = initialize_storage(settings.data_dir)
+    filters = _build_search_filters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+    )
+
+    try:
+        engine = build_search_engine(
+            database_path=storage_paths.database,
+            lancedb_path=storage_paths.lancedb,
+            embedding_config=settings.config.embedding,
+        )
+        results = engine.search(query, filters=filters)
+        write_source_packet(
+            out,
+            format_source_packet(query=query, results=results, filters=filters),
+            overwrite=overwrite,
+        )
+    except (SearchError, PacketError) as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Wrote source packet to {out}")
 
 
 @jobs_app.command("list")
@@ -434,6 +510,25 @@ def run() -> None:
     """Run the Typer application."""
 
     app()
+
+
+def _build_search_filters(
+    *,
+    body: str | None,
+    document_type: str | None,
+    jurisdiction: str | None,
+    source_url: str | None,
+    since: str | None,
+    until: str | None,
+) -> SearchFilters:
+    return SearchFilters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+    )
 
 
 def _build_document_metadata_options(

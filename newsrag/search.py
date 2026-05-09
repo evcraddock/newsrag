@@ -106,6 +106,7 @@ class SearchCandidate:
     document_type: str | None = None
     jurisdiction: str | None = None
     source_url: str | None = None
+    source_path: str | None = None
     keyword_score: float | None = None
     vector_score: float | None = None
 
@@ -123,10 +124,13 @@ class SearchResult:
     score: float
     keyword_score: float | None
     vector_score: float | None
+    title: str | None = None
+    meeting_date: str | None = None
     body: str | None = None
     document_type: str | None = None
     jurisdiction: str | None = None
     source_url: str | None = None
+    source_path: str | None = None
 
 
 class Reranker(Protocol):
@@ -340,6 +344,7 @@ def search_keyword_candidates(
                 passages.text AS passage_text,
                 documents.title AS title,
                 documents.source_url AS source_url,
+                documents.source_path AS source_path,
                 documents.metadata_json AS metadata_json,
                 bm25(passages_fts) AS keyword_score
             FROM passages_fts
@@ -369,6 +374,9 @@ def search_keyword_candidates(
                 jurisdiction=_optional_string(metadata.get("jurisdiction")),
                 source_url=_optional_string(row["source_url"])
                 or _optional_string(metadata.get("source_url")),
+                source_path=_optional_string(row["source_path"])
+                or _optional_string(metadata.get("stored_source_path"))
+                or _optional_string(metadata.get("source_filename")),
                 keyword_score=float(row["keyword_score"]),
             )
         )
@@ -428,10 +436,13 @@ def merge_search_candidates(
             score=score,
             keyword_score=context.keyword_score,
             vector_score=context.vector_score,
+            title=context.title,
+            meeting_date=context.meeting_date,
             body=context.body,
             document_type=context.document_type,
             jurisdiction=context.jurisdiction,
             source_url=context.source_url,
+            source_path=context.source_path,
         )
 
     return sorted(
@@ -644,6 +655,7 @@ def _expand_contextual_keyword_candidates(
                     document_type=neighbor.document_type,
                     jurisdiction=neighbor.jurisdiction,
                     source_url=neighbor.source_url,
+                    source_path=neighbor.source_path,
                     keyword_score=(candidate.keyword_score or 0.0) + 0.5,
                 )
             )
@@ -712,6 +724,7 @@ def _load_passage_context(
                     passages.text AS passage_text,
                     documents.title AS title,
                     documents.source_url AS source_url,
+                    documents.source_path AS source_path,
                     documents.metadata_json AS metadata_json
                 FROM passages
                 JOIN documents ON documents.id = passages.document_id
@@ -735,6 +748,9 @@ def _load_passage_context(
                 jurisdiction=_optional_string(metadata.get("jurisdiction")),
                 source_url=_optional_string(row["source_url"])
                 or _optional_string(metadata.get("source_url")),
+                source_path=_optional_string(row["source_path"])
+                or _optional_string(metadata.get("stored_source_path"))
+                or _optional_string(metadata.get("source_filename")),
             )
 
     for candidate in vector_candidates:
@@ -751,6 +767,7 @@ def _load_passage_context(
             document_type=existing.document_type,
             jurisdiction=existing.jurisdiction,
             source_url=existing.source_url,
+            source_path=existing.source_path,
             keyword_score=existing.keyword_score,
             vector_score=candidate.vector_score,
         )
@@ -809,6 +826,7 @@ def _load_adjacent_passages(
                 passages.text AS passage_text,
                 documents.title AS title,
                 documents.source_url AS source_url,
+                documents.source_path AS source_path,
                 documents.metadata_json AS metadata_json
             FROM passages
             JOIN origin
@@ -837,6 +855,9 @@ def _load_adjacent_passages(
                 jurisdiction=_optional_string(metadata.get("jurisdiction")),
                 source_url=_optional_string(row["source_url"])
                 or _optional_string(metadata.get("source_url")),
+                source_path=_optional_string(row["source_path"])
+                or _optional_string(metadata.get("stored_source_path"))
+                or _optional_string(metadata.get("source_filename")),
             )
         )
     return candidates
