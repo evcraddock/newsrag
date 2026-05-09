@@ -5,7 +5,7 @@ description: Release newsrag. Use when user says "release newsrag", "create a re
 
 # Release newsrag
 
-Guide the release process through conversation. Draft a changelog collaboratively, bump the project version, tag, and push.
+Guide the release process through conversation. Draft a changelog collaboratively, bump the project version, tag, and push. GitHub Actions creates or updates the GitHub Release from the pushed tag.
 
 ## Quick Reference
 
@@ -86,6 +86,18 @@ The script handles:
 5. Create annotated tag `v<version>`.
 6. Push commit and tag.
 7. Verify tag exists on remote.
+
+The tag push triggers `.github/workflows/release.yml`, which validates the tag, runs checks, builds the Python distribution artifacts, extracts the matching `CHANGELOG.md` section, and creates or updates the GitHub Release with the built artifacts.
+
+### 7. Post-release
+
+After the script succeeds, verify the release workflow:
+
+```bash
+gh run list --workflow Release --limit 1 --json databaseId,status,conclusion,event,headBranch
+```
+
+If needed for an existing tag, manually dispatch the release workflow with the tag name.
 
 ## Important
 

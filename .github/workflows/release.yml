@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.0)"
+        required: true
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Extract and validate version
+        id: version
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          if ! echo "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::Invalid release tag: $TAG"
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          PYPROJECT_VERSION=$(python -c "import tomllib; from pathlib import Path; print(tomllib.loads(Path('pyproject.toml').read_text())['project']['version'])")
+
+          if [ "$PYPROJECT_VERSION" != "$VERSION" ]; then
+            echo "::error::Version mismatch: tag $TAG expects $VERSION but pyproject.toml has $PYPROJECT_VERSION"
+            exit 1
+          fi
+
+          echo "✅ pyproject.toml version matches $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if echo "$VERSION" | grep -qE '(alpha|beta|rc|dev)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build and test package
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync dependencies
+        run: uv sync --dev
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy .
+
+      - name: Run unit tests
+        run: uv run pytest -m "not integration"
+
+      - name: Build package
+        run: uv build
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  release:
+    name: Create GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Extract changelog
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          BODY=""
+          if [ -f CHANGELOG.md ]; then
+            BODY=$(awk "/^## .*${VERSION//./\\.}/ {found=1; next} /^## / {if(found) exit} found {print}" CHANGELOG.md)
+          fi
+
+          if [ -z "$BODY" ]; then
+            BODY="Release v${VERSION}"
+          fi
+
+          printf '%s\n' "$BODY" > release-notes.md
+          cat release-notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          prerelease_flag=()
+          if [ "$PRERELEASE" = "true" ]; then
+            prerelease_flag=(--prerelease)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "newsrag $TAG" \
+              --notes-file release-notes.md \
+              "${prerelease_flag[@]}"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "newsrag $TAG" \
+              --notes-file release-notes.md \
+              "${prerelease_flag[@]}"
+          fi

@@ -60,14 +60,10 @@ from pathlib import Path
 version = sys.argv[1]
 path = Path("pyproject.toml")
 text = path.read_text(encoding="utf-8")
-updated = re.sub(
-    r'(?m)^(version\s*=\s*)"[^"]+"',
-    rf'\1"{version}"',
-    text,
-    count=1,
-)
-if updated == text:
+pattern = r'(?m)^(version\s*=\s*)"[^"]+"'
+if re.search(pattern, text) is None:
     raise SystemExit("project.version not found in pyproject.toml")
+updated = re.sub(pattern, rf'\1"{version}"', text, count=1)
 path.write_text(updated, encoding="utf-8")
 PY
 
@@ -97,3 +93,6 @@ fi
 info ""
 info "✅ Released $NEW_TAG"
 info "✅ Tag verified on remote"
+info ""
+info "GitHub Actions will create or update the GitHub Release from the tag."
+info "Monitor with: gh run list --workflow Release --limit 1"
