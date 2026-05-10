@@ -28,7 +28,7 @@ newsrag jobs retry <job-id>
 
 ## Storage and configuration
 
-NewsRAG uses configurable local storage with a per-corpus data directory defaulting to `./.newsrag/`. A user can override the active data directory with a CLI flag or configured default. The data directory contains the corpus-local SQLite database, LanceDB vector index directory, downloaded source PDFs, OCR-normalized PDFs, processing artifacts, and local logs relevant to that corpus.
+NewsRAG uses configurable local storage with a data directory defaulting to the user data directory (`$XDG_DATA_HOME/newsrag`, or `~/.local/share/newsrag` when `XDG_DATA_HOME` is unset). A user can override the active data directory with a CLI flag or configured default for a separate corpus. The data directory contains the corpus-local SQLite database, LanceDB vector index directory, downloaded source PDFs, OCR-normalized PDFs, processing artifacts, and local logs relevant to that corpus.
 
 Configuration is user-global, for example `~/.config/newsrag/config.yaml`. The global config stores daemon settings, embedding provider/model defaults, watched folder registrations, and user-level defaults. CLI flags can override config values for a specific command.
 
@@ -38,7 +38,7 @@ The daemon is global and may manage many data directories over time. Search beha
 
 NewsRAG is organized around a small set of durable entities rather than a server-side application model.
 
-- **Corpus/data directory**: a local collection of documents, metadata, artifacts, and indexes stored under a `.newsrag/` directory or configured equivalent.
+- **Corpus/data directory**: a local collection of documents, metadata, artifacts, and indexes stored under the default user data directory or configured equivalent.
 - **Document**: a source PDF and its user-supplied civic metadata, such as title, source URL, meeting date, body or committee, document type, and jurisdiction.
 - **Normalized PDF artifact**: the OCR-normalized/searchable PDF produced from the source document and used for text extraction.
 - **Page**: canonical extracted page text with page number and extraction quality information. Pages are the source of citation truth.

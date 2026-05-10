@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 import yaml
 
 DEFAULT_CONFIG_PATH = Path("~/.config/newsrag/config.yaml").expanduser()
-DEFAULT_DATA_DIR_NAME = ".newsrag"
+DEFAULT_DATA_DIR_NAME = "newsrag"
 
 
 class ConfigError(Exception):
@@ -110,7 +111,7 @@ def resolve_data_dir(
     """
 
     base_dir = cwd or Path.cwd()
-    selected = cli_data_dir or config.data_dir or Path(DEFAULT_DATA_DIR_NAME)
+    selected = cli_data_dir or config.data_dir or _default_data_dir()
     return _normalize_path(selected, cwd=base_dir)
 
 
@@ -196,6 +197,13 @@ def _optional_path(value: object, *, field_name: str) -> Path | None:
     if string_value is None:
         return None
     return Path(string_value).expanduser()
+
+
+def _default_data_dir() -> Path:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    if data_home:
+        return Path(data_home).expanduser() / DEFAULT_DATA_DIR_NAME
+    return Path("~/.local/share").expanduser() / DEFAULT_DATA_DIR_NAME
 
 
 def _normalize_path(path: Path, *, cwd: Path) -> Path:
