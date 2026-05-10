@@ -15,8 +15,8 @@ require_command git
 require_command uv
 
 source_dir=""
-script_path="${BASH_SOURCE[0]}"
-if [[ -f "$script_path" ]]; then
+script_path="${BASH_SOURCE[0]-}"
+if [[ -n "$script_path" && -f "$script_path" ]]; then
     candidate_dir="$(cd "$(dirname "$script_path")/.." && pwd)"
     if [[ -f "$candidate_dir/pyproject.toml" && -d "$candidate_dir/newsrag" ]]; then
         source_dir="$candidate_dir"
