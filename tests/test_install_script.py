@@ -44,10 +44,12 @@ exit 1
     uv.chmod(0o755)
 
     env = os.environ.copy()
+    cache_home = tmp_path / "cache"
+    checkout = cache_home / "newsrag" / "source"
     env.update(
         {
             "HOME": str(tmp_path / "home"),
-            "NEWSRAG_INSTALL_DIR": str(tmp_path / "checkout"),
+            "XDG_CACHE_HOME": str(cache_home),
             "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
         }
     )
@@ -63,5 +65,6 @@ exit 1
     )
 
     assert result.returncode == 0, result.stderr
-    assert "Cloning NewsRAG into" in result.stdout
+    assert f"Cloning NewsRAG into {checkout}" in result.stdout
     assert "Installing NewsRAG with uv" in result.stdout
+    assert (checkout / ".git").is_dir()
