@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.3] - 2026-05-12
+
+### Fixed
+- Moved the curl installer checkout cache to `${XDG_CACHE_HOME:-~/.cache}/newsrag/source` so it no longer collides with the default runtime data directory.
+- Made the installer refuse to overwrite an existing non-git checkout target.
+
 ## [0.2.2] - 2026-05-12
 
 ### Fixed
