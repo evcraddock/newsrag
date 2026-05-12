@@ -2,7 +2,8 @@
 set -euo pipefail
 
 REPO_URL="${NEWSRAG_REPO_URL:-https://github.com/evcraddock/newsrag.git}"
-INSTALL_DIR="${NEWSRAG_INSTALL_DIR:-$HOME/.local/share/newsrag}"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+INSTALL_DIR="${NEWSRAG_INSTALL_DIR:-$CACHE_HOME/newsrag/source}"
 REF="${NEWSRAG_REF:-main}"
 
 log() { printf '%s\n' "$*"; }
@@ -30,9 +31,11 @@ else
         log "Updating NewsRAG checkout at $INSTALL_DIR"
         git -C "$INSTALL_DIR" fetch --tags origin
     else
+        if [[ -e "$INSTALL_DIR" ]]; then
+            die "$INSTALL_DIR exists but is not a git checkout. Move it aside or set NEWSRAG_INSTALL_DIR."
+        fi
         log "Cloning NewsRAG into $INSTALL_DIR"
         mkdir -p "$(dirname "$INSTALL_DIR")"
-        rm -rf "$INSTALL_DIR"
         git clone "$REPO_URL" "$INSTALL_DIR"
     fi
 
