@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.2] - 2026-05-12
+
+### Fixed
+- Fixed the documented `curl ... | bash` installer path by supporting scripts run from stdin.
+- Changed the default data directory from project-local `./.newsrag` to user storage (`$XDG_DATA_HOME/newsrag` or `~/.local/share/newsrag`).
+- Reduced `newsrag --version` startup latency by lazy-loading heavy command dependencies only when their commands run.
+
 ## [0.2.1] - 2026-05-09
 
 ### Fixed
