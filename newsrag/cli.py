@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
@@ -16,25 +16,10 @@ from newsrag.config import (
     load_config,
     resolve_data_dir,
 )
-from newsrag.daemon import DaemonConfig, run_daemon
-from newsrag.doctor import format_report, run_doctor
-from newsrag.ingest import (
-    IngestError,
-    enqueue_ingest_jobs,
-    enqueue_ingest_url_job,
-    normalize_pdf_extractor_mode,
-)
-from newsrag.jobs import FAILED, Job, JobRetryError, list_jobs, retry_failed_job
-from newsrag.manifests import ManifestError, load_manifest
-from newsrag.packets import PacketError, format_source_packet, write_source_packet
-from newsrag.search import SearchError, SearchFilters, build_search_engine, format_search_results
-from newsrag.storage import (
-    StorageError,
-    format_status_report,
-    get_storage_status,
-    initialize_storage,
-)
-from newsrag.watches import add_watch, list_watches
+
+if TYPE_CHECKING:
+    from newsrag.jobs import Job
+    from newsrag.search import SearchFilters
 
 CONFIG_PATH_OPTION = typer.Option(
     None,
@@ -129,6 +114,8 @@ def doctor(
 ) -> None:
     """Validate the local NewsRAG environment and configuration."""
 
+    from newsrag.doctor import format_report, run_doctor
+
     settings, config_error = _resolve_runtime_settings(
         ctx,
         embedding_provider=embedding_provider,
@@ -153,6 +140,13 @@ def status(
     ),
 ) -> None:
     """Report storage layout health for the active data directory."""
+
+    from newsrag.storage import (
+        StorageError,
+        format_status_report,
+        get_storage_status,
+        initialize_storage,
+    )
 
     settings, _ = _resolve_runtime_settings(ctx)
 
@@ -181,6 +175,10 @@ def daemon_run(
     max_loops: int | None = typer.Option(None, hidden=True),
 ) -> None:
     """Run the foreground NewsRAG daemon loop."""
+
+    import asyncio
+
+    from newsrag.daemon import DaemonConfig, run_daemon
 
     settings, _ = _resolve_runtime_settings(ctx)
     typer.echo(f"NewsRAG daemon running for {settings.data_dir}")
@@ -219,6 +217,9 @@ def ingest_command(
     pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
     """Enqueue one local PDF or directory of PDFs for ingestion."""
+
+    from newsrag.ingest import IngestError, enqueue_ingest_jobs, normalize_pdf_extractor_mode
+    from newsrag.storage import initialize_storage
 
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
@@ -271,6 +272,9 @@ def ingest_url_command(
 ) -> None:
     """Download one direct PDF URL and enqueue it for ingestion."""
 
+    from newsrag.ingest import IngestError, enqueue_ingest_url_job, normalize_pdf_extractor_mode
+    from newsrag.storage import initialize_storage
+
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
     metadata = _build_document_metadata_options(
@@ -301,6 +305,10 @@ def ingest_url_command(
 @app.command("ingest-manifest")
 def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
     """Load a YAML manifest and enqueue one URL-ingest job per document."""
+
+    from newsrag.ingest import IngestError, enqueue_ingest_url_job
+    from newsrag.manifests import ManifestError, load_manifest
+    from newsrag.storage import initialize_storage
 
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
@@ -362,6 +370,9 @@ def search_command(
     ),
 ) -> None:
     """Search indexed evidence passages with hybrid keyword/vector retrieval."""
+
+    from newsrag.search import SearchError, build_search_engine, format_search_results
+    from newsrag.storage import initialize_storage
 
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
@@ -426,6 +437,10 @@ def packet_command(
 ) -> None:
     """Generate an extractive Markdown source packet from retrieved evidence."""
 
+    from newsrag.packets import PacketError, format_source_packet, write_source_packet
+    from newsrag.search import SearchError, build_search_engine
+    from newsrag.storage import initialize_storage
+
     settings, _ = _resolve_runtime_settings(ctx)
     storage_paths = initialize_storage(settings.data_dir)
     filters = _build_search_filters(
@@ -460,6 +475,9 @@ def packet_command(
 def jobs_list_command(ctx: typer.Context) -> None:
     """List durable NewsRAG jobs."""
 
+    from newsrag.jobs import list_jobs
+    from newsrag.storage import initialize_storage
+
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
     jobs = list_jobs(database_path)
@@ -477,6 +495,9 @@ def jobs_list_command(ctx: typer.Context) -> None:
 @jobs_app.command("retry")
 def jobs_retry_command(ctx: typer.Context, job_id: str) -> None:
     """Retry one failed durable NewsRAG job."""
+
+    from newsrag.jobs import JobRetryError, retry_failed_job
+    from newsrag.storage import initialize_storage
 
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
@@ -511,6 +532,9 @@ def watch_add_command(
 ) -> None:
     """Register one watched folder."""
 
+    from newsrag.storage import initialize_storage
+    from newsrag.watches import add_watch
+
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
     watch = add_watch(
@@ -534,6 +558,9 @@ def watch_add_command(
 def watch_list_command(ctx: typer.Context) -> None:
     """List watched folders."""
 
+    from newsrag.storage import initialize_storage
+    from newsrag.watches import list_watches
+
     settings, _ = _resolve_runtime_settings(ctx)
     database_path = initialize_storage(settings.data_dir).database
     watches = list_watches(database_path)
@@ -555,6 +582,8 @@ def run() -> None:
 
 
 def _format_job_line(job: Job) -> str:
+    from newsrag.jobs import FAILED
+
     parts = [job.id, job.status, job.kind, f"updated_at={job.updated_at}"]
     source_path = job.payload.get("path")
     if isinstance(source_path, str) and source_path.strip():
@@ -576,6 +605,8 @@ def _build_search_filters(
     since: str | None,
     until: str | None,
 ) -> SearchFilters:
+    from newsrag.search import SearchFilters
+
     return SearchFilters(
         body=body,
         document_type=document_type,
