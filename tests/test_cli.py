@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +38,43 @@ def test_version_option_shows_project_version() -> None:
     assert f"newsrag {__version__}" in result.stdout
 
 
+def test_version_option_avoids_heavy_command_imports() -> None:
+    script = """
+import sys
+from typer.testing import CliRunner
+from newsrag import __version__
+from newsrag.cli import app
+
+result = CliRunner().invoke(app, ["--version"])
+if result.exit_code != 0:
+    raise SystemExit(result.output)
+if f"newsrag {__version__}" not in result.stdout:
+    raise SystemExit(result.stdout)
+
+blocked_modules = (
+    "fitz",
+    "lancedb",
+    "newsrag.daemon",
+    "newsrag.ingest",
+    "newsrag.search",
+    "newsrag.storage",
+    "pdfplumber",
+    "pyarrow",
+)
+loaded = [name for name in blocked_modules if name in sys.modules]
+if loaded:
+    raise SystemExit(f"heavy modules imported: {loaded}")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_doctor_runs_without_crashing(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("", encoding="utf-8")
@@ -66,7 +105,7 @@ def test_doctor_command_applies_embedding_overrides(
         seen_embedding.append(embedding)
         return DoctorReport(checks=(DoctorCheck("embedding", "ok", "mock"),))
 
-    monkeypatch.setattr("newsrag.cli.run_doctor", fake_run_doctor)
+    monkeypatch.setattr("newsrag.doctor.run_doctor", fake_run_doctor)
 
     result = runner.invoke(
         app,

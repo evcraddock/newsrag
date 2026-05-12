@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-import newsrag.cli as cli
 from newsrag.cli import app
 from newsrag.packets import PacketError, format_source_packet, write_source_packet
 from newsrag.search import SearchFilters, SearchResult
@@ -72,7 +71,7 @@ def test_packet_command_writes_markdown_from_mocked_retrieval(
             captured_filters.append(filters)
             return [_search_result()]
 
-    monkeypatch.setattr(cli, "build_search_engine", lambda **_: FakeSearchEngine())
+    monkeypatch.setattr("newsrag.search.build_search_engine", lambda **_: FakeSearchEngine())
 
     result = runner.invoke(
         app,
@@ -112,7 +111,7 @@ def test_packet_command_requires_overwrite_for_existing_output(
         ) -> list[SearchResult]:
             return [_search_result()]
 
-    monkeypatch.setattr(cli, "build_search_engine", lambda **_: FakeSearchEngine())
+    monkeypatch.setattr("newsrag.search.build_search_engine", lambda **_: FakeSearchEngine())
 
     result = runner.invoke(
         app,
