@@ -6,7 +6,7 @@ Make a selected corpus data directory usable by the CLI and daemon by creating, 
 
 ## Requirements
 
-- Initialize a `.newsrag/` data directory when needed.
+- Initialize the configured NewsRAG data directory when needed.
 - Create stable subdirectories for source PDFs, downloaded PDFs, OCR-normalized PDFs, LanceDB data, logs, and transient processing artifacts.
 - Create or migrate the SQLite database enough to track high-level entities: documents, pages, chunks, jobs, watches, and metadata.
 - Ensure storage initialization is idempotent.

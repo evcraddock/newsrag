@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pytest import MonkeyPatch
 
 from newsrag.config import (
     DEFAULT_CONFIG_PATH,
@@ -88,12 +89,16 @@ def test_resolve_data_dir_uses_config_value(tmp_path: Path) -> None:
     assert data_dir == (tmp_path / "configured-dir").resolve()
 
 
-def test_resolve_data_dir_defaults_to_local_newsrag(tmp_path: Path) -> None:
+def test_resolve_data_dir_defaults_to_user_data_home(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    data_home = tmp_path / "data-home"
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
     config = AppConfig(source_path=DEFAULT_CONFIG_PATH)
 
     data_dir = resolve_data_dir(None, config, cwd=tmp_path)
 
-    assert data_dir == (tmp_path / ".newsrag").resolve()
+    assert data_dir == data_home / "newsrag"
 
 
 def test_apply_embedding_overrides_replaces_selected_fields() -> None:

@@ -8,7 +8,7 @@ Create the initial Typer CLI foundation, global config loading, selected data-di
 
 - Add a Typer-based `newsrag` CLI entrypoint runnable through `uv run newsrag`.
 - Load user-global configuration from a conventional config path such as `~/.config/newsrag/config.yaml`.
-- Resolve the active corpus data directory from CLI flag, config, or default `./.newsrag/`.
+- Resolve the active corpus data directory from CLI flag, config, or the default user data directory.
 - Implement `newsrag doctor` with checks for config validity, data-dir writability, OCR tooling presence, embedding provider availability, and daemon connectivity when applicable.
 - Keep output readable for humans and stable enough for agents to inspect.
 
