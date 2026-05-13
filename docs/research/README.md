@@ -7,6 +7,7 @@ Working notes for a RAG / evidence retrieval system over city hall PDF documents
 - [[rag-overview]] — general explanation of RAG systems, use cases, and baseline technology choices.
 - [[city-hall-pdf-rag]] — specific architecture and build plan for searching city hall PDFs with natural-language queries and citations.
 - [[recommended-stack]] — current local-first CLI stack recommendation.
+- [[discovery-oriented-ingestion-enrichment]] — research plan for evidence-backed document briefs, extracted facts, topics, timelines, and story leads.
 
 ## Core idea
 
