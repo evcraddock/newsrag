@@ -56,9 +56,11 @@ app = typer.Typer(
 daemon_app = typer.Typer(help="Run the NewsRAG background daemon.")
 jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
 watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
+documents_app = typer.Typer(help="Browse ingested document inventory.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watch_app, name="watch")
+app.add_typer(documents_app, name="documents")
 
 
 @dataclass(frozen=True)
@@ -469,6 +471,96 @@ def packet_command(
         raise typer.Exit(code=1) from exc
 
     typer.echo(f"Wrote source packet to {out}")
+
+
+@documents_app.command("list")
+def documents_list_command(
+    ctx: typer.Context,
+    body: str | None = typer.Option(None, help="Only list documents from this civic body."),
+    document_type: str | None = typer.Option(
+        None,
+        "--document-type",
+        help="Only list documents with this document type metadata.",
+    ),
+    jurisdiction: str | None = typer.Option(
+        None,
+        help="Only list documents from this jurisdiction.",
+    ),
+    source_url: str | None = typer.Option(
+        None,
+        "--source-url",
+        help="Only list documents with this source URL.",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Only list documents with meeting dates on or after YYYY-MM-DD.",
+    ),
+    until: str | None = typer.Option(
+        None,
+        "--until",
+        help="Only list documents with meeting dates on or before YYYY-MM-DD.",
+    ),
+    query: str | None = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Search document IDs, titles, source paths, source URLs, and filenames.",
+    ),
+    limit: int = typer.Option(50, "--limit", help="Maximum documents to show, up to 500."),
+    offset: int = typer.Option(0, "--offset", help="Number of matching documents to skip."),
+) -> None:
+    """List ingested documents with bounded, filterable output."""
+
+    from newsrag.documents import (
+        DocumentError,
+        DocumentFilters,
+        format_document_list,
+        list_document_summaries,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    filters = DocumentFilters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        query=query,
+    )
+    try:
+        page = list_document_summaries(
+            database_path,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+        )
+    except DocumentError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_document_list(page))
+
+
+@documents_app.command("show")
+def documents_show_command(ctx: typer.Context, document_id: str) -> None:
+    """Show details for one ingested document."""
+
+    from newsrag.documents import DocumentError, format_document_detail, get_document_detail
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        document = get_document_detail(database_path, document_id)
+    except DocumentError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_document_detail(document))
 
 
 @jobs_app.command("list")
