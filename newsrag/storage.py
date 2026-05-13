@@ -80,6 +80,12 @@ REQUIRED_TABLES = {
     "watches",
     "watch_files",
     "embedding_records",
+    "document_profiles",
+    "document_briefs",
+    "document_briefs_fts",
+    "discovery_items",
+    "discovery_items_fts",
+    "discovery_evidence",
     "metadata",
 }
 SCHEMA_STATEMENTS = (
@@ -188,6 +194,85 @@ SCHEMA_STATEMENTS = (
         version TEXT NOT NULL,
         dimensions INTEGER NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_profiles (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL UNIQUE,
+        page_count INTEGER NOT NULL,
+        text_length INTEGER NOT NULL,
+        extraction_quality_json TEXT NOT NULL DEFAULT '{}',
+        extractor TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS document_briefs (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        significance TEXT NOT NULL DEFAULT '',
+        open_questions_json TEXT NOT NULL DEFAULT '[]',
+        extractor TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS document_briefs_fts USING fts5(
+        brief_id UNINDEXED,
+        summary,
+        significance
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS discovery_items (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        item_type TEXT NOT NULL,
+        label TEXT NOT NULL,
+        value_json TEXT NOT NULL DEFAULT '{}',
+        summary TEXT NOT NULL DEFAULT '',
+        confidence REAL,
+        extractor TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS discovery_items_fts USING fts5(
+        item_id UNINDEXED,
+        label,
+        summary
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS discovery_evidence (
+        id TEXT PRIMARY KEY,
+        item_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        page_id TEXT,
+        passage_id TEXT,
+        page_start INTEGER NOT NULL,
+        page_end INTEGER NOT NULL,
+        quote TEXT NOT NULL DEFAULT '',
+        validation_status TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(item_id) REFERENCES discovery_items(id),
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(page_id) REFERENCES pages(id),
+        FOREIGN KEY(passage_id) REFERENCES passages(id)
     )
     """,
 )
@@ -378,6 +463,9 @@ def _initialize_database(database_path: Path) -> None:
         _ensure_column(connection, "documents", "normalized_path", "TEXT")
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
         _ensure_column(connection, "pages", "extractor", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(connection, "document_profiles", "provider", "TEXT")
+        _ensure_column(connection, "document_briefs", "provider", "TEXT")
+        _ensure_column(connection, "discovery_items", "provider", "TEXT")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash)"
         )
