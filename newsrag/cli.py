@@ -57,10 +57,12 @@ daemon_app = typer.Typer(help="Run the NewsRAG background daemon.")
 jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
 watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
 documents_app = typer.Typer(help="Browse ingested document inventory.")
+discover_app = typer.Typer(help="Extract and inspect discovery signals.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watch_app, name="watch")
 app.add_typer(documents_app, name="documents")
+app.add_typer(discover_app, name="discover")
 
 
 @dataclass(frozen=True)
@@ -561,6 +563,36 @@ def documents_show_command(ctx: typer.Context, document_id: str) -> None:
         raise typer.Exit(code=1) from exc
 
     typer.echo(format_document_detail(document))
+
+
+@discover_app.command("document")
+def discover_document_command(
+    ctx: typer.Context,
+    document_id: str,
+    persist: bool = typer.Option(
+        True,
+        "--persist/--no-persist",
+        help="Persist newly extracted deterministic discovery items.",
+    ),
+) -> None:
+    """Extract deterministic discovery signals for one document."""
+
+    from newsrag.facts import (
+        FactExtractionError,
+        extract_document_facts,
+        format_fact_extraction_result,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        result = extract_document_facts(database_path, document_id, persist=persist)
+    except FactExtractionError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_fact_extraction_result(result))
 
 
 @jobs_app.command("list")
