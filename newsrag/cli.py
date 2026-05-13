@@ -595,6 +595,24 @@ def discover_document_command(
     typer.echo(format_fact_extraction_result(result))
 
 
+@documents_app.command("brief")
+def documents_brief_command(ctx: typer.Context, document_id: str) -> None:
+    """Generate and show an evidence-backed brief for one document."""
+
+    from newsrag.briefs import BriefError, format_generated_brief, generate_document_brief
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        brief = generate_document_brief(database_path, document_id)
+    except BriefError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_generated_brief(brief))
+
+
 @jobs_app.command("list")
 def jobs_list_command(ctx: typer.Context) -> None:
     """List durable NewsRAG jobs."""
