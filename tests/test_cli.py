@@ -32,6 +32,10 @@ def test_help_shows_cli_commands() -> None:
     assert "documents" in result.stdout
     assert "discover" in result.stdout
     assert "enrich" in result.stdout
+    assert "topics" in result.stdout
+    assert "entities" in result.stdout
+    assert "timeline" in result.stdout
+    assert "leads" in result.stdout
 
 
 def test_version_option_shows_project_version() -> None:

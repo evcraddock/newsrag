@@ -18,6 +18,7 @@ from newsrag.config import (
 )
 
 if TYPE_CHECKING:
+    from newsrag.discovery_browse import DiscoveryBrowseFilters
     from newsrag.jobs import Job
     from newsrag.search import SearchFilters
 
@@ -54,6 +55,43 @@ ENRICH_RESPONSE_JSON_OPTION = typer.Option(
     dir_okay=False,
     resolve_path=False,
 )
+DISCOVERY_BODY_OPTION = typer.Option(None, help="Only browse items from this civic body.")
+DISCOVERY_DOCUMENT_TYPE_OPTION = typer.Option(
+    None,
+    "--document-type",
+    help="Only browse items from documents with this document type metadata.",
+)
+DISCOVERY_JURISDICTION_OPTION = typer.Option(
+    None,
+    help="Only browse items from this jurisdiction.",
+)
+DISCOVERY_SOURCE_URL_OPTION = typer.Option(
+    None,
+    "--source-url",
+    help="Only browse items from documents with this source URL.",
+)
+DISCOVERY_SINCE_OPTION = typer.Option(
+    None,
+    "--since",
+    help="Only browse items from documents with meeting dates on or after YYYY-MM-DD.",
+)
+DISCOVERY_UNTIL_OPTION = typer.Option(
+    None,
+    "--until",
+    help="Only browse items from documents with meeting dates on or before YYYY-MM-DD.",
+)
+DISCOVERY_ITEM_TYPE_OPTION = typer.Option(
+    None,
+    "--item-type",
+    help="Only browse timeline items with this discovery item type.",
+)
+DISCOVERY_MIN_CONFIDENCE_OPTION = typer.Option(
+    None,
+    "--min-confidence",
+    help="Only browse items at or above this confidence threshold.",
+)
+DISCOVERY_LIMIT_OPTION = typer.Option(50, "--limit", help="Maximum items to show, up to 500.")
+DISCOVERY_OFFSET_OPTION = typer.Option(0, "--offset", help="Number of matching items to skip.")
 
 app = typer.Typer(
     help="Local-first evidence retrieval for city hall PDFs.",
@@ -66,12 +104,18 @@ watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
 documents_app = typer.Typer(help="Browse ingested document inventory.")
 discover_app = typer.Typer(help="Extract and inspect discovery signals.")
 enrich_app = typer.Typer(help="Run optional structured discovery enrichment.")
+topics_app = typer.Typer(help="Browse corpus topics from discovery records.")
+entities_app = typer.Typer(help="Browse corpus entities from discovery records.")
+leads_app = typer.Typer(help="Browse story leads from discovery records.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watch_app, name="watch")
 app.add_typer(documents_app, name="documents")
 app.add_typer(discover_app, name="discover")
 app.add_typer(enrich_app, name="enrich")
+app.add_typer(topics_app, name="topics")
+app.add_typer(entities_app, name="entities")
+app.add_typer(leads_app, name="leads")
 
 
 @dataclass(frozen=True)
@@ -653,6 +697,260 @@ def enrich_document_command(
     typer.echo(format_enrichment_result(result))
 
 
+@topics_app.command("list")
+def topics_list_command(
+    ctx: typer.Context,
+    body: str | None = DISCOVERY_BODY_OPTION,
+    document_type: str | None = DISCOVERY_DOCUMENT_TYPE_OPTION,
+    jurisdiction: str | None = DISCOVERY_JURISDICTION_OPTION,
+    source_url: str | None = DISCOVERY_SOURCE_URL_OPTION,
+    since: str | None = DISCOVERY_SINCE_OPTION,
+    until: str | None = DISCOVERY_UNTIL_OPTION,
+    min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
+    limit: int = DISCOVERY_LIMIT_OPTION,
+    offset: int = DISCOVERY_OFFSET_OPTION,
+) -> None:
+    """List corpus topics from discovery records."""
+
+    from newsrag.discovery_browse import (
+        TOPIC_ITEM_TYPES,
+        DiscoveryBrowseError,
+        format_topics_list,
+        list_browse_items,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    filters = _build_discovery_browse_filters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        min_confidence=min_confidence,
+    )
+    try:
+        page = list_browse_items(
+            database_path,
+            item_types=TOPIC_ITEM_TYPES,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+        )
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_topics_list(page))
+
+
+@topics_app.command("show")
+def topics_show_command(ctx: typer.Context, item_id: str) -> None:
+    """Show one topic discovery record with citations."""
+
+    from newsrag.discovery_browse import DiscoveryBrowseError, format_browse_detail, get_browse_item
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        item = get_browse_item(database_path, item_id)
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_browse_detail(item, title="NewsRAG Topic"))
+
+
+@entities_app.command("list")
+def entities_list_command(
+    ctx: typer.Context,
+    body: str | None = DISCOVERY_BODY_OPTION,
+    document_type: str | None = DISCOVERY_DOCUMENT_TYPE_OPTION,
+    jurisdiction: str | None = DISCOVERY_JURISDICTION_OPTION,
+    source_url: str | None = DISCOVERY_SOURCE_URL_OPTION,
+    since: str | None = DISCOVERY_SINCE_OPTION,
+    until: str | None = DISCOVERY_UNTIL_OPTION,
+    min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
+    limit: int = DISCOVERY_LIMIT_OPTION,
+    offset: int = DISCOVERY_OFFSET_OPTION,
+) -> None:
+    """List corpus entities from discovery records."""
+
+    from newsrag.discovery_browse import (
+        ENTITY_ITEM_TYPES,
+        DiscoveryBrowseError,
+        format_entities_list,
+        list_browse_items,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    filters = _build_discovery_browse_filters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        min_confidence=min_confidence,
+    )
+    try:
+        page = list_browse_items(
+            database_path,
+            item_types=ENTITY_ITEM_TYPES,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+        )
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_entities_list(page))
+
+
+@entities_app.command("show")
+def entities_show_command(ctx: typer.Context, item_id: str) -> None:
+    """Show one entity discovery record with citations."""
+
+    from newsrag.discovery_browse import DiscoveryBrowseError, format_browse_detail, get_browse_item
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        item = get_browse_item(database_path, item_id)
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_browse_detail(item, title="NewsRAG Entity"))
+
+
+@app.command("timeline")
+def timeline_command(
+    ctx: typer.Context,
+    body: str | None = DISCOVERY_BODY_OPTION,
+    document_type: str | None = DISCOVERY_DOCUMENT_TYPE_OPTION,
+    jurisdiction: str | None = DISCOVERY_JURISDICTION_OPTION,
+    source_url: str | None = DISCOVERY_SOURCE_URL_OPTION,
+    since: str | None = DISCOVERY_SINCE_OPTION,
+    until: str | None = DISCOVERY_UNTIL_OPTION,
+    item_type: str | None = DISCOVERY_ITEM_TYPE_OPTION,
+    min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
+    limit: int = DISCOVERY_LIMIT_OPTION,
+    offset: int = DISCOVERY_OFFSET_OPTION,
+) -> None:
+    """Show dated evidence-backed discovery items across the corpus."""
+
+    from newsrag.discovery_browse import (
+        TIMELINE_ITEM_TYPES,
+        DiscoveryBrowseError,
+        format_timeline,
+        list_browse_items,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    filters = _build_discovery_browse_filters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        item_type=item_type,
+        min_confidence=min_confidence,
+    )
+    try:
+        page = list_browse_items(
+            database_path,
+            item_types=TIMELINE_ITEM_TYPES,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            order_by="timeline",
+        )
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_timeline(page))
+
+
+@leads_app.command("list")
+def leads_list_command(
+    ctx: typer.Context,
+    body: str | None = DISCOVERY_BODY_OPTION,
+    document_type: str | None = DISCOVERY_DOCUMENT_TYPE_OPTION,
+    jurisdiction: str | None = DISCOVERY_JURISDICTION_OPTION,
+    source_url: str | None = DISCOVERY_SOURCE_URL_OPTION,
+    since: str | None = DISCOVERY_SINCE_OPTION,
+    until: str | None = DISCOVERY_UNTIL_OPTION,
+    min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
+    limit: int = DISCOVERY_LIMIT_OPTION,
+    offset: int = DISCOVERY_OFFSET_OPTION,
+) -> None:
+    """List possible story leads from discovery records."""
+
+    from newsrag.discovery_browse import (
+        LEAD_ITEM_TYPES,
+        DiscoveryBrowseError,
+        format_leads_list,
+        list_browse_items,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    filters = _build_discovery_browse_filters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        min_confidence=min_confidence,
+    )
+    try:
+        page = list_browse_items(
+            database_path,
+            item_types=LEAD_ITEM_TYPES,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            order_by="created",
+        )
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_leads_list(page))
+
+
+@leads_app.command("show")
+def leads_show_command(ctx: typer.Context, item_id: str) -> None:
+    """Show one story lead with supporting evidence."""
+
+    from newsrag.discovery_browse import DiscoveryBrowseError, format_browse_detail, get_browse_item
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        item = get_browse_item(database_path, item_id)
+    except DiscoveryBrowseError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_browse_detail(item, title="NewsRAG Story Lead"))
+
+
 @jobs_app.command("list")
 def jobs_list_command(ctx: typer.Context) -> None:
     """List durable NewsRAG jobs."""
@@ -796,6 +1094,31 @@ def _build_search_filters(
         source_url=source_url,
         since=since,
         until=until,
+    )
+
+
+def _build_discovery_browse_filters(
+    *,
+    body: str | None,
+    document_type: str | None,
+    jurisdiction: str | None,
+    source_url: str | None,
+    since: str | None,
+    until: str | None,
+    item_type: str | None = None,
+    min_confidence: float | None = None,
+) -> DiscoveryBrowseFilters:
+    from newsrag.discovery_browse import DiscoveryBrowseFilters
+
+    return DiscoveryBrowseFilters(
+        body=body,
+        document_type=document_type,
+        jurisdiction=jurisdiction,
+        source_url=source_url,
+        since=since,
+        until=until,
+        item_type=item_type,
+        min_confidence=min_confidence,
     )
 
 
