@@ -47,6 +47,13 @@ PDF_EXTRACTOR_OPTION = typer.Option(
     "--pdf-extractor",
     help="PDF text extractor mode: auto, pymupdf, pdfplumber, or table.",
 )
+ENRICH_RESPONSE_JSON_OPTION = typer.Option(
+    ...,
+    "--response-json",
+    help="Path to structured enrichment JSON produced by an enrichment provider.",
+    dir_okay=False,
+    resolve_path=False,
+)
 
 app = typer.Typer(
     help="Local-first evidence retrieval for city hall PDFs.",
@@ -58,11 +65,13 @@ jobs_app = typer.Typer(help="Inspect durable NewsRAG jobs.")
 watch_app = typer.Typer(help="Manage watched folders for automatic ingestion.")
 documents_app = typer.Typer(help="Browse ingested document inventory.")
 discover_app = typer.Typer(help="Extract and inspect discovery signals.")
+enrich_app = typer.Typer(help="Run optional structured discovery enrichment.")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(watch_app, name="watch")
 app.add_typer(documents_app, name="documents")
 app.add_typer(discover_app, name="discover")
+app.add_typer(enrich_app, name="enrich")
 
 
 @dataclass(frozen=True)
@@ -611,6 +620,37 @@ def documents_brief_command(ctx: typer.Context, document_id: str) -> None:
         raise typer.Exit(code=1) from exc
 
     typer.echo(format_generated_brief(brief))
+
+
+@enrich_app.command("document")
+def enrich_document_command(
+    ctx: typer.Context,
+    document_id: str,
+    response_json: Path = ENRICH_RESPONSE_JSON_OPTION,
+) -> None:
+    """Run structured enrichment for one document from provider JSON."""
+
+    from newsrag.enrichment import (
+        EnrichmentError,
+        JsonFileEnrichmentProvider,
+        enrich_document,
+        format_enrichment_result,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        result = enrich_document(
+            database_path,
+            document_id,
+            provider=JsonFileEnrichmentProvider(response_json),
+        )
+    except EnrichmentError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_enrichment_result(result))
 
 
 @jobs_app.command("list")
