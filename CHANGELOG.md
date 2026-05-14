@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-05-14
+
+### Added
+- Added bounded document inventory browsing with `newsrag documents list/show`.
+- Added durable discovery storage for document profiles, briefs, discovery items, and evidence references.
+- Added deterministic civic fact extraction with `newsrag discover document`.
+- Added evidence-backed document briefs with `newsrag documents brief`.
+- Added optional structured LLM discovery enrichment with validated JSON and quote-backed evidence.
+- Added corpus discovery browsing commands for topics, entities, timelines, and story leads.
+
+### Documentation
+- Added research notes for discovery-oriented ingestion enrichment.
+
 ## [0.2.3] - 2026-05-12
 
 ### Fixed
