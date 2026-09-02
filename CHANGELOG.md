@@ -4,10 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-02
+
+### Added
+- Added supported Apple Silicon installation through `brew install evcraddock/tap/newsrag`.
+- Added configuration guidance for llama.cpp, LM Studio, Ollama's OpenAI-compatible API, and hosted OpenAI embeddings.
 
 ### Changed
-- Replaced the native Ollama embedding integration with one OpenAI-compatible `/v1/embeddings` provider for llama.cpp, LM Studio, Ollama, OpenAI, and other compatible services.
+- Replaced the native Ollama embedding integration with one OpenAI-compatible `/v1/embeddings` provider.
 - Require explicit embedding provider, base URL, and model configuration before ingestion or vector search.
 
 ## [0.3.0] - 2026-05-14
