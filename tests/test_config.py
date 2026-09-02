@@ -111,13 +111,13 @@ def test_apply_embedding_overrides_replaces_selected_fields() -> None:
 
     updated = apply_embedding_overrides(
         embedding,
-        provider="ollama",
-        model="nomic-embed-text",
+        base_url="http://127.0.0.1:8080/v1",
+        model="nomic-embed-text-v1.5",
     )
 
     assert updated == EmbeddingConfig(
-        provider="ollama",
-        base_url="http://localhost:1234/v1",
-        model="nomic-embed-text",
+        provider="openai_compatible",
+        base_url="http://127.0.0.1:8080/v1",
+        model="nomic-embed-text-v1.5",
         api_key_env="OPENAI_API_KEY",
     )

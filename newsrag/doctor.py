@@ -12,9 +12,7 @@ import httpx
 from newsrag.config import EmbeddingConfig, RuntimeSettings
 from newsrag.storage import build_storage_paths
 
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+EMBEDDING_PROVIDER_OPENAI_COMPATIBLE = "openai_compatible"
 
 
 @dataclass(frozen=True)
@@ -122,50 +120,29 @@ def _binary_check(name: str, command: str) -> DoctorCheck:
 def _embedding_check(embedding: EmbeddingConfig, *, timeout_seconds: float) -> DoctorCheck:
     provider = embedding.provider
     if provider is None:
-        return DoctorCheck("embedding", "warn", "no embedding provider configured")
-
-    normalized_provider = provider.lower()
-    if normalized_provider == "ollama":
-        return _ollama_check(embedding, timeout_seconds=timeout_seconds)
-    if normalized_provider in {"openai", "openai_compatible"}:
-        return _openai_compatible_check(embedding, timeout_seconds=timeout_seconds)
-    return DoctorCheck("embedding", "error", f"unsupported provider '{provider}'")
-
-
-def _ollama_check(embedding: EmbeddingConfig, *, timeout_seconds: float) -> DoctorCheck:
-    if embedding.model is None:
         return DoctorCheck(
             "embedding",
             "warn",
-            "provider=ollama is configured but embedding.model is missing",
+            "no embedding provider configured; set embedding.provider=openai_compatible",
         )
 
-    base_url = embedding.base_url or DEFAULT_OLLAMA_BASE_URL
-    endpoint = f"{base_url.rstrip('/')}/api/tags"
-    payload = _json_get(
-        endpoint,
-        provider_label="ollama",
-        timeout_seconds=timeout_seconds,
-    )
-    if isinstance(payload, DoctorCheck):
-        return payload
-
-    model_names = _extract_ollama_model_names(payload)
-    if _model_available(embedding.model, model_names):
+    normalized_provider = provider.lower()
+    if normalized_provider == "ollama":
         return DoctorCheck(
             "embedding",
-            "ok",
-            f"provider=ollama base_url={base_url} model={embedding.model} is available",
+            "error",
+            (
+                "the native Ollama provider was removed; set provider=openai_compatible and "
+                "base_url=http://127.0.0.1:11434/v1"
+            ),
         )
-
-    return DoctorCheck(
-        "embedding",
-        "warn",
-        (
-            f"provider=ollama base_url={base_url} is reachable but model={embedding.model} "
-            f"is not installed; run 'ollama pull {embedding.model}'"
-        ),
-    )
+    if normalized_provider != EMBEDDING_PROVIDER_OPENAI_COMPATIBLE:
+        return DoctorCheck(
+            "embedding",
+            "error",
+            f"unsupported provider '{provider}'; use openai_compatible",
+        )
+    return _openai_compatible_check(embedding, timeout_seconds=timeout_seconds)
 
 
 def _openai_compatible_check(
@@ -173,7 +150,7 @@ def _openai_compatible_check(
     *,
     timeout_seconds: float,
 ) -> DoctorCheck:
-    provider = embedding.provider or "openai_compatible"
+    provider = EMBEDDING_PROVIDER_OPENAI_COMPATIBLE
     if embedding.model is None:
         return DoctorCheck(
             "embedding",
@@ -181,25 +158,18 @@ def _openai_compatible_check(
             f"provider={provider} is configured but embedding.model is missing",
         )
 
-    api_key_env = embedding.api_key_env
-    if provider.lower() == "openai" and api_key_env is None:
-        api_key_env = DEFAULT_OPENAI_API_KEY_ENV
-
     headers: dict[str, str] = {}
-    if api_key_env is not None:
-        api_key = os.getenv(api_key_env)
+    if embedding.api_key_env is not None:
+        api_key = os.getenv(embedding.api_key_env)
         if not api_key:
             return DoctorCheck(
                 "embedding",
                 "warn",
-                f"provider={provider} expects environment variable {api_key_env}",
+                f"provider={provider} expects environment variable {embedding.api_key_env}",
             )
         headers["Authorization"] = f"Bearer {api_key}"
 
     base_url = embedding.base_url
-    if provider.lower() == "openai" and base_url is None:
-        base_url = DEFAULT_OPENAI_BASE_URL
-
     if base_url is None:
         return DoctorCheck(
             "embedding",
@@ -218,7 +188,13 @@ def _openai_compatible_check(
         return payload
 
     model_names = _extract_openai_compatible_model_names(payload)
-    if model_names and not _model_available(embedding.model, model_names):
+    if model_names is None:
+        return DoctorCheck(
+            "embedding",
+            "warn",
+            f"provider={provider} endpoint {endpoint} returned an unexpected models payload",
+        )
+    if not _model_available(embedding.model, model_names):
         return DoctorCheck(
             "embedding",
             "warn",
@@ -325,24 +301,10 @@ def _nearest_existing_parent(path: Path) -> Path | None:
     return current
 
 
-def _extract_ollama_model_names(payload: dict[str, Any]) -> set[str]:
-    models = payload.get("models")
-    if not isinstance(models, list):
-        return set()
-
-    names: set[str] = set()
-    for model in models:
-        if isinstance(model, dict):
-            name = model.get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
-
-
-def _extract_openai_compatible_model_names(payload: dict[str, Any]) -> set[str]:
+def _extract_openai_compatible_model_names(payload: dict[str, Any]) -> set[str] | None:
     data = payload.get("data")
     if not isinstance(data, list):
-        return set()
+        return None
 
     names: set[str] = set()
     for model in data:

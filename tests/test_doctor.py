@@ -49,6 +49,7 @@ def test_run_doctor_warns_when_embedding_provider_is_unconfigured(tmp_path: Path
     embedding_check = next(check for check in report.checks if check.name == "embedding")
     assert embedding_check.status == "warn"
     assert "no embedding provider configured" in embedding_check.detail
+    assert "provider=openai_compatible" in embedding_check.detail
     assert report.summary == "warn"
 
 
@@ -90,50 +91,25 @@ def test_run_doctor_reports_actionable_watcher_health_failures(tmp_path: Path) -
     assert "remove/re-add the watch" in watcher_check.detail
 
 
-def test_run_doctor_handles_malformed_ollama_response(
+def test_run_doctor_checks_openai_compatible_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = RuntimeSettings(
-        config_path=tmp_path / "config.yaml",
-        data_dir=tmp_path / ".newsrag",
-        config=AppConfig(
-            source_path=tmp_path / "config.yaml",
-            embedding=EmbeddingConfig(provider="ollama", model="nomic-embed-text"),
+    monkeypatch.setenv("TEST_OPENAI_API_KEY", "secret-value")
+    settings = _settings_with_embedding(
+        tmp_path,
+        EmbeddingConfig(
+            provider="openai_compatible",
+            base_url="https://api.example.test/v1",
+            model="text-embedding-3-small",
+            api_key_env="TEST_OPENAI_API_KEY",
         ),
     )
 
     def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
-        request = httpx.Request("GET", url)
-        return httpx.Response(200, request=request, content=b"not-json")
-
-    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
-
-    report = run_doctor(settings)
-
-    embedding_check = next(check for check in report.checks if check.name == "embedding")
-    assert embedding_check.status == "warn"
-    assert "malformed JSON" in embedding_check.detail
-
-
-def test_run_doctor_checks_generic_openai_compatible_provider(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = RuntimeSettings(
-        config_path=tmp_path / "config.yaml",
-        data_dir=tmp_path / ".newsrag",
-        config=AppConfig(
-            source_path=tmp_path / "config.yaml",
-            embedding=EmbeddingConfig(
-                provider="openai_compatible",
-                base_url="http://localhost:1234/v1",
-                model="text-embedding-3-small",
-            ),
-        ),
-    )
-
-    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        del timeout
+        assert url == "https://api.example.test/v1/models"
+        assert headers == {"Authorization": "Bearer secret-value"}
         request = httpx.Request("GET", url, headers=headers)
         return httpx.Response(
             200,
@@ -148,44 +124,146 @@ def test_run_doctor_checks_generic_openai_compatible_provider(
     embedding_check = next(check for check in report.checks if check.name == "embedding")
     assert embedding_check.status == "ok"
     assert "provider=openai_compatible" in embedding_check.detail
+    assert "text-embedding-3-small" in embedding_check.detail
+    assert "secret-value" not in embedding_check.detail
 
 
-def test_run_doctor_warns_when_ollama_model_is_missing(tmp_path: Path) -> None:
-    settings = RuntimeSettings(
-        config_path=tmp_path / "config.yaml",
-        data_dir=tmp_path / ".newsrag",
-        config=AppConfig(
-            source_path=tmp_path / "config.yaml",
-            embedding=EmbeddingConfig(provider="ollama"),
+def test_run_doctor_rejects_removed_native_ollama_provider(tmp_path: Path) -> None:
+    settings = _settings_with_embedding(
+        tmp_path,
+        EmbeddingConfig(
+            provider="ollama",
+            base_url="http://127.0.0.1:11434",
+            model="nomic-embed-text",
         ),
     )
 
     report = run_doctor(settings)
 
     embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "error"
+    assert "native Ollama provider was removed" in embedding_check.detail
+    assert "http://127.0.0.1:11434/v1" in embedding_check.detail
+
+
+@pytest.mark.parametrize(
+    ("embedding", "message"),
+    [
+        (
+            EmbeddingConfig(
+                provider="openai_compatible",
+                base_url="http://127.0.0.1:8080/v1",
+            ),
+            "embedding.model is missing",
+        ),
+        (
+            EmbeddingConfig(
+                provider="openai_compatible",
+                model="nomic-embed-text-v1.5",
+            ),
+            "embedding.base_url is missing",
+        ),
+        (
+            EmbeddingConfig(
+                provider="openai_compatible",
+                base_url="https://api.example.test/v1",
+                model="text-embedding-3-small",
+                api_key_env="MISSING_EMBEDDING_API_KEY",
+            ),
+            "expects environment variable MISSING_EMBEDDING_API_KEY",
+        ),
+    ],
+)
+def test_run_doctor_reports_incomplete_openai_compatible_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    embedding: EmbeddingConfig,
+    message: str,
+) -> None:
+    monkeypatch.delenv("MISSING_EMBEDDING_API_KEY", raising=False)
+    settings = _settings_with_embedding(tmp_path, embedding)
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
     assert embedding_check.status == "warn"
-    assert "embedding.model is missing" in embedding_check.detail
+    assert message in embedding_check.detail
 
 
-def test_run_doctor_warns_when_ollama_is_unreachable(
+def test_run_doctor_handles_malformed_openai_compatible_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = RuntimeSettings(
-        config_path=tmp_path / "config.yaml",
-        data_dir=tmp_path / ".newsrag",
-        config=AppConfig(
-            source_path=tmp_path / "config.yaml",
-            embedding=EmbeddingConfig(
-                provider="ollama",
-                base_url="http://127.0.0.1:11434",
-                model="nomic-embed-text",
-            ),
+    settings = _settings_with_embedding(
+        tmp_path,
+        EmbeddingConfig(
+            provider="openai_compatible",
+            base_url="http://127.0.0.1:8080/v1",
+            model="nomic-embed-text-v1.5",
         ),
     )
 
     def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
-        request = httpx.Request("GET", url, headers=headers)
+        del timeout, headers
+        request = httpx.Request("GET", url)
+        return httpx.Response(200, request=request, content=b"not-json")
+
+    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "warn"
+    assert "malformed JSON" in embedding_check.detail
+
+
+def test_run_doctor_warns_when_openai_compatible_model_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings_with_embedding(
+        tmp_path,
+        EmbeddingConfig(
+            provider="openai_compatible",
+            base_url="http://127.0.0.1:8080/v1",
+            model="missing-model",
+        ),
+    )
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        del timeout, headers
+        request = httpx.Request("GET", url)
+        return httpx.Response(
+            200,
+            request=request,
+            json={"data": [{"id": "nomic-embed-text-v1.5"}]},
+        )
+
+    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
+
+    report = run_doctor(settings)
+
+    embedding_check = next(check for check in report.checks if check.name == "embedding")
+    assert embedding_check.status == "warn"
+    assert "model=missing-model is not listed" in embedding_check.detail
+
+
+def test_run_doctor_warns_when_openai_compatible_service_is_unreachable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings_with_embedding(
+        tmp_path,
+        EmbeddingConfig(
+            provider="openai_compatible",
+            base_url="http://127.0.0.1:8080/v1",
+            model="nomic-embed-text-v1.5",
+        ),
+    )
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+        del timeout, headers
+        request = httpx.Request("GET", url)
         raise httpx.ConnectError("boom", request=request)
 
     monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
@@ -197,35 +275,10 @@ def test_run_doctor_warns_when_ollama_is_unreachable(
     assert "is unreachable" in embedding_check.detail
 
 
-def test_run_doctor_checks_ollama_provider_when_selected(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = RuntimeSettings(
-        config_path=tmp_path / "config.yaml",
+def _settings_with_embedding(tmp_path: Path, embedding: EmbeddingConfig) -> RuntimeSettings:
+    config_path = tmp_path / "config.yaml"
+    return RuntimeSettings(
+        config_path=config_path,
         data_dir=tmp_path / ".newsrag",
-        config=AppConfig(
-            source_path=tmp_path / "config.yaml",
-            embedding=EmbeddingConfig(
-                provider="ollama",
-                base_url="http://127.0.0.1:11434",
-                model="nomic-embed-text",
-            ),
-        ),
+        config=AppConfig(source_path=config_path, embedding=embedding),
     )
-
-    def fake_get(url: str, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
-        request = httpx.Request("GET", url)
-        return httpx.Response(
-            200,
-            request=request,
-            json={"models": [{"name": "nomic-embed-text:latest"}]},
-        )
-
-    monkeypatch.setattr("newsrag.doctor.httpx.get", fake_get)
-
-    report = run_doctor(settings)
-
-    embedding_check = next(check for check in report.checks if check.name == "embedding")
-    assert embedding_check.status == "ok"
-    assert "provider=ollama" in embedding_check.detail

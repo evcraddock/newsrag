@@ -86,13 +86,12 @@ async def run_daemon(
     """Start the foreground daemon loop."""
 
     storage_paths = initialize_storage(config.data_dir)
-    resolved_handlers: dict[str, JobHandler] = {
-        INGEST_JOB_KIND: build_ingest_handler(
+    resolved_handlers = dict(handlers or {})
+    if INGEST_JOB_KIND not in resolved_handlers:
+        resolved_handlers[INGEST_JOB_KIND] = build_ingest_handler(
             data_dir=config.data_dir,
             embedding_config=config.embedding_config,
         )
-    }
-    resolved_handlers.update(handlers or {})
 
     runner = DaemonRunner(
         database_path=storage_paths.database,

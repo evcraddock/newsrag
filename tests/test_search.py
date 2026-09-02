@@ -33,8 +33,8 @@ def _strip_ansi(value: str) -> str:
 @dataclass(frozen=True)
 class FakeQueryEmbeddingProvider:
     metadata: EmbeddingMetadata = EmbeddingMetadata(
-        provider="ollama",
-        model="nomic-embed-text",
+        provider="openai_compatible",
+        model="nomic-embed-text-v1.5",
         version="latest",
     )
 
@@ -423,14 +423,15 @@ def test_format_search_results_returns_full_matching_passage() -> None:
     assert "NewsRAG Search" in output
 
 
-def test_search_command_reports_no_evidence_for_empty_corpus(tmp_path: Path) -> None:
+def test_search_command_requires_explicit_embedding_configuration(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     initialize_storage(data_dir)
 
     result = runner.invoke(app, ["--data-dir", str(data_dir), "search", "stormwater"])
 
-    assert result.exit_code == 0
-    assert result.stdout.strip() == "No evidence found."
+    assert result.exit_code == 1
+    assert "No embedding provider configured" in result.stdout
+    assert "embedding.provider=openai_compatible" in result.stdout
 
 
 def _seed_search_corpus(tmp_path: Path) -> Path:

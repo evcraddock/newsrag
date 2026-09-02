@@ -121,20 +121,20 @@ def test_doctor_command_applies_embedding_overrides(
             str(config_path),
             "doctor",
             "--embedding-provider",
-            "ollama",
+            "openai_compatible",
             "--embedding-base-url",
-            "http://localhost:11434",
+            "http://localhost:8080/v1",
             "--embedding-model",
-            "nomic-embed-text",
+            "nomic-embed-text-v1.5",
         ],
     )
 
     assert result.exit_code == 0
     assert seen_embedding == [
         EmbeddingConfig(
-            provider="ollama",
-            base_url="http://localhost:11434",
-            model="nomic-embed-text",
+            provider="openai_compatible",
+            base_url="http://localhost:8080/v1",
+            model="nomic-embed-text-v1.5",
             api_key_env=None,
         )
     ]

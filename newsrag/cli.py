@@ -236,19 +236,24 @@ def daemon_run(
     import asyncio
 
     from newsrag.daemon import DaemonConfig, run_daemon
+    from newsrag.embeddings import EmbeddingError
 
     settings, _ = _resolve_runtime_settings(ctx)
     typer.echo(f"NewsRAG daemon running for {settings.data_dir}")
-    asyncio.run(
-        run_daemon(
-            DaemonConfig(
-                data_dir=settings.data_dir,
-                embedding_config=settings.config.embedding,
-                poll_interval=poll_interval,
-                max_loops=max_loops,
+    try:
+        asyncio.run(
+            run_daemon(
+                DaemonConfig(
+                    data_dir=settings.data_dir,
+                    embedding_config=settings.config.embedding,
+                    poll_interval=poll_interval,
+                    max_loops=max_loops,
+                )
             )
         )
-    )
+    except EmbeddingError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("ingest")
@@ -443,6 +448,7 @@ def search_command(
     )
 
     try:
+        filters.validate()
         engine = build_search_engine(
             database_path=storage_paths.database,
             lancedb_path=storage_paths.lancedb,
@@ -510,6 +516,7 @@ def packet_command(
     )
 
     try:
+        filters.validate()
         engine = build_search_engine(
             database_path=storage_paths.database,
             lancedb_path=storage_paths.lancedb,
