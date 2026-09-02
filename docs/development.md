@@ -7,8 +7,7 @@ NewsRAG uses a local-first development stack. SQLite and LanceDB are embedded de
 Install the local tools NewsRAG expects on a fresh machine:
 
 ```bash
-brew install uv python@3.11 overmind tmux sqlite ocrmypdf tesseract ghostscript qpdf
-brew install --cask ollama
+brew install uv python@3.11 overmind tmux sqlite ocrmypdf tesseract ghostscript qpdf ollama
 ```
 
 Notes:
@@ -68,6 +67,8 @@ cp .env.example .env
 make check
 ```
 
+Development commands run through `uv run`. An end-user Homebrew installation instead exposes `newsrag` directly and does not require a repository checkout; see the installation section in the [README](../README.md).
+
 ## Development workflow
 
 Start the development environment:
@@ -113,4 +114,4 @@ make check
 
 ## Environment variables
 
-See `.env.example` for the local defaults and optional overrides used by the planned local stack.
+See `.env.example` for development process variables. Installed CLI configuration is YAML at `~/.config/newsrag/config.yaml`; `.env` is not the installed application's configuration file.

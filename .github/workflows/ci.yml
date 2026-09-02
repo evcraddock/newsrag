@@ -40,3 +40,26 @@ jobs:
 
       - name: Run unit tests
         run: uv run pytest -m "not integration"
+
+  macos-package:
+    name: macOS package
+    runs-on: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync locked dependencies
+        run: uv sync --locked --dev
+
+      - name: Build and smoke test Apple Silicon artifact
+        run: ./scripts/build-macos-artifact.sh
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: newsrag-macos-arm64
+          path: dist/newsrag-*-macos-arm64.tar.gz
