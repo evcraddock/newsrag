@@ -103,9 +103,9 @@ Search filters should use user-supplied civic metadata, including body, document
 
 ## Embeddings
 
-Embeddings are pluggable. The MVP is local-first and defaults to Ollama running `nomic-embed-text`. The architecture also supports `bge-base-en` as a local model option and OpenAI `text-embedding-3-small` as an optional hosted provider.
+Embeddings use one OpenAI-compatible `/v1/embeddings` integration. The configured service can be local, such as llama.cpp, LM Studio, or Ollama's compatible API, or hosted, such as OpenAI. NewsRAG has no implicit embedding provider because the base URL and model must be selected explicitly.
 
-Every embedding record should retain provider, model, and version information. This allows safe index rebuilds when the embedding model changes. `newsrag doctor` checks embedding provider availability, including whether Ollama is reachable and whether the configured model is installed or pullable.
+Every embedding record retains provider, model, and version information. This allows safe index rebuilds when the embedding model changes. `newsrag doctor` checks the configured `/v1/models` endpoint, optional API-key environment variable, and model availability without exposing secret values.
 
 ## Daemon and jobs
 

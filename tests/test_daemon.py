@@ -15,6 +15,40 @@ runner = CliRunner()
 
 def test_daemon_run_command_starts_against_initialized_storage(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+embedding:
+  provider: openai_compatible
+  base_url: http://127.0.0.1:8080/v1
+  model: nomic-embed-text-v1.5
+""".strip(),
+        encoding="utf-8",
+    )
+    initialize_storage(data_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config-path",
+            str(config_path),
+            "--data-dir",
+            str(data_dir),
+            "daemon",
+            "run",
+            "--poll-interval",
+            "0",
+            "--max-loops",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "NewsRAG daemon running" in result.stdout
+
+
+def test_daemon_run_command_requires_embedding_configuration(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
     initialize_storage(data_dir)
 
     result = runner.invoke(
@@ -31,8 +65,9 @@ def test_daemon_run_command_starts_against_initialized_storage(tmp_path: Path) -
         ],
     )
 
-    assert result.exit_code == 0
-    assert "NewsRAG daemon running" in result.stdout
+    assert result.exit_code == 1
+    assert "No embedding provider configured" in result.stdout
+    assert "embedding.provider=openai_compatible" in result.stdout
 
 
 def test_mocked_job_moves_from_pending_to_running_to_done(tmp_path: Path) -> None:

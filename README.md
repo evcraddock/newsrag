@@ -20,22 +20,21 @@ NewsRAG installs as a standalone `newsrag` command. Installed usage does not req
 
 ### Configure embeddings
 
-Ollama is optional and is not installed with NewsRAG. To use the default local embedding model:
+NewsRAG uses one OpenAI-compatible embedding API for local and hosted services. An embedding provider must be configured explicitly before ingestion or vector search.
+
+For a local llama.cpp server exposing Nomic Embed Text v1.5:
 
 ```bash
-brew install ollama
-brew services start ollama
-ollama pull nomic-embed-text
 mkdir -p ~/.config/newsrag
 cat > ~/.config/newsrag/config.yaml <<'YAML'
 embedding:
-  provider: ollama
-  base_url: http://127.0.0.1:11434
-  model: nomic-embed-text
+  provider: openai_compatible
+  base_url: http://127.0.0.1:8080/v1
+  model: nomic-embed-text-v1.5
 YAML
 ```
 
-A hosted OpenAI-compatible embedding provider can be configured instead through `~/.config/newsrag/config.yaml`.
+NewsRAG also supports LM Studio, Ollama's `/v1` API, OpenAI, and other compatible services through the same provider. See [Embedding configuration](docs/embeddings.md) for server examples, hosted authentication, and migration instructions.
 
 ### Verify and initialize
 
@@ -70,7 +69,7 @@ NewsRAG uses a local-first stack:
 - SQLite with FTS5 for metadata and keyword search
 - LanceDB for vector search
 - OCRmyPDF, Tesseract, Ghostscript, and qpdf for OCR normalization
-- Ollama with `nomic-embed-text` for optional local embeddings
+- Any OpenAI-compatible `/v1/embeddings` service for local or hosted embeddings
 - Overmind for `make dev`
 
 The default development path does not require Docker because SQLite and LanceDB are embedded. For the full macOS development setup and validation steps, see [docs/development.md](docs/development.md).

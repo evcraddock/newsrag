@@ -33,7 +33,6 @@ from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.storage import StoragePaths, initialize_storage
 
 INGEST_JOB_KIND = "ingest-file"
-DEFAULT_EMBEDDING_PROVIDER = "ollama"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
@@ -419,9 +418,7 @@ class IngestionPipeline:
         self.ocr_runner = ocr_runner or SubprocessOcrRunner()
         self.text_extractor = text_extractor
         self.chunker = chunker or PageChunker()
-        self.embedding_provider = embedding_provider or build_embedding_provider(
-            _resolve_embedding_config(embedding_config)
-        )
+        self.embedding_provider = embedding_provider or build_embedding_provider(embedding_config)
         self.vector_store = vector_store or LanceDbVectorStore(storage_paths.lancedb)
         self.passage_vector_store = LanceDbPassageVectorStore(storage_paths.lancedb)
 
@@ -760,18 +757,6 @@ def _iter_pdf_inputs(source_path: Path) -> tuple[Path, ...]:
         return pdf_paths
 
     raise IngestError(f"No PDF files found under {resolved_path}")
-
-
-def _resolve_embedding_config(embedding_config: EmbeddingConfig) -> EmbeddingConfig:
-    if embedding_config.provider is not None:
-        return embedding_config
-
-    return EmbeddingConfig(
-        provider=DEFAULT_EMBEDDING_PROVIDER,
-        base_url=embedding_config.base_url,
-        model=embedding_config.model,
-        api_key_env=embedding_config.api_key_env,
-    )
 
 
 def _payload_path(payload: dict[str, Any]) -> Path:

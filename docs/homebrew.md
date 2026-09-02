@@ -14,7 +14,7 @@ Native commands invoked by NewsRAG remain formula dependencies:
 - Ghostscript
 - qpdf
 
-Ollama is optional. The formula must not install Ollama or download an embedding model during installation.
+Embedding services are optional external runtimes. The formula must not install llama.cpp, LM Studio, Ollama, or an embedding model during installation; users configure any OpenAI-compatible service separately.
 
 ## Build and validate an artifact
 

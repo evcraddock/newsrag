@@ -12,6 +12,7 @@ import lancedb  # type: ignore[import-untyped]
 
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import (
+    EmbeddingError,
     EmbeddingMetadata,
     EmbeddingProvider,
     QueryEmbedding,
@@ -27,7 +28,6 @@ DEFAULT_MAX_VECTOR_DISTANCE = 1.0
 DEFAULT_VECTOR_DISTANCE_MARGIN_WITH_KEYWORD = 0.08
 DEFAULT_STRONG_VECTOR_DISTANCE_WITH_KEYWORD = 0.98
 DEFAULT_SNIPPET_LENGTH = 700
-DEFAULT_EMBEDDING_PROVIDER = "ollama"
 PASSAGE_VECTOR_TABLE_NAME = "passage_embeddings"
 
 
@@ -310,9 +310,12 @@ def build_search_engine(
 ) -> SearchEngine:
     """Build the default hybrid search engine for one corpus."""
 
-    resolved_embedding_provider = embedding_provider or build_embedding_provider(
-        _resolve_embedding_config(embedding_config)
-    )
+    try:
+        resolved_embedding_provider = embedding_provider or build_embedding_provider(
+            embedding_config
+        )
+    except EmbeddingError as exc:
+        raise SearchError(str(exc)) from exc
     resolved_vector_store = vector_store or LanceDbPassageVectorStore(lancedb_path)
     resolved_vector_searcher = vector_searcher or LanceDbPassageVectorSearcher(lancedb_path)
     return SearchEngine(
@@ -662,18 +665,6 @@ def _expand_contextual_keyword_candidates(
             seen_passage_ids.add(neighbor.passage_id)
 
     return expanded
-
-
-def _resolve_embedding_config(embedding_config: EmbeddingConfig) -> EmbeddingConfig:
-    if embedding_config.provider is not None:
-        return embedding_config
-
-    return EmbeddingConfig(
-        provider=DEFAULT_EMBEDDING_PROVIDER,
-        base_url=embedding_config.base_url,
-        model=embedding_config.model,
-        api_key_env=embedding_config.api_key_env,
-    )
 
 
 def _normalize_lower_better_scores(scores: dict[str, float | None]) -> dict[str, float]:

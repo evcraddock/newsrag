@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+- Replaced the native Ollama embedding integration with one OpenAI-compatible `/v1/embeddings` provider for llama.cpp, LM Studio, Ollama, OpenAI, and other compatible services.
+- Require explicit embedding provider, base URL, and model configuration before ingestion or vector search.
+
 ## [0.3.0] - 2026-05-14
 
 ### Added

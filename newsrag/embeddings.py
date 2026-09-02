@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 import sqlite3
 import uuid
 from collections.abc import Sequence
@@ -11,9 +13,9 @@ import httpx
 
 from newsrag.config import EmbeddingConfig
 
-DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-DEFAULT_OLLAMA_MODEL = "nomic-embed-text"
-EMBEDDING_PROVIDER_OLLAMA = "ollama"
+EMBEDDING_PROVIDER_OPENAI_COMPATIBLE = "openai_compatible"
+DEFAULT_EMBEDDING_BATCH_SIZE = 64
+DEFAULT_EMBEDDING_TIMEOUT_SECONDS = 30.0
 
 
 class EmbeddingError(Exception):
@@ -58,25 +60,30 @@ class EmbeddingProvider(Protocol):
 
 
 @dataclass(frozen=True)
-class OllamaEmbeddingProvider:
-    """Embedding provider backed by the Ollama HTTP API."""
+class OpenAICompatibleEmbeddingProvider:
+    """Embedding provider backed by the OpenAI-compatible embeddings API."""
 
-    model: str = DEFAULT_OLLAMA_MODEL
-    base_url: str = DEFAULT_OLLAMA_BASE_URL
+    base_url: str
+    model: str
+    api_key_env: str | None = None
+    batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
+    timeout_seconds: float = DEFAULT_EMBEDDING_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if self.batch_size < 1:
+            raise EmbeddingError("Embedding batch size must be at least 1")
 
     @property
     def metadata(self) -> EmbeddingMetadata:
         model_name, version = _split_model_identity(self.model)
         return EmbeddingMetadata(
-            provider=EMBEDDING_PROVIDER_OLLAMA,
+            provider=EMBEDDING_PROVIDER_OPENAI_COMPATIBLE,
             model=model_name,
             version=version,
         )
 
     def embed_query(self, text: str) -> QueryEmbedding:
         vectors = self._embed_inputs([text])
-        if len(vectors) != 1:
-            raise EmbeddingError(f"Ollama returned {len(vectors)} vectors for 1 query")
         return QueryEmbedding(text=text, vector=vectors[0], metadata=self.metadata)
 
     def embed_chunks(self, texts: Sequence[str]) -> list[ChunkEmbedding]:
@@ -85,11 +92,6 @@ class OllamaEmbeddingProvider:
             return []
 
         vectors = self._embed_inputs(resolved_texts)
-        if len(vectors) != len(resolved_texts):
-            raise EmbeddingError(
-                f"Ollama returned {len(vectors)} vectors for {len(resolved_texts)} inputs"
-            )
-
         metadata = self.metadata
         return [
             ChunkEmbedding(text=text, vector=vector, metadata=metadata)
@@ -97,19 +99,59 @@ class OllamaEmbeddingProvider:
         ]
 
     def _embed_inputs(self, texts: list[str]) -> list[tuple[float, ...]]:
-        endpoint = f"{self.base_url.rstrip('/')}/api/embed"
+        headers = self._request_headers()
+        vectors: list[tuple[float, ...]] = []
+        expected_dimensions: int | None = None
+
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            batch_vectors = self._request_batch(batch, headers=headers)
+            batch_dimensions = len(batch_vectors[0])
+            if expected_dimensions is None:
+                expected_dimensions = batch_dimensions
+            elif batch_dimensions != expected_dimensions:
+                raise EmbeddingError(
+                    "OpenAI-compatible response contained inconsistent embedding dimensions"
+                )
+            vectors.extend(batch_vectors)
+
+        return vectors
+
+    def _request_batch(
+        self,
+        texts: list[str],
+        *,
+        headers: dict[str, str] | None,
+    ) -> list[tuple[float, ...]]:
+        endpoint = f"{self.base_url.rstrip('/')}/embeddings"
         try:
             response = httpx.post(
-                endpoint, json={"model": self.model, "input": texts}, timeout=30.0
+                endpoint,
+                json={"model": self.model, "input": texts},
+                timeout=self.timeout_seconds,
+                headers=headers,
             )
             response.raise_for_status()
             payload = response.json()
         except httpx.HTTPError as exc:
-            raise EmbeddingError(f"Ollama embedding request failed: {exc}") from exc
+            raise EmbeddingError(
+                f"OpenAI-compatible embedding request failed for {endpoint}: {exc}"
+            ) from exc
         except ValueError as exc:
-            raise EmbeddingError("Ollama embedding response was not valid JSON") from exc
+            raise EmbeddingError("OpenAI-compatible embedding response was not valid JSON") from exc
 
-        return _extract_embedding_vectors(payload)
+        return _extract_embedding_vectors(payload, expected_count=len(texts))
+
+    def _request_headers(self) -> dict[str, str] | None:
+        if self.api_key_env is None:
+            return None
+
+        api_key = os.getenv(self.api_key_env)
+        if not api_key:
+            raise EmbeddingError(
+                f"Embedding API key environment variable {self.api_key_env} is not set"
+            )
+        return {"Authorization": f"Bearer {api_key}"}
 
 
 @dataclass(frozen=True)
@@ -127,20 +169,34 @@ class EmbeddingRecord:
 
 
 def build_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
-    """Build an embedding provider from resolved config."""
+    """Build the OpenAI-compatible embedding provider from resolved config."""
 
     provider = config.provider
     if provider is None:
-        raise EmbeddingError("No embedding provider configured")
-
-    normalized_provider = provider.lower()
-    if normalized_provider == EMBEDDING_PROVIDER_OLLAMA:
-        return OllamaEmbeddingProvider(
-            model=config.model or DEFAULT_OLLAMA_MODEL,
-            base_url=config.base_url or DEFAULT_OLLAMA_BASE_URL,
+        raise EmbeddingError(
+            "No embedding provider configured; set embedding.provider=openai_compatible"
         )
 
-    raise EmbeddingError(f"Embedding provider '{provider}' is not implemented")
+    normalized_provider = provider.lower()
+    if normalized_provider == "ollama":
+        raise EmbeddingError(
+            "The native Ollama provider was removed; set provider=openai_compatible and "
+            "base_url=http://127.0.0.1:11434/v1"
+        )
+    if normalized_provider != EMBEDDING_PROVIDER_OPENAI_COMPATIBLE:
+        raise EmbeddingError(
+            f"Embedding provider '{provider}' is not supported; use openai_compatible"
+        )
+    if config.base_url is None:
+        raise EmbeddingError("embedding.base_url is required for provider=openai_compatible")
+    if config.model is None:
+        raise EmbeddingError("embedding.model is required for provider=openai_compatible")
+
+    return OpenAICompatibleEmbeddingProvider(
+        base_url=config.base_url,
+        model=config.model,
+        api_key_env=config.api_key_env,
+    )
 
 
 def create_embedding_record(
@@ -220,33 +276,70 @@ def list_embedding_records(database_path: Path) -> list[EmbeddingRecord]:
     return [_row_to_embedding_record(row) for row in rows]
 
 
-def _extract_embedding_vectors(payload: Any) -> list[tuple[float, ...]]:
+def _extract_embedding_vectors(
+    payload: Any,
+    *,
+    expected_count: int,
+) -> list[tuple[float, ...]]:
     if not isinstance(payload, dict):
-        raise EmbeddingError("Ollama embedding response had an unexpected payload shape")
+        raise EmbeddingError("OpenAI-compatible embedding response had an unexpected payload shape")
 
-    embeddings = payload.get("embeddings")
-    if not isinstance(embeddings, list):
-        raise EmbeddingError("Ollama embedding response is missing an embeddings list")
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise EmbeddingError("OpenAI-compatible embedding response is missing a data list")
+    if len(data) != expected_count:
+        raise EmbeddingError(
+            f"OpenAI-compatible embedding response returned {len(data)} vectors for "
+            f"{expected_count} inputs"
+        )
 
-    vectors: list[tuple[float, ...]] = []
-    for embedding in embeddings:
+    vectors_by_index: dict[int, tuple[float, ...]] = {}
+    dimensions: int | None = None
+    for item in data:
+        if not isinstance(item, dict):
+            raise EmbeddingError(
+                "OpenAI-compatible embedding response contained a non-object data item"
+            )
+
+        index = item.get("index")
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < expected_count:
+            raise EmbeddingError(
+                f"OpenAI-compatible embedding response contained invalid index {index!r}"
+            )
+        if index in vectors_by_index:
+            raise EmbeddingError(
+                f"OpenAI-compatible embedding response contained duplicate index {index}"
+            )
+
+        embedding = item.get("embedding")
         if not isinstance(embedding, list):
-            raise EmbeddingError("Ollama embedding response contained a non-list embedding")
-
+            raise EmbeddingError(
+                "OpenAI-compatible embedding response is missing an embedding vector"
+            )
         vector = tuple(_coerce_vector_value(value) for value in embedding)
         if not vector:
-            raise EmbeddingError("Ollama embedding response contained an empty embedding vector")
-        vectors.append(vector)
+            raise EmbeddingError(
+                "OpenAI-compatible embedding response contained an empty embedding vector"
+            )
+        if dimensions is None:
+            dimensions = len(vector)
+        elif len(vector) != dimensions:
+            raise EmbeddingError(
+                "OpenAI-compatible response contained inconsistent embedding dimensions"
+            )
+        vectors_by_index[index] = vector
 
-    if not vectors:
-        raise EmbeddingError("Ollama embedding response did not return any vectors")
-    return vectors
+    return [vectors_by_index[index] for index in range(expected_count)]
 
 
 def _coerce_vector_value(value: object) -> float:
-    if isinstance(value, int | float):
-        return float(value)
-    raise EmbeddingError("Ollama embedding response contained a non-numeric value")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise EmbeddingError("OpenAI-compatible embedding response contained a non-numeric value")
+
+    resolved_value = float(value)
+    if not math.isfinite(resolved_value):
+        raise EmbeddingError("OpenAI-compatible embedding response contained a non-finite value")
+    return resolved_value
 
 
 def _split_model_identity(model: str) -> tuple[str, str]:

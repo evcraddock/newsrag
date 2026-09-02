@@ -7,27 +7,15 @@ NewsRAG uses a local-first development stack. SQLite and LanceDB are embedded de
 Install the local tools NewsRAG expects on a fresh machine:
 
 ```bash
-brew install uv python@3.11 overmind tmux sqlite ocrmypdf tesseract ghostscript qpdf ollama
+brew install uv python@3.11 overmind tmux sqlite ocrmypdf tesseract ghostscript qpdf
 ```
 
 Notes:
 - Overmind uses tmux under the hood, so install both.
 - SQLite must include FTS5 support. The validation command below checks the Python runtime that NewsRAG will use.
-- Ollama must be running before local embedding checks will pass.
+- The test suite mocks embedding requests, so development checks do not require a running embedding service.
 
-Pull the default local embedding model:
-
-```bash
-ollama pull nomic-embed-text
-```
-
-If Ollama is not already running, start it with one of:
-
-```bash
-brew services start ollama
-# or
-ollama serve
-```
+For manual ingestion and vector-search testing, configure any OpenAI-compatible embedding service. See [Embedding configuration](embeddings.md) for llama.cpp, LM Studio, Ollama, and hosted OpenAI examples.
 
 ## Validate local prerequisites
 
@@ -42,8 +30,6 @@ ocrmypdf --version
 tesseract --version
 gs --version
 qpdf --version
-ollama --version
-ollama list | grep nomic-embed-text
 ```
 
 Validate SQLite FTS5 support through Python:

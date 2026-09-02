@@ -477,7 +477,7 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert len(vectors) == 2
     assert len(embedding_records) == 4
     assert {record.source_kind for record in embedding_records} == {"chunk", "passage"}
-    assert {record.provider for record in embedding_records} == {"ollama"}
+    assert {record.provider for record in embedding_records} == {"openai_compatible"}
     assert {vector["document_id"] for vector in vectors} == {documents[0].id}
 
 
@@ -741,8 +741,8 @@ class FailingTextExtractor:
 @dataclass(frozen=True)
 class FakeEmbeddingProvider:
     metadata: EmbeddingMetadata = EmbeddingMetadata(
-        provider="ollama",
-        model="nomic-embed-text",
+        provider="openai_compatible",
+        model="nomic-embed-text-v1.5",
         version="latest",
     )
 
