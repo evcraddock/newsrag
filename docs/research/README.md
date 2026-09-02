@@ -8,6 +8,7 @@ Working notes for a RAG / evidence retrieval system over city hall PDF documents
 - [[city-hall-pdf-rag]] — specific architecture and build plan for searching city hall PDFs with natural-language queries and citations.
 - [[recommended-stack]] — current local-first CLI stack recommendation.
 - [[discovery-oriented-ingestion-enrichment]] — research plan for evidence-backed document briefs, extracted facts, topics, timelines, and story leads.
+- [[non-pdf-source-ingestion]] — source-neutral ingestion design with static HTML as the first non-PDF adapter.
 
 ## Core idea
 
