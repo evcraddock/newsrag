@@ -49,11 +49,14 @@ embedding:
 
 def test_daemon_run_command_requires_embedding_configuration(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
+    config_path = tmp_path / "missing-config.yaml"
     initialize_storage(data_dir)
 
     result = runner.invoke(
         app,
         [
+            "--config-path",
+            str(config_path),
             "--data-dir",
             str(data_dir),
             "daemon",

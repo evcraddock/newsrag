@@ -29,6 +29,8 @@ class DocumentFilters:
     source_url: str | None = None
     since: str | None = None
     until: str | None = None
+    ingested_since: str | None = None
+    ingested_until: str | None = None
     query: str | None = None
 
 
@@ -268,6 +270,16 @@ def _build_filter_query(filters: DocumentFilters) -> _QueryParts:
         clauses.append("json_extract(documents.metadata_json, '$.meeting_date') <= ?")
         parameters.append(until)
 
+    ingested_since = _normalized_optional_string(filters.ingested_since)
+    if ingested_since is not None:
+        clauses.append("date(documents.created_at) >= ?")
+        parameters.append(ingested_since)
+
+    ingested_until = _normalized_optional_string(filters.ingested_until)
+    if ingested_until is not None:
+        clauses.append("date(documents.created_at) <= ?")
+        parameters.append(ingested_until)
+
     query = _normalized_optional_string(filters.query)
     if query is not None:
         like_query = f"%{query.lower()}%"
@@ -300,6 +312,23 @@ def _validate_filters(filters: DocumentFilters) -> None:
     until_date = _parse_filter_date(filters.until, option_name="--until")
     if since_date is not None and until_date is not None and since_date > until_date:
         raise DocumentError("Invalid date range: --since must be on or before --until")
+
+    ingested_since_date = _parse_filter_date(
+        filters.ingested_since,
+        option_name="--ingested-since",
+    )
+    ingested_until_date = _parse_filter_date(
+        filters.ingested_until,
+        option_name="--ingested-until",
+    )
+    if (
+        ingested_since_date is not None
+        and ingested_until_date is not None
+        and ingested_since_date > ingested_until_date
+    ):
+        raise DocumentError(
+            "Invalid ingestion date range: --ingested-since must be on or before --ingested-until"
+        )
 
 
 def _parse_filter_date(value: str | None, *, option_name: str) -> date | None:

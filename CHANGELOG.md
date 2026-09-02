@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+- Added inclusive UTC ingestion-date filters to `newsrag documents list` with `--ingested-since` and `--ingested-until`.
+
 ## [0.4.0] - 2026-09-02
 
 ### Added
