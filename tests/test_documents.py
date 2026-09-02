@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -14,6 +15,10 @@ from newsrag.documents import (
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
+
+
+def _strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", value)
 
 
 def test_documents_list_empty_corpus(tmp_path: Path) -> None:
@@ -230,13 +235,14 @@ def test_documents_list_rejects_invalid_and_reversed_ingestion_dates(tmp_path: P
 
 def test_documents_list_help_distinguishes_ingestion_and_meeting_dates() -> None:
     result = runner.invoke(app, ["documents", "list", "--help"])
+    output = _strip_ansi(result.stdout)
 
     assert result.exit_code == 0
-    assert "--ingested-since" in result.stdout
-    assert "--ingested-until" in result.stdout
-    assert "Only list documents ingested on or after" in result.stdout
-    assert "YYYY-MM-DD (UTC)." in result.stdout
-    assert "Only list documents with meeting dates on" in result.stdout
+    assert "--ingested-since" in output
+    assert "--ingested-until" in output
+    assert "Only list documents ingested on or after" in output
+    assert "YYYY-MM-DD (UTC)." in output
+    assert "Only list documents with meeting dates on" in output
 
 
 def test_documents_list_rejects_invalid_limit_and_date(tmp_path: Path) -> None:
