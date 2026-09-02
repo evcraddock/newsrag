@@ -563,6 +563,16 @@ def documents_list_command(
         "--until",
         help="Only list documents with meeting dates on or before YYYY-MM-DD.",
     ),
+    ingested_since: str | None = typer.Option(
+        None,
+        "--ingested-since",
+        help="Only list documents ingested on or after YYYY-MM-DD (UTC).",
+    ),
+    ingested_until: str | None = typer.Option(
+        None,
+        "--ingested-until",
+        help="Only list documents ingested on or before YYYY-MM-DD (UTC).",
+    ),
     query: str | None = typer.Option(
         None,
         "--query",
@@ -591,6 +601,8 @@ def documents_list_command(
         source_url=source_url,
         since=since,
         until=until,
+        ingested_since=ingested_since,
+        ingested_until=ingested_until,
         query=query,
     )
     try:

@@ -98,6 +98,147 @@ def test_documents_list_supports_metadata_date_query_and_pagination_filters(
     assert page.total == 1
 
 
+def test_documents_list_filters_on_or_after_ingestion_date(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_document_inventory(data_dir)
+
+    page = list_document_summaries(
+        database_path,
+        filters=DocumentFilters(ingested_since="2026-04-02"),
+    )
+
+    assert [document.id for document in page.documents] == ["document-c", "document-b"]
+
+
+def test_documents_list_filters_on_or_before_entire_ingestion_day(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_document_inventory(data_dir)
+
+    page = list_document_summaries(
+        database_path,
+        filters=DocumentFilters(ingested_until="2026-04-02"),
+    )
+
+    assert [document.id for document in page.documents] == ["document-b", "document-a"]
+    assert page.documents[0].created_at == "2026-04-02T23:59:59+00:00"
+
+
+def test_documents_list_filters_within_ingestion_date_range(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_document_inventory(data_dir)
+
+    page = list_document_summaries(
+        database_path,
+        filters=DocumentFilters(
+            ingested_since="2026-04-02",
+            ingested_until="2026-04-02",
+        ),
+    )
+
+    assert [document.id for document in page.documents] == ["document-b"]
+
+
+def test_documents_list_combines_ingestion_and_existing_filters(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_document_inventory(data_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "documents",
+            "list",
+            "--ingested-since",
+            "2026-04-03",
+            "--body",
+            "Planning Commission",
+            "--query",
+            "zoning",
+        ],
+    )
+    page = list_document_summaries(
+        database_path,
+        filters=DocumentFilters(
+            body="Planning Commission",
+            query="zoning",
+            ingested_since="2026-04-03",
+        ),
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "document-c | Zoning Packet" in result.stdout
+    assert [document.id for document in page.documents] == ["document-c"]
+
+
+def test_documents_list_ingestion_filters_can_return_empty_results(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    _seed_document_inventory(data_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "documents",
+            "list",
+            "--ingested-since",
+            "2030-01-01",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "documents: none" in result.stdout
+
+
+def test_documents_list_rejects_invalid_and_reversed_ingestion_dates(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    initialize_storage(data_dir)
+
+    invalid_result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "documents",
+            "list",
+            "--ingested-since",
+            "04-01-2026",
+        ],
+    )
+    reversed_result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "documents",
+            "list",
+            "--ingested-since",
+            "2026-04-03",
+            "--ingested-until",
+            "2026-04-02",
+        ],
+    )
+
+    assert invalid_result.exit_code == 1
+    assert "Invalid --ingested-since date: expected YYYY-MM-DD" in invalid_result.stdout
+    assert reversed_result.exit_code == 1
+    assert (
+        "Invalid ingestion date range: --ingested-since must be on or before --ingested-until"
+    ) in reversed_result.stdout
+
+
+def test_documents_list_help_distinguishes_ingestion_and_meeting_dates() -> None:
+    result = runner.invoke(app, ["documents", "list", "--help"])
+
+    assert result.exit_code == 0
+    assert "--ingested-since" in result.stdout
+    assert "--ingested-until" in result.stdout
+    assert "Only list documents ingested on or after" in result.stdout
+    assert "YYYY-MM-DD (UTC)." in result.stdout
+    assert "Only list documents with meeting dates on" in result.stdout
+
+
 def test_documents_list_rejects_invalid_limit_and_date(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     initialize_storage(data_dir)
@@ -190,7 +331,7 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                     "hash-b",
                     "/tmp/budget-ocr.pdf",
                     '{"body": "City Council", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-04-20", "source_filename": "budget.pdf"}',
-                    "2026-04-02T00:00:00+00:00",
+                    "2026-04-02T23:59:59+00:00",
                 ),
                 (
                     "document-c",

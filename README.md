@@ -62,6 +62,14 @@ newsrag doctor
 newsrag status --initialize
 ```
 
+List documents ingested during an inclusive UTC calendar-date range:
+
+```bash
+newsrag documents list --ingested-since 2026-09-01 --ingested-until 2026-09-02
+```
+
+The existing `--since` and `--until` document filters continue to apply to meeting dates.
+
 ## Development prerequisites
 
 NewsRAG uses a local-first stack:
