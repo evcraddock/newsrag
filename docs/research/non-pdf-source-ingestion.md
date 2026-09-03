@@ -238,7 +238,7 @@ Once registration succeeds, errors produce a durable failed job and no searchabl
 
 The task intentionally does not define:
 
-- source identity or duplicate-ingestion policy;
+- source identity or duplicate-ingestion policy, now defined in [[source-identity-and-repeated-ingestion]];
 - source revisions, updates, refresh, or change detection;
 - reprocessing after extractor, embedding, or index changes;
 - catalog browsing, source discovery, crawling, or SlugKit integration; or

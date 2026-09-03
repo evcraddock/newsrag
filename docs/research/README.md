@@ -9,6 +9,7 @@ Working notes for a RAG / evidence retrieval system over city hall PDF documents
 - [[recommended-stack]] — current local-first CLI stack recommendation.
 - [[discovery-oriented-ingestion-enrichment]] — research plan for evidence-backed document briefs, extracted facts, topics, timelines, and story leads.
 - [[non-pdf-source-ingestion]] — source-neutral ingestion design with static HTML as the first non-PDF adapter.
+- [[source-identity-and-repeated-ingestion]] — exact-byte source identity and duplicate-ingestion policy.
 
 ## Core idea
 
