@@ -1,1 +1,1 @@
-newsrag: uv run newsrag daemon run
+newsrag: uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" daemon run

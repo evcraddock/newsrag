@@ -97,7 +97,14 @@ uv run newsrag --help
 make dev
 ```
 
-This starts all processes defined in `Procfile.dev`, including the foreground `newsrag daemon run` process managed by Overmind.
+This starts all processes defined in `Procfile.dev`, including the foreground `newsrag daemon run` process managed by Overmind. The development daemon stores its corpus under the repository's gitignored `.newsrag` directory by default; set `NEWSRAG_DATA_DIR` to override it.
+
+Target the same development corpus from another terminal by passing the development data directory explicitly:
+
+```bash
+uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" status
+uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" jobs list
+```
 
 ### View and manage the development environment
 
