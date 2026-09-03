@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+import lancedb  # type: ignore[import-untyped]
 import pytest
 from typer.testing import CliRunner
 
@@ -189,10 +192,21 @@ def test_url_ingest_stores_source_url_and_retrieved_at(
     )
 
     documents = list_documents(paths.database)
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        source = connection.execute("SELECT * FROM sources").fetchone()
+        artifact = connection.execute("SELECT * FROM source_artifacts").fetchone()
 
     assert len(documents) == 1
     assert documents[0].source_url == url
     assert documents[0].metadata["retrieved_at"] == retrieved_at
+    assert source is not None
+    assert source["kind"] == "url"
+    assert source["submitted_reference"] == url
+    assert source["normalized_reference"] == url
+    assert artifact is not None
+    assert artifact["source_id"] == source["id"]
+    assert artifact["acquired_at"] == retrieved_at
 
 
 def test_ingest_url_rejects_non_pdf_responses(
@@ -465,6 +479,30 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     chunks = list_chunks(paths.database)
     vectors = list_chunk_vectors(paths.lancedb)
     embedding_records = list_embedding_records(paths.database)
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        source = connection.execute("SELECT * FROM sources").fetchone()
+        artifact = connection.execute("SELECT * FROM source_artifacts").fetchone()
+        source_units = connection.execute(
+            "SELECT * FROM source_units ORDER BY ordinal ASC"
+        ).fetchall()
+        chunk_ranges = connection.execute(
+            """
+            SELECT source_unit_start_id, source_unit_end_id
+            FROM chunks
+            ORDER BY page_start ASC
+            """
+        ).fetchall()
+        passage_ranges = connection.execute(
+            """
+            SELECT source_unit_start_id, source_unit_end_id
+            FROM passages
+            ORDER BY page_start ASC, ordinal ASC
+            """
+        ).fetchall()
+    passage_vectors = (
+        lancedb.connect(paths.lancedb).open_table("passage_embeddings").to_arrow().to_pylist()
+    )
 
     assert processed is True
     assert get_job(paths.database, job.id).status == "done"
@@ -478,7 +516,36 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert len(embedding_records) == 4
     assert {record.source_kind for record in embedding_records} == {"chunk", "passage"}
     assert {record.provider for record in embedding_records} == {"openai_compatible"}
+    assert source is not None
+    assert source["kind"] == "local_path"
+    assert source["submitted_reference"] == str(source_pdf.resolve())
+    assert artifact is not None
+    assert artifact["source_id"] == source["id"]
+    assert artifact["content_hash"] == documents[0].source_hash
+    assert artifact["byte_size"] == source_pdf.stat().st_size
+    assert len(source_units) == 2
+    assert [unit["ordinal"] for unit in source_units] == [1, 2]
+    assert [json.loads(unit["location_json"]) for unit in source_units] == [
+        {"page_number": 1},
+        {"page_number": 2},
+    ]
+    assert [unit["human_label"] for unit in source_units] == ["p. 1", "p. 2"]
+    unit_ids = [str(unit["id"]) for unit in source_units]
+    assert [tuple(row) for row in chunk_ranges] == [
+        (unit_ids[0], unit_ids[0]),
+        (unit_ids[1], unit_ids[1]),
+    ]
+    assert [tuple(row) for row in passage_ranges] == [
+        (unit_ids[0], unit_ids[0]),
+        (unit_ids[1], unit_ids[1]),
+    ]
     assert {vector["document_id"] for vector in vectors} == {documents[0].id}
+    assert {vector["source_unit_start_id"] for vector in vectors} == set(unit_ids)
+    assert {vector["source_unit_end_id"] for vector in vectors} == set(unit_ids)
+    assert {vector["source_unit_start_id"] for vector in passage_vectors} == set(unit_ids)
+    assert {vector["source_unit_end_id"] for vector in passage_vectors} == set(unit_ids)
+    assert {record.source_unit_start_id for record in embedding_records} == set(unit_ids)
+    assert {record.source_unit_end_id for record in embedding_records} == set(unit_ids)
 
 
 def test_build_pdf_text_extractor_can_choose_extraction_path_under_test() -> None:

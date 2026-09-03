@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
+import lancedb  # type: ignore[import-untyped]
+import pyarrow as pa
+
 from newsrag.jobs import DONE, FAILED, PENDING, RUNNING
 from newsrag.passages import build_passage_rows
+from newsrag.sources import (
+    PAGE_LOCATION_TYPE,
+    PDF_MEDIA_TYPE,
+    artifact_id_for_hash,
+    build_source_identity,
+    source_unit_id_for_page,
+)
 
 
 class StorageError(Exception):
@@ -68,8 +79,11 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifacts", "artifacts"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 REQUIRED_TABLES = {
+    "sources",
+    "source_artifacts",
+    "source_units",
     "documents",
     "pages",
     "chunks",
@@ -96,6 +110,30 @@ SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS sources (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        submitted_reference TEXT NOT NULL,
+        normalized_reference TEXT NOT NULL,
+        resolved_reference TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(kind, normalized_reference)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS source_artifacts (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        byte_size INTEGER,
+        content_hash TEXT NOT NULL UNIQUE,
+        stored_path TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(source_id) REFERENCES sources(id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
         source_path TEXT,
@@ -104,7 +142,9 @@ SCHEMA_STATEMENTS = (
         source_hash TEXT,
         normalized_path TEXT,
         metadata_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        artifact_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id)
     )
     """,
     """
@@ -112,10 +152,31 @@ SCHEMA_STATEMENTS = (
         id TEXT PRIMARY KEY,
         document_id TEXT NOT NULL,
         page_number INTEGER NOT NULL,
+        source_unit_id TEXT,
         text TEXT NOT NULL DEFAULT '',
         extractor TEXT NOT NULL DEFAULT 'unknown',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(document_id) REFERENCES documents(id)
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(source_unit_id) REFERENCES source_units(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS source_units (
+        id TEXT PRIMARY KEY,
+        artifact_id TEXT NOT NULL,
+        document_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        location_type TEXT NOT NULL,
+        location_json TEXT NOT NULL DEFAULT '{}',
+        human_label TEXT NOT NULL,
+        normalized_text TEXT NOT NULL DEFAULT '',
+        structure_json TEXT NOT NULL DEFAULT '{}',
+        extractor TEXT NOT NULL,
+        extractor_version TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id),
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        UNIQUE(document_id, ordinal)
     )
     """,
     """
@@ -124,9 +185,13 @@ SCHEMA_STATEMENTS = (
         document_id TEXT NOT NULL,
         page_start INTEGER NOT NULL,
         page_end INTEGER NOT NULL,
+        source_unit_start_id TEXT,
+        source_unit_end_id TEXT,
         text TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(document_id) REFERENCES documents(id)
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
+        FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id)
     )
     """,
     """
@@ -142,11 +207,15 @@ SCHEMA_STATEMENTS = (
         document_id TEXT NOT NULL,
         page_start INTEGER NOT NULL,
         page_end INTEGER NOT NULL,
+        source_unit_start_id TEXT,
+        source_unit_end_id TEXT,
         ordinal INTEGER NOT NULL,
         text TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(chunk_id) REFERENCES chunks(id),
-        FOREIGN KEY(document_id) REFERENCES documents(id)
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
+        FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id)
     )
     """,
     """
@@ -193,7 +262,11 @@ SCHEMA_STATEMENTS = (
         model TEXT NOT NULL,
         version TEXT NOT NULL,
         dimensions INTEGER NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        source_unit_start_id TEXT,
+        source_unit_end_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
+        FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id)
     )
     """,
     """
@@ -304,7 +377,10 @@ def initialize_storage(data_dir: Path) -> StoragePaths:
     for directory in _iter_directories(paths):
         directory.mkdir(parents=True, exist_ok=True)
 
-    _initialize_database(paths.database)
+    vector_migration_required = _initialize_database(paths.database)
+    if vector_migration_required:
+        _backfill_vector_source_unit_ranges(paths.database, paths.lancedb)
+    _set_schema_version(paths.database)
     return paths
 
 
@@ -454,20 +530,55 @@ def _iter_directories(paths: StoragePaths) -> tuple[Path, ...]:
     return tuple(directory for _, directory in _directory_checks(paths))
 
 
-def _initialize_database(database_path: Path) -> None:
+def _initialize_database(database_path: Path) -> bool:
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
+        previous_schema_version = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
         _ensure_column(connection, "documents", "source_hash", "TEXT")
         _ensure_column(connection, "documents", "normalized_path", "TEXT")
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(
+            connection,
+            "documents",
+            "artifact_id",
+            "TEXT REFERENCES source_artifacts(id)",
+        )
         _ensure_column(connection, "pages", "extractor", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(
+            connection,
+            "pages",
+            "source_unit_id",
+            "TEXT REFERENCES source_units(id)",
+        )
+        for table_name in ("chunks", "passages", "embedding_records"):
+            _ensure_column(
+                connection,
+                table_name,
+                "source_unit_start_id",
+                "TEXT REFERENCES source_units(id)",
+            )
+            _ensure_column(
+                connection,
+                table_name,
+                "source_unit_end_id",
+                "TEXT REFERENCES source_units(id)",
+            )
         _ensure_column(connection, "document_profiles", "provider", "TEXT")
         _ensure_column(connection, "document_briefs", "provider", "TEXT")
         _ensure_column(connection, "discovery_items", "provider", "TEXT")
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_documents_source_hash ON documents(source_hash)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_documents_artifact_id ON documents(artifact_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_units_document_ordinal "
+            "ON source_units(document_id, ordinal)"
         )
         connection.execute(
             """
@@ -478,6 +589,7 @@ def _initialize_database(database_path: Path) -> None:
             """
         )
         _backfill_passages(connection)
+        _backfill_pdf_source_model(connection)
         connection.execute(
             """
             INSERT INTO passages_fts(passage_id, text)
@@ -486,11 +598,302 @@ def _initialize_database(database_path: Path) -> None:
             WHERE passages.id NOT IN (SELECT passage_id FROM passages_fts)
             """
         )
+        connection.commit()
+
+    return previous_schema_version is None or str(previous_schema_version[0]) != SCHEMA_VERSION
+
+
+def _set_schema_version(database_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
         connection.execute(
-            "INSERT OR IGNORE INTO metadata(key, value) VALUES(?, ?)",
+            """
+            INSERT INTO metadata(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
             ("schema_version", SCHEMA_VERSION),
         )
         connection.commit()
+
+
+def _backfill_vector_source_unit_ranges(database_path: Path, lancedb_path: Path) -> None:
+    database = lancedb.connect(lancedb_path)
+    table_specs = (
+        ("chunk_embeddings", "chunk_id", "chunks"),
+        ("passage_embeddings", "passage_id", "passages"),
+    )
+    for table_name, key_column, sqlite_table in table_specs:
+        try:
+            table = database.open_table(table_name)
+        except ValueError:
+            continue
+
+        missing_fields = [
+            pa.field(column_name, pa.string())
+            for column_name in ("source_unit_start_id", "source_unit_end_id")
+            if column_name not in table.schema.names
+        ]
+        if missing_fields:
+            table.add_columns(missing_fields)
+
+        with sqlite3.connect(database_path) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, source_unit_start_id, source_unit_end_id
+                FROM {sqlite_table}
+                WHERE source_unit_start_id IS NOT NULL
+                    AND source_unit_end_id IS NOT NULL
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+        for source_key, source_unit_start_id, source_unit_end_id in rows:
+            escaped_key = str(source_key).replace("'", "''")
+            table.update(
+                where=(
+                    f"{key_column} = '{escaped_key}' AND "
+                    "(source_unit_start_id IS NULL OR source_unit_end_id IS NULL)"
+                ),
+                values={
+                    "source_unit_start_id": str(source_unit_start_id),
+                    "source_unit_end_id": str(source_unit_end_id),
+                },
+            )
+
+
+def _backfill_pdf_source_model(connection: sqlite3.Connection) -> None:
+    document_rows = connection.execute(
+        """
+        SELECT
+            id,
+            source_path,
+            source_url,
+            source_hash,
+            metadata_json,
+            created_at
+        FROM documents
+        WHERE artifact_id IS NULL
+            AND source_hash IS NOT NULL
+            AND (source_path IS NOT NULL OR source_url IS NOT NULL)
+        ORDER BY created_at ASC, id ASC
+        """
+    ).fetchall()
+
+    for row in document_rows:
+        document_id = str(row[0])
+        raw_source_path = str(row[1]) if row[1] is not None else ""
+        source_url = str(row[2]) if row[2] is not None else None
+        content_hash = str(row[3])
+        metadata = _load_metadata_json(row[4])
+        stored_path = _artifact_stored_path(metadata, raw_source_path)
+        if stored_path is None:
+            continue
+
+        source_identity = build_source_identity(
+            source_path=Path(raw_source_path),
+            source_url=source_url,
+        )
+        artifact_id = artifact_id_for_hash(content_hash)
+        acquired_at = _metadata_text(metadata, "retrieved_at") or str(row[5])
+        byte_size = _artifact_byte_size(metadata, stored_path)
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO sources(
+                id,
+                kind,
+                submitted_reference,
+                normalized_reference,
+                resolved_reference
+            )
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                source_identity.id,
+                source_identity.kind,
+                source_identity.submitted_reference,
+                source_identity.normalized_reference,
+                source_identity.resolved_reference,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO source_artifacts(
+                id,
+                source_id,
+                media_type,
+                byte_size,
+                content_hash,
+                stored_path,
+                acquired_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                source_identity.id,
+                PDF_MEDIA_TYPE,
+                byte_size,
+                content_hash,
+                stored_path,
+                acquired_at,
+            ),
+        )
+        connection.execute(
+            "UPDATE documents SET artifact_id = ? WHERE id = ?",
+            (artifact_id, document_id),
+        )
+
+    page_rows = connection.execute(
+        """
+        SELECT
+            pages.id,
+            pages.document_id,
+            pages.page_number,
+            pages.text,
+            pages.extractor,
+            documents.artifact_id
+        FROM pages
+        JOIN documents ON documents.id = pages.document_id
+        WHERE pages.source_unit_id IS NULL
+            AND documents.artifact_id IS NOT NULL
+        ORDER BY pages.document_id ASC, pages.page_number ASC, pages.id ASC
+        """
+    ).fetchall()
+    for row in page_rows:
+        page_id = str(row[0])
+        document_id = str(row[1])
+        page_number = int(row[2])
+        unit_id = source_unit_id_for_page(page_id)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO source_units(
+                id,
+                artifact_id,
+                document_id,
+                ordinal,
+                location_type,
+                location_json,
+                human_label,
+                normalized_text,
+                structure_json,
+                extractor
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, '{}', ?)
+            """,
+            (
+                unit_id,
+                str(row[5]),
+                document_id,
+                page_number,
+                PAGE_LOCATION_TYPE,
+                json.dumps({"page_number": page_number}, sort_keys=True),
+                f"p. {page_number}",
+                str(row[3]),
+                str(row[4]),
+            ),
+        )
+        connection.execute(
+            "UPDATE pages SET source_unit_id = ? WHERE id = ?",
+            (unit_id, page_id),
+        )
+
+    for table_name in ("chunks", "passages"):
+        connection.execute(
+            f"""
+            UPDATE {table_name}
+            SET source_unit_start_id = COALESCE(
+                    source_unit_start_id,
+                    (
+                        SELECT pages.source_unit_id
+                        FROM pages
+                        WHERE pages.document_id = {table_name}.document_id
+                            AND pages.page_number = {table_name}.page_start
+                    )
+                ),
+                source_unit_end_id = COALESCE(
+                    source_unit_end_id,
+                    (
+                        SELECT pages.source_unit_id
+                        FROM pages
+                        WHERE pages.document_id = {table_name}.document_id
+                            AND pages.page_number = {table_name}.page_end
+                    )
+                )
+            WHERE document_id IN (
+                    SELECT documents.id
+                    FROM documents
+                    JOIN source_artifacts
+                        ON source_artifacts.id = documents.artifact_id
+                    WHERE source_artifacts.media_type = ?
+                )
+                AND (source_unit_start_id IS NULL OR source_unit_end_id IS NULL)
+            """,
+            (PDF_MEDIA_TYPE,),
+        )
+
+    for source_kind, table_name in (("chunk", "chunks"), ("passage", "passages")):
+        connection.execute(
+            f"""
+            UPDATE embedding_records
+            SET source_unit_start_id = COALESCE(
+                    source_unit_start_id,
+                    (
+                        SELECT {table_name}.source_unit_start_id
+                        FROM {table_name}
+                        WHERE {table_name}.id = embedding_records.source_key
+                    )
+                ),
+                source_unit_end_id = COALESCE(
+                    source_unit_end_id,
+                    (
+                        SELECT {table_name}.source_unit_end_id
+                        FROM {table_name}
+                        WHERE {table_name}.id = embedding_records.source_key
+                    )
+                )
+            WHERE source_kind = ?
+                AND (source_unit_start_id IS NULL OR source_unit_end_id IS NULL)
+            """,
+            (source_kind,),
+        )
+
+
+def _load_metadata_json(raw_metadata: object) -> dict[str, object]:
+    if not isinstance(raw_metadata, str):
+        return {}
+    try:
+        metadata = json.loads(raw_metadata)
+    except ValueError:
+        return {}
+    if not isinstance(metadata, dict):
+        return {}
+    return metadata
+
+
+def _metadata_text(metadata: dict[str, object], key: str) -> str | None:
+    value = metadata.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _artifact_stored_path(metadata: dict[str, object], source_path: str) -> str | None:
+    stored_path = _metadata_text(metadata, "stored_source_path")
+    if stored_path is not None:
+        return stored_path
+    if source_path:
+        return source_path
+    return None
+
+
+def _artifact_byte_size(metadata: dict[str, object], stored_path: str) -> int | None:
+    stored_size = metadata.get("source_size_bytes")
+    if isinstance(stored_size, int) and not isinstance(stored_size, bool) and stored_size >= 0:
+        return stored_size
+    try:
+        return Path(stored_path).stat().st_size
+    except OSError:
+        return None
 
 
 def _backfill_passages(connection: sqlite3.Connection) -> None:

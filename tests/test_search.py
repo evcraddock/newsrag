@@ -19,6 +19,7 @@ from newsrag.search import (
     build_search_engine,
     format_citation,
     format_search_results,
+    merge_search_candidates,
     search_keyword_candidates,
 )
 from newsrag.storage import initialize_storage
@@ -119,6 +120,126 @@ def test_search_over_indexed_passages_returns_ranked_cited_passages(tmp_path: Pa
         "passage-e",
         "passage-f",
     }
+
+
+def test_search_candidates_and_results_retain_source_unit_ranges(tmp_path: Path) -> None:
+    database_path = initialize_storage(tmp_path / ".newsrag").database
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at
+            )
+            VALUES('artifact-1', 'source-1', 'application/pdf', 10, 'hash-1', '/tmp/report.pdf', CURRENT_TIMESTAMP)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, source_path, title, source_hash, metadata_json, artifact_id
+            )
+            VALUES(
+                'document-1',
+                '/tmp/report.pdf',
+                'Stormwater Report',
+                'hash-1',
+                '{"meeting_date": "2026-05-01"}',
+                'artifact-1'
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_units(
+                id,
+                artifact_id,
+                document_id,
+                ordinal,
+                location_type,
+                location_json,
+                human_label,
+                normalized_text,
+                extractor
+            )
+            VALUES(?, 'artifact-1', 'document-1', ?, 'page', ?, ?, ?, 'pymupdf')
+            """,
+            [
+                ("unit-1", 1, '{"page_number": 1}', "p. 1", "stormwater"),
+                ("unit-2", 2, '{"page_number": 2}', "p. 2", "improvements"),
+            ],
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks(
+                id,
+                document_id,
+                page_start,
+                page_end,
+                source_unit_start_id,
+                source_unit_end_id,
+                text
+            )
+            VALUES('chunk-1', 'document-1', 1, 2, 'unit-1', 'unit-2', 'stormwater improvements')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO passages(
+                id,
+                chunk_id,
+                document_id,
+                page_start,
+                page_end,
+                source_unit_start_id,
+                source_unit_end_id,
+                ordinal,
+                text
+            )
+            VALUES(
+                'passage-1',
+                'chunk-1',
+                'document-1',
+                1,
+                2,
+                'unit-1',
+                'unit-2',
+                1,
+                'stormwater improvements'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO passages_fts(passage_id, text)
+            VALUES('passage-1', 'stormwater improvements')
+            """
+        )
+        connection.commit()
+
+    candidates = search_keyword_candidates(database_path, "stormwater", limit=5)
+    results = merge_search_candidates(
+        candidates,
+        [],
+        database_path=database_path,
+        limit=5,
+        keyword_weight=0.6,
+        vector_weight=0.4,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].source_unit_start_id == "unit-1"
+    assert candidates[0].source_unit_end_id == "unit-2"
+    assert len(results) == 1
+    assert results[0].source_unit_start_id == "unit-1"
+    assert results[0].source_unit_end_id == "unit-2"
+    assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 1"
 
 
 def test_search_filters_by_document_metadata_and_meeting_date(tmp_path: Path) -> None:

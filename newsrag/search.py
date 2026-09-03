@@ -89,6 +89,8 @@ class PassageVectorRecord:
     text: str
     vector: tuple[float, ...]
     metadata: EmbeddingMetadata
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +109,8 @@ class SearchCandidate:
     jurisdiction: str | None = None
     source_url: str | None = None
     source_path: str | None = None
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
     keyword_score: float | None = None
     vector_score: float | None = None
 
@@ -131,6 +135,8 @@ class SearchResult:
     jurisdiction: str | None = None
     source_url: str | None = None
     source_path: str | None = None
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
 
 
 class Reranker(Protocol):
@@ -179,6 +185,8 @@ class LanceDbPassageVectorStore:
                 "document_id": passage.document_id,
                 "page_start": passage.page_start,
                 "page_end": passage.page_end,
+                "source_unit_start_id": passage.source_unit_start_id,
+                "source_unit_end_id": passage.source_unit_end_id,
                 "text": passage.text,
                 "vector": list(passage.vector),
                 "provider": passage.metadata.provider,
@@ -230,6 +238,8 @@ class LanceDbPassageVectorSearcher:
                     text=str(row["text"]),
                     title=None,
                     meeting_date=None,
+                    source_unit_start_id=_optional_string(row.get("source_unit_start_id")),
+                    source_unit_end_id=_optional_string(row.get("source_unit_end_id")),
                     vector_score=distance,
                 )
             )
@@ -344,6 +354,8 @@ def search_keyword_candidates(
                 passages.document_id AS document_id,
                 passages.page_start AS page_start,
                 passages.page_end AS page_end,
+                passages.source_unit_start_id AS source_unit_start_id,
+                passages.source_unit_end_id AS source_unit_end_id,
                 passages.text AS passage_text,
                 documents.title AS title,
                 documents.source_url AS source_url,
@@ -380,6 +392,8 @@ def search_keyword_candidates(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+                source_unit_end_id=_optional_string(row["source_unit_end_id"]),
                 keyword_score=float(row["keyword_score"]),
             )
         )
@@ -446,6 +460,8 @@ def merge_search_candidates(
             jurisdiction=context.jurisdiction,
             source_url=context.source_url,
             source_path=context.source_path,
+            source_unit_start_id=context.source_unit_start_id,
+            source_unit_end_id=context.source_unit_end_id,
         )
 
     return sorted(
@@ -516,6 +532,8 @@ def _ensure_passage_embeddings(
                     text=passage.text,
                     vector=embedding.vector,
                     metadata=embedding.metadata,
+                    source_unit_start_id=passage.source_unit_start_id,
+                    source_unit_end_id=passage.source_unit_end_id,
                 )
                 for passage, embedding in zip(batch, embeddings, strict=True)
             ]
@@ -526,6 +544,8 @@ def _ensure_passage_embeddings(
                 source_kind="passage",
                 source_key=passage.passage_id,
                 embedding=embedding,
+                source_unit_start_id=passage.source_unit_start_id,
+                source_unit_end_id=passage.source_unit_end_id,
             )
 
 
@@ -536,6 +556,8 @@ class _PassageForEmbedding:
     page_start: int
     page_end: int
     text: str
+    source_unit_start_id: str | None
+    source_unit_end_id: str | None
 
 
 def _load_missing_passages(
@@ -551,7 +573,9 @@ def _load_missing_passages(
                 passages.document_id AS document_id,
                 passages.page_start AS page_start,
                 passages.page_end AS page_end,
-                passages.text AS passage_text
+                passages.text AS passage_text,
+                passages.source_unit_start_id AS source_unit_start_id,
+                passages.source_unit_end_id AS source_unit_end_id
             FROM passages
             LEFT JOIN embedding_records
                 ON embedding_records.source_kind = 'passage'
@@ -572,6 +596,8 @@ def _load_missing_passages(
             page_start=int(row["page_start"]),
             page_end=int(row["page_end"]),
             text=str(row["passage_text"]),
+            source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+            source_unit_end_id=_optional_string(row["source_unit_end_id"]),
         )
         for row in rows
     ]
@@ -659,6 +685,8 @@ def _expand_contextual_keyword_candidates(
                     jurisdiction=neighbor.jurisdiction,
                     source_url=neighbor.source_url,
                     source_path=neighbor.source_path,
+                    source_unit_start_id=neighbor.source_unit_start_id,
+                    source_unit_end_id=neighbor.source_unit_end_id,
                     keyword_score=(candidate.keyword_score or 0.0) + 0.5,
                 )
             )
@@ -712,6 +740,8 @@ def _load_passage_context(
                     passages.document_id AS document_id,
                     passages.page_start AS page_start,
                     passages.page_end AS page_end,
+                    passages.source_unit_start_id AS source_unit_start_id,
+                    passages.source_unit_end_id AS source_unit_end_id,
                     passages.text AS passage_text,
                     documents.title AS title,
                     documents.source_url AS source_url,
@@ -742,6 +772,8 @@ def _load_passage_context(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+                source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             )
 
     for candidate in vector_candidates:
@@ -759,6 +791,8 @@ def _load_passage_context(
             jurisdiction=existing.jurisdiction,
             source_url=existing.source_url,
             source_path=existing.source_path,
+            source_unit_start_id=existing.source_unit_start_id,
+            source_unit_end_id=existing.source_unit_end_id,
             keyword_score=existing.keyword_score,
             vector_score=candidate.vector_score,
         )
@@ -814,6 +848,8 @@ def _load_adjacent_passages(
                 passages.document_id AS document_id,
                 passages.page_start AS page_start,
                 passages.page_end AS page_end,
+                passages.source_unit_start_id AS source_unit_start_id,
+                passages.source_unit_end_id AS source_unit_end_id,
                 passages.text AS passage_text,
                 documents.title AS title,
                 documents.source_url AS source_url,
@@ -849,6 +885,8 @@ def _load_adjacent_passages(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+                source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             )
         )
     return candidates

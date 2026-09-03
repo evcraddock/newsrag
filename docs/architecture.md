@@ -39,11 +39,14 @@ The daemon is global and may manage many data directories over time. Search beha
 NewsRAG is organized around a small set of durable entities rather than a server-side application model.
 
 - **Corpus/data directory**: a local collection of documents, metadata, artifacts, and indexes stored under the default user data directory or configured equivalent.
-- **Document**: a source PDF and its user-supplied civic metadata, such as title, source URL, meeting date, body or committee, document type, and jurisdiction.
-- **Normalized PDF artifact**: the OCR-normalized/searchable PDF produced from the source document and used for text extraction.
-- **Page**: canonical extracted page text with page number and extraction quality information. Pages are the source of citation truth.
-- **Chunk**: a searchable passage derived from page text. MVP chunking is page-first, with long pages split into overlapping chunks. Chunks retain page start/end and allow future structure fields such as section title, heading path, agenda item, and bounding box.
-- **Embedding**: a vector representation of a chunk stored in LanceDB, linked back to the chunk identifier and tagged with embedding provider, model, and version.
+- **Source**: the submitted URL or local path, stored separately from the bytes retrieved from it.
+- **Source artifact**: the immutable raw bytes acquired from a source, identified by content hash and retaining media type, byte size, acquisition time, and stored path.
+- **Document**: the searchable representation of one source artifact plus user-supplied civic metadata, such as title, meeting date, body or committee, document type, and jurisdiction.
+- **Normalized PDF artifact**: the OCR-normalized/searchable PDF derived from a raw PDF source artifact and used for text extraction.
+- **Source unit**: one ordered canonical text unit with a typed machine location, human label, normalized text, structure metadata, and extractor identity. PDF pages are represented as page source units; future formats may use blocks, lines, cells, or timestamps.
+- **Page**: the PDF-specific compatibility record linked one-to-one to a page source unit. Existing page numbers and page citations remain the source of citation truth for PDFs.
+- **Chunk**: searchable text derived from source units. Chunks retain both the existing PDF page span and a source-unit range for source-neutral retrieval.
+- **Embedding**: a vector representation of a chunk or passage stored in LanceDB, linked back to its source record, source-unit range, and embedding provider/model/version.
 - **Job**: durable processing work tracked through pending, running, done, and failed states, with error details and retry support.
 - **Watch**: a configured folder watcher with default metadata used when new PDFs appear.
 - **Packet**: a generated Markdown evidence file assembled from retrieved chunks and source metadata.
@@ -64,9 +67,9 @@ documents:
     jurisdiction: Example City
 ```
 
-Processing is idempotent. The system hashes source content to avoid duplicate indexing and to detect changed documents. Each document is normalized through OCR first, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path.
+Processing is idempotent. The system hashes source content to avoid duplicate indexing and to detect changed documents. Raw bytes are retained as an immutable source artifact. Each PDF is normalized through OCR, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path.
 
-The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Page text is stored before chunking so citations remain stable and inspectable.
+The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Each extracted page is stored as an ordered page source unit before chunking, and source-unit ranges propagate through chunks, passages, embeddings, and search results while existing page citations remain stable.
 
 ## Chunking and citations
 
