@@ -394,6 +394,35 @@ def test_search_uses_vector_candidates_when_keyword_search_is_empty(tmp_path: Pa
     assert results[0].citation == "Zoning Packet — 2026-03-15 — p. 2"
 
 
+def test_search_ignores_orphan_vectors_from_failed_publication(tmp_path: Path) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(
+            {
+                "banana telescope": [
+                    SearchCandidate(
+                        passage_id="passage-orphan",
+                        document_id="document-orphan",
+                        page_start=1,
+                        page_end=1,
+                        text="uncommitted vector",
+                        title=None,
+                        meeting_date=None,
+                        vector_score=0.1,
+                    )
+                ]
+            }
+        ),
+        vector_store=FakeVectorStore(),
+    )
+
+    assert engine.search("banana telescope") == []
+
+
 def test_search_keeps_strong_semantic_passage_when_keyword_hits_exist(tmp_path: Path) -> None:
     database_path = _seed_search_corpus(tmp_path)
 

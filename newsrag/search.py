@@ -205,6 +205,15 @@ class LanceDbPassageVectorStore:
 
         table.add(records)
 
+    def delete_document(self, document_id: str) -> None:
+        database = lancedb.connect(self.lancedb_path)
+        try:
+            table = database.open_table(self.table_name)
+        except ValueError:
+            return
+        escaped_document_id = document_id.replace("'", "''")
+        table.delete(f"document_id = '{escaped_document_id}'")
+
 
 @dataclass(frozen=True)
 class LanceDbPassageVectorSearcher:
@@ -777,7 +786,9 @@ def _load_passage_context(
             )
 
     for candidate in vector_candidates:
-        existing = merged[candidate.passage_id]
+        existing = merged.get(candidate.passage_id)
+        if existing is None:
+            continue
         merged[candidate.passage_id] = SearchCandidate(
             passage_id=existing.passage_id,
             document_id=existing.document_id,

@@ -84,6 +84,12 @@ def source_unit_id_for_page(page_id: str) -> str:
     return _stable_id("source-unit", page_id)
 
 
+def source_unit_id_for_ordinal(document_id: str, ordinal: int) -> str:
+    """Return a stable source-unit ID for a non-page canonical unit."""
+
+    return _stable_id("source-unit", document_id, str(ordinal))
+
+
 def _stable_id(prefix: str, *parts: str) -> str:
     identity = "\0".join(parts).encode("utf-8")
     return f"{prefix}-{hashlib.sha256(identity).hexdigest()}"

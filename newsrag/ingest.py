@@ -5,30 +5,56 @@ import hashlib
 import json
 import shutil
 import sqlite3
-import subprocess
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
-import fitz  # type: ignore[import-untyped]
 import httpx
 import lancedb  # type: ignore[import-untyped]
-import pdfplumber
 
+from newsrag.adapters import (
+    AdapterError,
+    AdapterInput,
+    AdapterResult,
+    CanonicalSourceUnit,
+    ExtractorIdentity,
+    SourceAdapter,
+)
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import (
     ChunkEmbedding,
     EmbeddingMetadata,
     EmbeddingProvider,
     build_embedding_provider,
-    create_embedding_record,
 )
 from newsrag.jobs import Job, create_job
 from newsrag.passages import build_passage_rows
+from newsrag.pdf_adapter import (
+    PDF_EXTRACTOR_AUTO,
+    PDF_EXTRACTOR_PDFPLUMBER,
+    PDF_EXTRACTOR_PYMUPDF,
+    PDF_EXTRACTOR_TABLE,
+    ExtractedPage,
+    FallbackTextExtractor,
+    OcrRunner,
+    PdfExtractorMode,
+    PdfPlumberTextExtractor,
+    PdfSourceAdapter,
+    PyMuPdfTextExtractor,
+    SubprocessOcrRunner,
+    TextExtractor,
+)
+from newsrag.pdf_adapter import (
+    build_pdf_text_extractor as _build_pdf_text_extractor,
+)
+from newsrag.pdf_adapter import (
+    normalize_pdf_extractor_mode as _normalize_pdf_extractor_mode,
+)
 from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
     PAGE_LOCATION_TYPE,
@@ -36,41 +62,36 @@ from newsrag.sources import (
     SourceIdentity,
     artifact_id_for_hash,
     build_source_identity,
+    source_unit_id_for_ordinal,
     source_unit_id_for_page,
 )
 from newsrag.storage import StoragePaths, initialize_storage
+
+__all__ = [
+    "ExtractedPage",
+    "FallbackTextExtractor",
+    "PDF_EXTRACTOR_AUTO",
+    "PDF_EXTRACTOR_PDFPLUMBER",
+    "PDF_EXTRACTOR_PYMUPDF",
+    "PDF_EXTRACTOR_TABLE",
+    "PreparedSourceArtifact",
+    "PdfPlumberTextExtractor",
+    "PyMuPdfTextExtractor",
+    "SourceAdapter",
+    "SourceProcessingPipeline",
+    "build_pdf_text_extractor",
+    "normalize_pdf_extractor_mode",
+]
 
 INGEST_JOB_KIND = "ingest-file"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 VECTOR_TABLE_NAME = "chunk_embeddings"
-PDF_EXTRACTOR_AUTO: Literal["auto"] = "auto"
-PDF_EXTRACTOR_PYMUPDF: Literal["pymupdf"] = "pymupdf"
-PDF_EXTRACTOR_PDFPLUMBER: Literal["pdfplumber"] = "pdfplumber"
-PDF_EXTRACTOR_TABLE: Literal["table"] = "table"
-PDF_EXTRACTOR_MODES = frozenset(
-    {
-        PDF_EXTRACTOR_AUTO,
-        PDF_EXTRACTOR_PYMUPDF,
-        PDF_EXTRACTOR_PDFPLUMBER,
-        PDF_EXTRACTOR_TABLE,
-    }
-)
-PdfExtractorMode = Literal["auto", "pymupdf", "pdfplumber", "table"]
 
 
 class IngestError(Exception):
     """Raised when local PDF ingestion cannot complete."""
-
-
-@dataclass(frozen=True)
-class ExtractedPage:
-    """Canonical page text extracted from one PDF page."""
-
-    page_number: int
-    text: str
-    extractor: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -80,6 +101,8 @@ class ChunkDraft:
     text: str
     page_start: int
     page_end: int
+    source_unit_start_ordinal: int | None = None
+    source_unit_end_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -155,32 +178,31 @@ class PdfDownloader(Protocol):
         """Download one direct PDF into the corpus data directory."""
 
 
-class OcrRunner(Protocol):
-    """Protocol for OCR normalization."""
-
-    def normalize_pdf(self, source_path: Path, output_path: Path) -> None:
-        """Create an OCR-normalized PDF artifact."""
-
-
-class TextExtractor(Protocol):
-    """Protocol for page-text extraction."""
-
-    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        """Extract canonical page text from one PDF."""
-
-
 class Chunker(Protocol):
-    """Protocol for page-to-chunk conversion."""
+    """Protocol for canonical-source-unit chunking."""
 
-    def chunk_pages(self, pages: Sequence[ExtractedPage]) -> list[ChunkDraft]:
-        """Split extracted pages into searchable chunks."""
+    def chunk_units(self, units: Sequence[CanonicalSourceUnit]) -> list[ChunkDraft]:
+        """Split canonical source units into searchable chunks."""
 
 
 class VectorStore(Protocol):
-    """Protocol for vector persistence."""
+    """Protocol for chunk-vector persistence."""
 
     def add_chunks(self, chunks: Sequence[ChunkVectorRecord]) -> None:
         """Persist embedded chunk vectors."""
+
+    def delete_document(self, document_id: str) -> None:
+        """Remove staged vectors for one failed document publication."""
+
+
+class PassageVectorStore(Protocol):
+    """Protocol for passage-vector persistence."""
+
+    def add_passages(self, passages: Sequence[PassageVectorRecord]) -> None:
+        """Persist embedded passage vectors."""
+
+    def delete_document(self, document_id: str) -> None:
+        """Remove staged vectors for one failed document publication."""
 
 
 @dataclass(frozen=True)
@@ -215,147 +237,65 @@ class HttpxPdfDownloader:
         )
 
 
-@dataclass(frozen=True)
-class SubprocessOcrRunner:
-    """OCR normalization backed by the `ocrmypdf` CLI."""
-
-    def normalize_pdf(self, source_path: Path, output_path: Path) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(
-                [
-                    "ocrmypdf",
-                    "--skip-text",
-                    "--quiet",
-                    str(source_path),
-                    str(output_path),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise IngestError(f"ocrmypdf failed for {source_path}: {detail}") from exc
-
-
-@dataclass(frozen=True)
-class PyMuPdfTextExtractor:
-    """Text extraction backed by PyMuPDF."""
-
-    extractor_name: str = PDF_EXTRACTOR_PYMUPDF
-
-    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        try:
-            pages: list[ExtractedPage] = []
-            with fitz.open(pdf_path) as document:
-                for index, page in enumerate(document, start=1):
-                    pages.append(
-                        ExtractedPage(
-                            page_number=index,
-                            text=page.get_text().strip(),
-                            extractor=self.extractor_name,
-                        )
-                    )
-            return pages
-        except Exception as exc:
-            raise IngestError(f"PyMuPDF extraction failed for {pdf_path}: {exc}") from exc
-
-
-@dataclass(frozen=True)
-class PdfPlumberTextExtractor:
-    """Text extraction backed by pdfplumber."""
-
-    extractor_name: str = PDF_EXTRACTOR_PDFPLUMBER
-
-    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        try:
-            pages: list[ExtractedPage] = []
-            with pdfplumber.open(pdf_path) as document:
-                for index, page in enumerate(document.pages, start=1):
-                    text = page.extract_text() or ""
-                    pages.append(
-                        ExtractedPage(
-                            page_number=index,
-                            text=text.strip(),
-                            extractor=self.extractor_name,
-                        )
-                    )
-            return pages
-        except Exception as exc:
-            raise IngestError(f"pdfplumber extraction failed for {pdf_path}: {exc}") from exc
-
-
-@dataclass(frozen=True)
-class FallbackTextExtractor:
-    """Run a primary extractor and fall back when page text quality is unusable."""
-
-    primary: TextExtractor = field(default_factory=PyMuPdfTextExtractor)
-    fallback: TextExtractor = field(default_factory=PdfPlumberTextExtractor)
-
-    def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        primary_pages = _extract_with_stage_context(
-            self.primary,
-            pdf_path,
-            stage="primary",
-        )
-        if not _has_usable_page_text(primary_pages):
-            return _extract_with_stage_context(
-                self.fallback,
-                pdf_path,
-                stage="fallback",
-            )
-        return primary_pages
-
-
 def build_pdf_text_extractor(mode: PdfExtractorMode = PDF_EXTRACTOR_AUTO) -> TextExtractor:
     """Build the configured PDF text extraction path."""
 
-    if mode == PDF_EXTRACTOR_AUTO:
-        return FallbackTextExtractor()
-    if mode == PDF_EXTRACTOR_PYMUPDF:
-        return PyMuPdfTextExtractor()
-    if mode in {PDF_EXTRACTOR_PDFPLUMBER, PDF_EXTRACTOR_TABLE}:
-        return PdfPlumberTextExtractor()
-    raise IngestError(f"Unsupported PDF extractor mode: {mode}")
+    try:
+        return _build_pdf_text_extractor(mode)
+    except AdapterError as exc:
+        raise IngestError(str(exc)) from exc
 
 
 def normalize_pdf_extractor_mode(value: str | None) -> PdfExtractorMode:
     """Normalize and validate a PDF extractor mode option."""
 
-    if value is None or not value.strip():
-        return PDF_EXTRACTOR_AUTO
-
-    normalized = value.strip().lower()
-    if normalized == PDF_EXTRACTOR_AUTO:
-        return PDF_EXTRACTOR_AUTO
-    if normalized == PDF_EXTRACTOR_PYMUPDF:
-        return PDF_EXTRACTOR_PYMUPDF
-    if normalized == PDF_EXTRACTOR_PDFPLUMBER:
-        return PDF_EXTRACTOR_PDFPLUMBER
-    if normalized == PDF_EXTRACTOR_TABLE:
-        return PDF_EXTRACTOR_TABLE
-
-    allowed = ", ".join(sorted(PDF_EXTRACTOR_MODES))
-    raise IngestError(f"Unsupported PDF extractor mode: {value}; expected one of: {allowed}")
+    try:
+        return _normalize_pdf_extractor_mode(value)
+    except AdapterError as exc:
+        raise IngestError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
 class PageChunker:
-    """Page-first chunking with simple overlap for long pages."""
+    """Source-unit chunking that preserves existing page-first PDF behavior."""
 
     max_chars: int = DEFAULT_CHUNK_MAX_CHARS
     overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS
 
     def chunk_pages(self, pages: Sequence[ExtractedPage]) -> list[ChunkDraft]:
+        """Retain the existing page-based entry point for compatibility."""
+
+        return self.chunk_units(
+            [
+                CanonicalSourceUnit(
+                    ordinal=page.page_number,
+                    location_type=PAGE_LOCATION_TYPE,
+                    location={"page_number": page.page_number},
+                    human_label=f"p. {page.page_number}",
+                    normalized_text=page.text,
+                    structure={},
+                    extractor=_extractor_identity(page.extractor),
+                )
+                for page in pages
+            ]
+        )
+
+    def chunk_units(self, units: Sequence[CanonicalSourceUnit]) -> list[ChunkDraft]:
         chunks: list[ChunkDraft] = []
-        for page in pages:
-            text = page.text.strip()
+        for unit in units:
+            page_number = _page_number(unit)
+            text = unit.normalized_text.strip()
             if not text:
                 continue
             if len(text) <= self.max_chars:
                 chunks.append(
-                    ChunkDraft(text=text, page_start=page.page_number, page_end=page.page_number)
+                    ChunkDraft(
+                        text=text,
+                        page_start=page_number,
+                        page_end=page_number,
+                        source_unit_start_ordinal=unit.ordinal,
+                        source_unit_end_ordinal=unit.ordinal,
+                    )
                 )
                 continue
 
@@ -367,8 +307,10 @@ class PageChunker:
                     chunks.append(
                         ChunkDraft(
                             text=chunk_text,
-                            page_start=page.page_number,
-                            page_end=page.page_number,
+                            page_start=page_number,
+                            page_end=page_number,
+                            source_unit_start_ordinal=unit.ordinal,
+                            source_unit_end_ordinal=unit.ordinal,
                         )
                     )
                 if end >= len(text):
@@ -414,28 +356,168 @@ class LanceDbVectorStore:
 
         table.add(records)
 
+    def delete_document(self, document_id: str) -> None:
+        database = lancedb.connect(self.lancedb_path)
+        try:
+            table = database.open_table(self.table_name)
+        except ValueError:
+            return
+        escaped_document_id = document_id.replace("'", "''")
+        table.delete(f"document_id = '{escaped_document_id}'")
+
+
+@dataclass(frozen=True)
+class PreparedSourceArtifact:
+    """One acquired artifact ready for source-neutral processing."""
+
+    source_path: Path
+    artifact_path: Path
+    content_hash: str
+    media_type: str
+    source_url: str | None
+    acquired_at: str
+    work_dir: Path
+    metadata: dict[str, Any]
+    adapter_options: dict[str, object]
+
+
+class SourceProcessingPipeline:
+    """Shared adapter, indexing, and atomic publication pipeline."""
+
+    def __init__(
+        self,
+        *,
+        storage_paths: StoragePaths,
+        adapter: SourceAdapter,
+        chunker: Chunker,
+        embedding_provider: EmbeddingProvider,
+        vector_store: VectorStore,
+        passage_vector_store: PassageVectorStore,
+    ) -> None:
+        self.storage_paths = storage_paths
+        self.adapter = adapter
+        self.chunker = chunker
+        self.embedding_provider = embedding_provider
+        self.vector_store = vector_store
+        self.passage_vector_store = passage_vector_store
+
+    def process(self, artifact: PreparedSourceArtifact) -> None:
+        adapter_result = self._extract_source_units(artifact)
+        chunks = self.chunker.chunk_units(adapter_result.units)
+        chunk_embeddings = self.embedding_provider.embed_chunks([chunk.text for chunk in chunks])
+        if len(chunk_embeddings) != len(chunks):
+            raise IngestError(
+                f"Embedded {len(chunk_embeddings)} chunks for {len(chunks)} chunk drafts"
+            )
+
+        document_id = f"document-{uuid.uuid4().hex[:8]}"
+        artifact_id = artifact_id_for_hash(artifact.content_hash)
+        source_identity = build_source_identity(
+            source_path=artifact.source_path,
+            source_url=artifact.source_url,
+        )
+        document_metadata = _build_document_metadata(
+            artifact.metadata,
+            artifact.source_path,
+            artifact.artifact_path,
+        )
+        page_rows, source_unit_rows, source_unit_ids = _build_source_unit_rows(
+            document_id,
+            artifact_id,
+            adapter_result.units,
+        )
+        chunk_rows, vector_rows = _build_chunk_and_vector_rows(
+            document_id,
+            chunks,
+            chunk_embeddings,
+            source_unit_ids=source_unit_ids,
+        )
+        passage_rows = _build_passage_rows_from_chunks(chunk_rows)
+        passage_embeddings = self.embedding_provider.embed_chunks(
+            [passage_row[8] for passage_row in passage_rows]
+        )
+        if len(passage_embeddings) != len(passage_rows):
+            raise IngestError(
+                f"Embedded {len(passage_embeddings)} passages for {len(passage_rows)} passage rows"
+            )
+        passage_vector_rows = _build_passage_vector_rows(
+            passage_rows,
+            passage_embeddings,
+        )
+
+        _publish_document_bundle(
+            self.storage_paths.database,
+            document_id=document_id,
+            source_identity=source_identity,
+            artifact_id=artifact_id,
+            artifact_byte_size=artifact.artifact_path.stat().st_size,
+            artifact_stored_path=artifact.artifact_path,
+            artifact_acquired_at=artifact.acquired_at,
+            artifact_media_type=adapter_result.media_type,
+            source_path=artifact.source_path,
+            source_url=artifact.source_url,
+            title=_resolve_document_title(artifact.metadata, artifact.source_path),
+            source_hash=artifact.content_hash,
+            normalized_path=adapter_result.derived_artifact_path,
+            metadata=document_metadata,
+            source_units=source_unit_rows,
+            pages=page_rows,
+            chunks=chunk_rows,
+            chunk_embeddings=chunk_embeddings,
+            passages=passage_rows,
+            passage_embeddings=passage_embeddings,
+            chunk_vectors=vector_rows,
+            passage_vectors=passage_vector_rows,
+            vector_store=self.vector_store,
+            passage_vector_store=self.passage_vector_store,
+        )
+
+    def _extract_source_units(self, artifact: PreparedSourceArtifact) -> AdapterResult:
+        adapter_input = AdapterInput(
+            artifact_path=artifact.artifact_path,
+            content_hash=artifact.content_hash,
+            media_type=artifact.media_type,
+            work_dir=artifact.work_dir,
+            options=artifact.adapter_options,
+        )
+        try:
+            result = self.adapter.extract(adapter_input)
+        except AdapterError as exc:
+            raise IngestError(f"Source adapter failed for {artifact.source_path}: {exc}") from exc
+        _validate_adapter_result(result, adapter=self.adapter)
+        return result
+
 
 class IngestionPipeline:
-    """End-to-end local PDF ingestion pipeline."""
+    """Current PDF job front end for the shared source-processing pipeline."""
 
     def __init__(
         self,
         *,
         storage_paths: StoragePaths,
         embedding_config: EmbeddingConfig,
+        adapter: SourceAdapter | None = None,
         ocr_runner: OcrRunner | None = None,
         text_extractor: TextExtractor | None = None,
         chunker: Chunker | None = None,
         embedding_provider: EmbeddingProvider | None = None,
         vector_store: VectorStore | None = None,
+        passage_vector_store: PassageVectorStore | None = None,
     ) -> None:
         self.storage_paths = storage_paths
-        self.ocr_runner = ocr_runner or SubprocessOcrRunner()
-        self.text_extractor = text_extractor
-        self.chunker = chunker or PageChunker()
-        self.embedding_provider = embedding_provider or build_embedding_provider(embedding_config)
-        self.vector_store = vector_store or LanceDbVectorStore(storage_paths.lancedb)
-        self.passage_vector_store = LanceDbPassageVectorStore(storage_paths.lancedb)
+        resolved_adapter = adapter or PdfSourceAdapter(
+            ocr_runner=ocr_runner or SubprocessOcrRunner(),
+            text_extractor=text_extractor,
+        )
+        self.processor = SourceProcessingPipeline(
+            storage_paths=storage_paths,
+            adapter=resolved_adapter,
+            chunker=chunker or PageChunker(),
+            embedding_provider=embedding_provider or build_embedding_provider(embedding_config),
+            vector_store=vector_store or LanceDbVectorStore(storage_paths.lancedb),
+            passage_vector_store=passage_vector_store
+            or LanceDbPassageVectorStore(storage_paths.lancedb),
+        )
 
     async def handle_job(self, job: Job) -> None:
         await asyncio.to_thread(self.process_job, job)
@@ -454,77 +536,18 @@ class IngestionPipeline:
                 return
 
             source_copy_path = _copy_source_pdf(self.storage_paths, source_path, source_hash)
-            normalized_path = self.storage_paths.ocr_pdfs / f"{source_hash}.pdf"
-            self.ocr_runner.normalize_pdf(source_copy_path, normalized_path)
-
-            text_extractor = self.text_extractor or build_pdf_text_extractor(
-                _payload_pdf_extractor_mode(job.payload)
-            )
-            try:
-                pages = text_extractor.extract_pages(normalized_path)
-            except IngestError as exc:
-                raise IngestError(
-                    f"Failed extracting text for {source_path} from {normalized_path}: {exc}"
-                ) from exc
-            chunks = self.chunker.chunk_pages(pages)
-            chunk_embeddings = self.embedding_provider.embed_chunks(
-                [chunk.text for chunk in chunks]
-            )
-            if len(chunk_embeddings) != len(chunks):
-                raise IngestError(
-                    f"Embedded {len(chunk_embeddings)} chunks for {len(chunks)} chunk drafts"
+            self.processor.process(
+                PreparedSourceArtifact(
+                    source_path=source_path,
+                    artifact_path=source_copy_path,
+                    content_hash=source_hash,
+                    media_type=PDF_MEDIA_TYPE,
+                    source_url=source_url,
+                    acquired_at=_metadata_retrieved_at(metadata) or _current_timestamp(),
+                    work_dir=self.storage_paths.ocr_pdfs,
+                    metadata=metadata,
+                    adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
                 )
-
-            document_id = f"document-{uuid.uuid4().hex[:8]}"
-            artifact_id = artifact_id_for_hash(source_hash)
-            source_identity = build_source_identity(
-                source_path=source_path,
-                source_url=source_url,
-            )
-            document_metadata = _build_document_metadata(metadata, source_path, source_copy_path)
-            page_rows, source_unit_rows, page_unit_ids = _build_page_and_source_unit_rows(
-                document_id,
-                artifact_id,
-                pages,
-            )
-            chunk_rows, vector_rows = _build_chunk_and_vector_rows(
-                document_id,
-                chunks,
-                chunk_embeddings,
-                page_unit_ids=page_unit_ids,
-            )
-            passage_rows = _build_passage_rows_from_chunks(chunk_rows)
-            passage_embeddings = self.embedding_provider.embed_chunks(
-                [passage_row[8] for passage_row in passage_rows]
-            )
-            if len(passage_embeddings) != len(passage_rows):
-                raise IngestError(
-                    f"Embedded {len(passage_embeddings)} passages for {len(passage_rows)} passage rows"
-                )
-            passage_vector_rows = _build_passage_vector_rows(passage_rows, passage_embeddings)
-
-            self.vector_store.add_chunks(vector_rows)
-            self.passage_vector_store.add_passages(passage_vector_rows)
-            _persist_document_bundle(
-                self.storage_paths.database,
-                document_id=document_id,
-                source_identity=source_identity,
-                artifact_id=artifact_id,
-                artifact_byte_size=source_copy_path.stat().st_size,
-                artifact_stored_path=source_copy_path,
-                artifact_acquired_at=_metadata_retrieved_at(metadata) or _current_timestamp(),
-                source_path=source_path,
-                source_url=source_url,
-                title=_resolve_document_title(metadata, source_path),
-                source_hash=source_hash,
-                normalized_path=normalized_path,
-                metadata=document_metadata,
-                source_units=source_unit_rows,
-                pages=page_rows,
-                chunks=chunk_rows,
-                chunk_embeddings=chunk_embeddings,
-                passages=passage_rows,
-                passage_embeddings=passage_embeddings,
             )
         except IngestError:
             raise
@@ -597,22 +620,26 @@ def build_ingest_handler(
     *,
     data_dir: Path,
     embedding_config: EmbeddingConfig,
+    adapter: SourceAdapter | None = None,
     ocr_runner: OcrRunner | None = None,
     text_extractor: TextExtractor | None = None,
     chunker: Chunker | None = None,
     embedding_provider: EmbeddingProvider | None = None,
     vector_store: VectorStore | None = None,
+    passage_vector_store: PassageVectorStore | None = None,
 ) -> Callable[[Job], Awaitable[None]]:
     """Build an async handler for local-PDF ingest jobs."""
 
     pipeline = IngestionPipeline(
         storage_paths=initialize_storage(data_dir),
         embedding_config=embedding_config,
+        adapter=adapter,
         ocr_runner=ocr_runner,
         text_extractor=text_extractor,
         chunker=chunker,
         embedding_provider=embedding_provider,
         vector_store=vector_store,
+        passage_vector_store=passage_vector_store,
     )
     return pipeline.handle_job
 
@@ -758,34 +785,6 @@ def list_chunk_vectors(
     return [dict(row) for row in rows if isinstance(row, dict)]
 
 
-def _extract_with_stage_context(
-    extractor: TextExtractor,
-    pdf_path: Path,
-    *,
-    stage: str,
-) -> list[ExtractedPage]:
-    extractor_name = _extractor_name(extractor)
-    try:
-        return extractor.extract_pages(pdf_path)
-    except IngestError as exc:
-        raise IngestError(
-            f"{stage} PDF text extraction with {extractor_name} failed for {pdf_path}: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise IngestError(
-            f"{stage} PDF text extraction with {extractor_name} failed for {pdf_path}: {exc}"
-        ) from exc
-
-
-def _extractor_name(extractor: TextExtractor) -> str:
-    name = getattr(extractor, "extractor_name", extractor.__class__.__name__)
-    return str(name)
-
-
-def _has_usable_page_text(pages: Sequence[ExtractedPage]) -> bool:
-    return any(page.text.strip() for page in pages)
-
-
 def _iter_pdf_inputs(source_path: Path) -> tuple[Path, ...]:
     resolved_path = source_path.expanduser().resolve()
     if not resolved_path.exists():
@@ -852,6 +851,45 @@ def _metadata_retrieved_at(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _validate_adapter_result(result: AdapterResult, *, adapter: SourceAdapter) -> None:
+    if result.media_type not in adapter.media_types:
+        raise IngestError(f"Source adapter returned unsupported media type {result.media_type!r}")
+    if not result.extractor.name.strip():
+        raise IngestError("Source adapter returned no extractor identity")
+    ordinals = [unit.ordinal for unit in result.units]
+    if ordinals != list(range(1, len(result.units) + 1)):
+        raise IngestError("Source adapter units must use contiguous one-based ordinals")
+    for unit in result.units:
+        if not unit.location_type.strip():
+            raise IngestError(f"Source adapter unit {unit.ordinal} has no location type")
+        if not unit.human_label.strip():
+            raise IngestError(f"Source adapter unit {unit.ordinal} has no human label")
+        if not unit.extractor.name.strip():
+            raise IngestError(f"Source adapter unit {unit.ordinal} has no extractor identity")
+
+
+def _page_number(unit: CanonicalSourceUnit) -> int:
+    page_number = _optional_page_number(unit)
+    if page_number is None:
+        raise IngestError(
+            f"Page-first chunking cannot process source-unit type {unit.location_type!r}"
+        )
+    return page_number
+
+
+def _optional_page_number(unit: CanonicalSourceUnit) -> int | None:
+    if unit.location_type != PAGE_LOCATION_TYPE:
+        return None
+    page_number = unit.location.get("page_number")
+    if isinstance(page_number, bool) or not isinstance(page_number, int) or page_number < 1:
+        raise IngestError(f"Source adapter unit {unit.ordinal} has an invalid PDF page location")
+    return page_number
+
+
+def _extractor_identity(name: str) -> ExtractorIdentity:
+    return ExtractorIdentity(name=name)
+
+
 def _hash_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -911,10 +949,10 @@ def _resolve_document_title(metadata: dict[str, Any], source_path: Path) -> str:
     return source_path.stem
 
 
-def _build_page_and_source_unit_rows(
+def _build_source_unit_rows(
     document_id: str,
     artifact_id: str,
-    pages: Sequence[ExtractedPage],
+    units: Sequence[CanonicalSourceUnit],
 ) -> tuple[
     list[tuple[str, str, int, str, str, str]],
     list[tuple[str, str, str, int, str, str, str, str, str, str, str | None]],
@@ -922,32 +960,44 @@ def _build_page_and_source_unit_rows(
 ]:
     page_rows: list[tuple[str, str, int, str, str, str]] = []
     source_unit_rows: list[tuple[str, str, str, int, str, str, str, str, str, str, str | None]] = []
-    page_unit_ids: dict[int, str] = {}
+    source_unit_ids: dict[int, str] = {}
 
-    for page in pages:
-        page_id = f"page-{uuid.uuid4().hex[:8]}"
-        unit_id = source_unit_id_for_page(page_id)
-        page_unit_ids[page.page_number] = unit_id
-        page_rows.append(
-            (page_id, document_id, page.page_number, unit_id, page.text, page.extractor)
-        )
+    for unit in units:
+        page_number = _optional_page_number(unit)
+        if page_number is not None:
+            page_id = f"page-{uuid.uuid4().hex[:8]}"
+            unit_id = source_unit_id_for_page(page_id)
+            page_rows.append(
+                (
+                    page_id,
+                    document_id,
+                    page_number,
+                    unit_id,
+                    unit.normalized_text,
+                    unit.extractor.name,
+                )
+            )
+        else:
+            unit_id = source_unit_id_for_ordinal(document_id, unit.ordinal)
+
+        source_unit_ids[unit.ordinal] = unit_id
         source_unit_rows.append(
             (
                 unit_id,
                 artifact_id,
                 document_id,
-                page.page_number,
-                PAGE_LOCATION_TYPE,
-                json.dumps({"page_number": page.page_number}, sort_keys=True),
-                f"p. {page.page_number}",
-                page.text,
-                "{}",
-                page.extractor,
-                None,
+                unit.ordinal,
+                unit.location_type,
+                json.dumps(unit.location, sort_keys=True),
+                unit.human_label,
+                unit.normalized_text,
+                json.dumps(unit.structure, sort_keys=True),
+                unit.extractor.name,
+                unit.extractor.version,
             )
         )
 
-    return page_rows, source_unit_rows, page_unit_ids
+    return page_rows, source_unit_rows, source_unit_ids
 
 
 def _build_chunk_and_vector_rows(
@@ -955,19 +1005,21 @@ def _build_chunk_and_vector_rows(
     chunks: Sequence[ChunkDraft],
     embeddings: Sequence[ChunkEmbedding],
     *,
-    page_unit_ids: dict[int, str],
+    source_unit_ids: dict[int, str],
 ) -> tuple[list[tuple[str, str, int, int, str, str, str]], list[ChunkVectorRecord]]:
     chunk_rows: list[tuple[str, str, int, int, str, str, str]] = []
     vector_rows: list[ChunkVectorRecord] = []
 
     for chunk, embedding in zip(chunks, embeddings, strict=True):
         chunk_id = f"chunk-{uuid.uuid4().hex[:8]}"
+        start_ordinal = chunk.source_unit_start_ordinal or chunk.page_start
+        end_ordinal = chunk.source_unit_end_ordinal or chunk.page_end
         try:
-            source_unit_start_id = page_unit_ids[chunk.page_start]
-            source_unit_end_id = page_unit_ids[chunk.page_end]
+            source_unit_start_id = source_unit_ids[start_ordinal]
+            source_unit_end_id = source_unit_ids[end_ordinal]
         except KeyError as exc:
             raise IngestError(
-                f"Chunk references missing PDF page {exc.args[0]} for document {document_id}"
+                f"Chunk references missing source unit {exc.args[0]} for document {document_id}"
             ) from exc
         chunk_rows.append(
             (
@@ -1063,7 +1115,7 @@ def _build_passage_vector_rows(
     ]
 
 
-def _persist_document_bundle(
+def _publish_document_bundle(
     database_path: Path,
     *,
     document_id: str,
@@ -1072,11 +1124,12 @@ def _persist_document_bundle(
     artifact_byte_size: int,
     artifact_stored_path: Path,
     artifact_acquired_at: str,
+    artifact_media_type: str,
     source_path: Path,
     source_url: str | None,
     title: str,
     source_hash: str,
-    normalized_path: Path,
+    normalized_path: Path | None,
     metadata: dict[str, Any],
     source_units: Sequence[tuple[str, str, str, int, str, str, str, str, str, str, str | None]],
     pages: Sequence[tuple[str, str, int, str, str, str]],
@@ -1084,11 +1137,19 @@ def _persist_document_bundle(
     chunk_embeddings: Sequence[ChunkEmbedding],
     passages: Sequence[tuple[str, str, str, int, int, str, str, int, str]],
     passage_embeddings: Sequence[ChunkEmbedding],
+    chunk_vectors: Sequence[ChunkVectorRecord],
+    passage_vectors: Sequence[PassageVectorRecord],
+    vector_store: VectorStore,
+    passage_vector_store: PassageVectorStore,
 ) -> None:
     metadata_json = json.dumps(metadata, sort_keys=True)
 
-    with sqlite3.connect(database_path) as connection:
-        connection.execute("PRAGMA foreign_keys = ON")
+    with _publication_transaction(
+        database_path,
+        document_id=document_id,
+        vector_store=vector_store,
+        passage_vector_store=passage_vector_store,
+    ) as connection:
         connection.execute(
             """
             INSERT OR IGNORE INTO sources(
@@ -1124,7 +1185,7 @@ def _persist_document_bundle(
             (
                 artifact_id,
                 source_identity.id,
-                PDF_MEDIA_TYPE,
+                artifact_media_type,
                 artifact_byte_size,
                 source_hash,
                 str(artifact_stored_path),
@@ -1151,7 +1212,7 @@ def _persist_document_bundle(
                 source_url,
                 title,
                 source_hash,
-                str(normalized_path),
+                str(normalized_path) if normalized_path is not None else None,
                 metadata_json,
                 artifact_id,
             ),
@@ -1228,27 +1289,103 @@ def _persist_document_bundle(
             """,
             [(passage_id, text) for passage_id, _, _, _, _, _, _, _, text in passages],
         )
-        connection.commit()
-
-    for chunk_row, embedding in zip(chunks, chunk_embeddings, strict=True):
-        create_embedding_record(
-            database_path,
+        _insert_embedding_rows(
+            connection,
             source_kind="chunk",
-            source_key=chunk_row[0],
-            embedding=embedding,
-            source_unit_start_id=chunk_row[4],
-            source_unit_end_id=chunk_row[5],
+            source_rows=chunks,
+            embeddings=chunk_embeddings,
+            source_key_index=0,
+            source_unit_start_index=4,
+            source_unit_end_index=5,
         )
-
-    for passage_row, embedding in zip(passages, passage_embeddings, strict=True):
-        create_embedding_record(
-            database_path,
+        _insert_embedding_rows(
+            connection,
             source_kind="passage",
-            source_key=passage_row[0],
-            embedding=embedding,
-            source_unit_start_id=passage_row[5],
-            source_unit_end_id=passage_row[6],
+            source_rows=passages,
+            embeddings=passage_embeddings,
+            source_key_index=0,
+            source_unit_start_index=5,
+            source_unit_end_index=6,
         )
+        vector_store.add_chunks(chunk_vectors)
+        passage_vector_store.add_passages(passage_vectors)
+
+
+@contextmanager
+def _publication_transaction(
+    database_path: Path,
+    *,
+    document_id: str,
+    vector_store: VectorStore,
+    passage_vector_store: PassageVectorStore,
+) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(database_path)
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+        connection.commit()
+    except Exception as exc:
+        connection.rollback()
+        cleanup_errors: list[str] = []
+        for name, store in (
+            ("chunk vectors", vector_store),
+            ("passage vectors", passage_vector_store),
+        ):
+            try:
+                store.delete_document(document_id)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"{name}: {cleanup_exc}")
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            raise IngestError(
+                f"Document publication failed for {document_id}: {exc}; "
+                f"vector cleanup also failed: {detail}"
+            ) from exc
+        raise
+    finally:
+        connection.close()
+
+
+def _insert_embedding_rows(
+    connection: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_rows: Sequence[tuple[object, ...]],
+    embeddings: Sequence[ChunkEmbedding],
+    source_key_index: int,
+    source_unit_start_index: int,
+    source_unit_end_index: int,
+) -> None:
+    connection.executemany(
+        """
+        INSERT INTO embedding_records(
+            id,
+            source_kind,
+            source_key,
+            provider,
+            model,
+            version,
+            dimensions,
+            source_unit_start_id,
+            source_unit_end_id
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                f"embedding-{uuid.uuid4().hex[:8]}",
+                source_kind,
+                str(source_row[source_key_index]),
+                embedding.metadata.provider,
+                embedding.metadata.model,
+                embedding.metadata.version,
+                len(embedding.vector),
+                str(source_row[source_unit_start_index]),
+                str(source_row[source_unit_end_index]),
+            )
+            for source_row, embedding in zip(source_rows, embeddings, strict=True)
+        ],
+    )
 
 
 def _row_to_document(row: sqlite3.Row) -> DocumentRecord:
