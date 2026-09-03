@@ -166,6 +166,8 @@ class EmbeddingRecord:
     version: str
     dimensions: int
     created_at: str
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
 
 
 def build_embedding_provider(config: EmbeddingConfig) -> EmbeddingProvider:
@@ -206,6 +208,8 @@ def create_embedding_record(
     source_key: str,
     embedding: QueryEmbedding | ChunkEmbedding,
     record_id: str | None = None,
+    source_unit_start_id: str | None = None,
+    source_unit_end_id: str | None = None,
 ) -> EmbeddingRecord:
     """Persist provider/model/version provenance for one embedding result."""
 
@@ -222,9 +226,11 @@ def create_embedding_record(
                 provider,
                 model,
                 version,
-                dimensions
+                dimensions,
+                source_unit_start_id,
+                source_unit_end_id
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 resolved_record_id,
@@ -234,6 +240,8 @@ def create_embedding_record(
                 metadata.model,
                 metadata.version,
                 len(embedding.vector),
+                source_unit_start_id,
+                source_unit_end_id,
             ),
         )
         connection.commit()
@@ -248,7 +256,17 @@ def get_embedding_record(database_path: Path, record_id: str) -> EmbeddingRecord
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT id, source_kind, source_key, provider, model, version, dimensions, created_at
+            SELECT
+                id,
+                source_kind,
+                source_key,
+                provider,
+                model,
+                version,
+                dimensions,
+                created_at,
+                source_unit_start_id,
+                source_unit_end_id
             FROM embedding_records
             WHERE id = ?
             """,
@@ -267,7 +285,17 @@ def list_embedding_records(database_path: Path) -> list[EmbeddingRecord]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, source_kind, source_key, provider, model, version, dimensions, created_at
+            SELECT
+                id,
+                source_kind,
+                source_key,
+                provider,
+                model,
+                version,
+                dimensions,
+                created_at,
+                source_unit_start_id,
+                source_unit_end_id
             FROM embedding_records
             ORDER BY created_at ASC, id ASC
             """
@@ -362,4 +390,10 @@ def _row_to_embedding_record(row: sqlite3.Row) -> EmbeddingRecord:
         version=str(row["version"]),
         dimensions=int(row["dimensions"]),
         created_at=str(row["created_at"]),
+        source_unit_start_id=(
+            str(row["source_unit_start_id"]) if row["source_unit_start_id"] is not None else None
+        ),
+        source_unit_end_id=(
+            str(row["source_unit_end_id"]) if row["source_unit_end_id"] is not None else None
+        ),
     )

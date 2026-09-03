@@ -30,6 +30,14 @@ from newsrag.embeddings import (
 from newsrag.jobs import Job, create_job
 from newsrag.passages import build_passage_rows
 from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
+from newsrag.sources import (
+    PAGE_LOCATION_TYPE,
+    PDF_MEDIA_TYPE,
+    SourceIdentity,
+    artifact_id_for_hash,
+    build_source_identity,
+    source_unit_id_for_page,
+)
 from newsrag.storage import StoragePaths, initialize_storage
 
 INGEST_JOB_KIND = "ingest-file"
@@ -98,6 +106,7 @@ class PageRecord:
     text: str
     extractor: str
     created_at: str
+    source_unit_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +119,8 @@ class ChunkRecord:
     page_end: int
     text: str
     created_at: str
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,8 @@ class ChunkVectorRecord:
     text: str
     vector: tuple[float, ...]
     metadata: EmbeddingMetadata
+    source_unit_start_id: str | None = None
+    source_unit_end_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -378,6 +391,8 @@ class LanceDbVectorStore:
                 "document_id": chunk.document_id,
                 "page_start": chunk.page_start,
                 "page_end": chunk.page_end,
+                "source_unit_start_id": chunk.source_unit_start_id,
+                "source_unit_end_id": chunk.source_unit_end_id,
                 "text": chunk.text,
                 "vector": list(chunk.vector),
                 "provider": chunk.metadata.provider,
@@ -461,16 +476,26 @@ class IngestionPipeline:
                 )
 
             document_id = f"document-{uuid.uuid4().hex[:8]}"
+            artifact_id = artifact_id_for_hash(source_hash)
+            source_identity = build_source_identity(
+                source_path=source_path,
+                source_url=source_url,
+            )
             document_metadata = _build_document_metadata(metadata, source_path, source_copy_path)
-            page_rows = _build_page_rows(document_id, pages)
+            page_rows, source_unit_rows, page_unit_ids = _build_page_and_source_unit_rows(
+                document_id,
+                artifact_id,
+                pages,
+            )
             chunk_rows, vector_rows = _build_chunk_and_vector_rows(
                 document_id,
                 chunks,
                 chunk_embeddings,
+                page_unit_ids=page_unit_ids,
             )
             passage_rows = _build_passage_rows_from_chunks(chunk_rows)
             passage_embeddings = self.embedding_provider.embed_chunks(
-                [passage_row[6] for passage_row in passage_rows]
+                [passage_row[8] for passage_row in passage_rows]
             )
             if len(passage_embeddings) != len(passage_rows):
                 raise IngestError(
@@ -483,12 +508,18 @@ class IngestionPipeline:
             _persist_document_bundle(
                 self.storage_paths.database,
                 document_id=document_id,
+                source_identity=source_identity,
+                artifact_id=artifact_id,
+                artifact_byte_size=source_copy_path.stat().st_size,
+                artifact_stored_path=source_copy_path,
+                artifact_acquired_at=_metadata_retrieved_at(metadata) or _current_timestamp(),
                 source_path=source_path,
                 source_url=source_url,
                 title=_resolve_document_title(metadata, source_path),
                 source_hash=source_hash,
                 normalized_path=normalized_path,
                 metadata=document_metadata,
+                source_units=source_unit_rows,
                 pages=page_rows,
                 chunks=chunk_rows,
                 chunk_embeddings=chunk_embeddings,
@@ -646,7 +677,7 @@ def list_pages(database_path: Path) -> list[PageRecord]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, document_id, page_number, text, extractor, created_at
+            SELECT id, document_id, page_number, text, extractor, created_at, source_unit_id
             FROM pages
             ORDER BY document_id ASC, page_number ASC, id ASC
             """
@@ -660,6 +691,9 @@ def list_pages(database_path: Path) -> list[PageRecord]:
             text=str(row["text"]),
             extractor=str(row["extractor"]),
             created_at=str(row["created_at"]),
+            source_unit_id=(
+                str(row["source_unit_id"]) if row["source_unit_id"] is not None else None
+            ),
         )
         for row in rows
     ]
@@ -672,7 +706,15 @@ def list_chunks(database_path: Path) -> list[ChunkRecord]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, document_id, page_start, page_end, text, created_at
+            SELECT
+                id,
+                document_id,
+                page_start,
+                page_end,
+                text,
+                created_at,
+                source_unit_start_id,
+                source_unit_end_id
             FROM chunks
             ORDER BY document_id ASC, page_start ASC, id ASC
             """
@@ -686,6 +728,14 @@ def list_chunks(database_path: Path) -> list[ChunkRecord]:
             page_end=int(row["page_end"]),
             text=str(row["text"]),
             created_at=str(row["created_at"]),
+            source_unit_start_id=(
+                str(row["source_unit_start_id"])
+                if row["source_unit_start_id"] is not None
+                else None
+            ),
+            source_unit_end_id=(
+                str(row["source_unit_end_id"]) if row["source_unit_end_id"] is not None else None
+            ),
         )
         for row in rows
     ]
@@ -795,6 +845,13 @@ def _metadata_source_url(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _metadata_retrieved_at(metadata: dict[str, Any]) -> str | None:
+    retrieved_at = metadata.get("retrieved_at")
+    if isinstance(retrieved_at, str) and retrieved_at.strip():
+        return retrieved_at.strip()
+    return None
+
+
 def _hash_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -854,32 +911,75 @@ def _resolve_document_title(metadata: dict[str, Any], source_path: Path) -> str:
     return source_path.stem
 
 
-def _build_page_rows(
-    document_id: str, pages: Sequence[ExtractedPage]
-) -> list[tuple[str, str, int, str, str]]:
-    return [
-        (
-            f"page-{uuid.uuid4().hex[:8]}",
-            document_id,
-            page.page_number,
-            page.text,
-            page.extractor,
+def _build_page_and_source_unit_rows(
+    document_id: str,
+    artifact_id: str,
+    pages: Sequence[ExtractedPage],
+) -> tuple[
+    list[tuple[str, str, int, str, str, str]],
+    list[tuple[str, str, str, int, str, str, str, str, str, str, str | None]],
+    dict[int, str],
+]:
+    page_rows: list[tuple[str, str, int, str, str, str]] = []
+    source_unit_rows: list[tuple[str, str, str, int, str, str, str, str, str, str, str | None]] = []
+    page_unit_ids: dict[int, str] = {}
+
+    for page in pages:
+        page_id = f"page-{uuid.uuid4().hex[:8]}"
+        unit_id = source_unit_id_for_page(page_id)
+        page_unit_ids[page.page_number] = unit_id
+        page_rows.append(
+            (page_id, document_id, page.page_number, unit_id, page.text, page.extractor)
         )
-        for page in pages
-    ]
+        source_unit_rows.append(
+            (
+                unit_id,
+                artifact_id,
+                document_id,
+                page.page_number,
+                PAGE_LOCATION_TYPE,
+                json.dumps({"page_number": page.page_number}, sort_keys=True),
+                f"p. {page.page_number}",
+                page.text,
+                "{}",
+                page.extractor,
+                None,
+            )
+        )
+
+    return page_rows, source_unit_rows, page_unit_ids
 
 
 def _build_chunk_and_vector_rows(
     document_id: str,
     chunks: Sequence[ChunkDraft],
     embeddings: Sequence[ChunkEmbedding],
-) -> tuple[list[tuple[str, str, int, int, str]], list[ChunkVectorRecord]]:
-    chunk_rows: list[tuple[str, str, int, int, str]] = []
+    *,
+    page_unit_ids: dict[int, str],
+) -> tuple[list[tuple[str, str, int, int, str, str, str]], list[ChunkVectorRecord]]:
+    chunk_rows: list[tuple[str, str, int, int, str, str, str]] = []
     vector_rows: list[ChunkVectorRecord] = []
 
     for chunk, embedding in zip(chunks, embeddings, strict=True):
         chunk_id = f"chunk-{uuid.uuid4().hex[:8]}"
-        chunk_rows.append((chunk_id, document_id, chunk.page_start, chunk.page_end, chunk.text))
+        try:
+            source_unit_start_id = page_unit_ids[chunk.page_start]
+            source_unit_end_id = page_unit_ids[chunk.page_end]
+        except KeyError as exc:
+            raise IngestError(
+                f"Chunk references missing PDF page {exc.args[0]} for document {document_id}"
+            ) from exc
+        chunk_rows.append(
+            (
+                chunk_id,
+                document_id,
+                chunk.page_start,
+                chunk.page_end,
+                source_unit_start_id,
+                source_unit_end_id,
+                chunk.text,
+            )
+        )
         vector_rows.append(
             ChunkVectorRecord(
                 chunk_id=chunk_id,
@@ -889,6 +989,8 @@ def _build_chunk_and_vector_rows(
                 text=chunk.text,
                 vector=embedding.vector,
                 metadata=embedding.metadata,
+                source_unit_start_id=source_unit_start_id,
+                source_unit_end_id=source_unit_end_id,
             )
         )
 
@@ -896,10 +998,18 @@ def _build_chunk_and_vector_rows(
 
 
 def _build_passage_rows_from_chunks(
-    chunks: Sequence[tuple[str, str, int, int, str]],
-) -> list[tuple[str, str, str, int, int, int, str]]:
-    passage_rows: list[tuple[str, str, str, int, int, int, str]] = []
-    for chunk_id, document_id, page_start, page_end, text in chunks:
+    chunks: Sequence[tuple[str, str, int, int, str, str, str]],
+) -> list[tuple[str, str, str, int, int, str, str, int, str]]:
+    passage_rows: list[tuple[str, str, str, int, int, str, str, int, str]] = []
+    for (
+        chunk_id,
+        document_id,
+        page_start,
+        page_end,
+        source_unit_start_id,
+        source_unit_end_id,
+        text,
+    ) in chunks:
         for passage in build_passage_rows(
             chunk_id=chunk_id,
             document_id=document_id,
@@ -914,6 +1024,8 @@ def _build_passage_rows_from_chunks(
                     passage.document_id,
                     passage.page_start,
                     passage.page_end,
+                    source_unit_start_id,
+                    source_unit_end_id,
                     passage.ordinal,
                     passage.text,
                 )
@@ -922,7 +1034,7 @@ def _build_passage_rows_from_chunks(
 
 
 def _build_passage_vector_rows(
-    passages: Sequence[tuple[str, str, str, int, int, int, str]],
+    passages: Sequence[tuple[str, str, str, int, int, str, str, int, str]],
     embeddings: Sequence[ChunkEmbedding],
 ) -> list[PassageVectorRecord]:
     return [
@@ -934,10 +1046,20 @@ def _build_passage_vector_rows(
             text=text,
             vector=embedding.vector,
             metadata=embedding.metadata,
+            source_unit_start_id=source_unit_start_id,
+            source_unit_end_id=source_unit_end_id,
         )
-        for (passage_id, _, document_id, page_start, page_end, _, text), embedding in zip(
-            passages, embeddings, strict=True
-        )
+        for (
+            passage_id,
+            _,
+            document_id,
+            page_start,
+            page_end,
+            source_unit_start_id,
+            source_unit_end_id,
+            _,
+            text,
+        ), embedding in zip(passages, embeddings, strict=True)
     ]
 
 
@@ -945,21 +1067,70 @@ def _persist_document_bundle(
     database_path: Path,
     *,
     document_id: str,
+    source_identity: SourceIdentity,
+    artifact_id: str,
+    artifact_byte_size: int,
+    artifact_stored_path: Path,
+    artifact_acquired_at: str,
     source_path: Path,
     source_url: str | None,
     title: str,
     source_hash: str,
     normalized_path: Path,
     metadata: dict[str, Any],
-    pages: Sequence[tuple[str, str, int, str, str]],
-    chunks: Sequence[tuple[str, str, int, int, str]],
+    source_units: Sequence[tuple[str, str, str, int, str, str, str, str, str, str, str | None]],
+    pages: Sequence[tuple[str, str, int, str, str, str]],
+    chunks: Sequence[tuple[str, str, int, int, str, str, str]],
     chunk_embeddings: Sequence[ChunkEmbedding],
-    passages: Sequence[tuple[str, str, str, int, int, int, str]],
+    passages: Sequence[tuple[str, str, str, int, int, str, str, int, str]],
     passage_embeddings: Sequence[ChunkEmbedding],
 ) -> None:
     metadata_json = json.dumps(metadata, sort_keys=True)
 
     with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO sources(
+                id,
+                kind,
+                submitted_reference,
+                normalized_reference,
+                resolved_reference
+            )
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                source_identity.id,
+                source_identity.kind,
+                source_identity.submitted_reference,
+                source_identity.normalized_reference,
+                source_identity.resolved_reference,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id,
+                source_id,
+                media_type,
+                byte_size,
+                content_hash,
+                stored_path,
+                acquired_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                artifact_id,
+                source_identity.id,
+                PDF_MEDIA_TYPE,
+                artifact_byte_size,
+                source_hash,
+                str(artifact_stored_path),
+                artifact_acquired_at,
+            ),
+        )
         connection.execute(
             """
             INSERT INTO documents(
@@ -969,9 +1140,10 @@ def _persist_document_bundle(
                 title,
                 source_hash,
                 normalized_path,
-                metadata_json
+                metadata_json,
+                artifact_id
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
@@ -981,19 +1153,47 @@ def _persist_document_bundle(
                 source_hash,
                 str(normalized_path),
                 metadata_json,
+                artifact_id,
             ),
         )
         connection.executemany(
             """
-            INSERT INTO pages(id, document_id, page_number, text, extractor)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO source_units(
+                id,
+                artifact_id,
+                document_id,
+                ordinal,
+                location_type,
+                location_json,
+                human_label,
+                normalized_text,
+                structure_json,
+                extractor,
+                extractor_version
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            source_units,
+        )
+        connection.executemany(
+            """
+            INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+            VALUES(?, ?, ?, ?, ?, ?)
             """,
             pages,
         )
         connection.executemany(
             """
-            INSERT INTO chunks(id, document_id, page_start, page_end, text)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO chunks(
+                id,
+                document_id,
+                page_start,
+                page_end,
+                source_unit_start_id,
+                source_unit_end_id,
+                text
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
             chunks,
         )
@@ -1002,12 +1202,22 @@ def _persist_document_bundle(
             INSERT INTO chunks_fts(chunk_id, text)
             VALUES(?, ?)
             """,
-            [(chunk_id, text) for chunk_id, _, _, _, text in chunks],
+            [(chunk_id, text) for chunk_id, _, _, _, _, _, text in chunks],
         )
         connection.executemany(
             """
-            INSERT INTO passages(id, chunk_id, document_id, page_start, page_end, ordinal, text)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO passages(
+                id,
+                chunk_id,
+                document_id,
+                page_start,
+                page_end,
+                source_unit_start_id,
+                source_unit_end_id,
+                ordinal,
+                text
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             passages,
         )
@@ -1016,7 +1226,7 @@ def _persist_document_bundle(
             INSERT INTO passages_fts(passage_id, text)
             VALUES(?, ?)
             """,
-            [(passage_id, text) for passage_id, _, _, _, _, _, text in passages],
+            [(passage_id, text) for passage_id, _, _, _, _, _, _, _, text in passages],
         )
         connection.commit()
 
@@ -1026,6 +1236,8 @@ def _persist_document_bundle(
             source_kind="chunk",
             source_key=chunk_row[0],
             embedding=embedding,
+            source_unit_start_id=chunk_row[4],
+            source_unit_end_id=chunk_row[5],
         )
 
     for passage_row, embedding in zip(passages, passage_embeddings, strict=True):
@@ -1034,6 +1246,8 @@ def _persist_document_bundle(
             source_kind="passage",
             source_key=passage_row[0],
             embedding=embedding,
+            source_unit_start_id=passage_row[5],
+            source_unit_end_id=passage_row[6],
         )
 
 
