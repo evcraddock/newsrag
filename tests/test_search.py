@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from newsrag.cli import app
@@ -14,6 +15,7 @@ from newsrag.embeddings import ChunkEmbedding, EmbeddingMetadata, QueryEmbedding
 from newsrag.search import (
     PassageVectorRecord,
     SearchCandidate,
+    SearchError,
     SearchFilters,
     SearchResult,
     build_search_engine,
@@ -171,8 +173,8 @@ def test_search_candidates_and_results_retain_source_unit_ranges(tmp_path: Path)
             VALUES(?, 'artifact-1', 'document-1', ?, 'page', ?, ?, ?, 'pymupdf')
             """,
             [
-                ("unit-1", 1, '{"page_number": 1}', "p. 1", "stormwater"),
-                ("unit-2", 2, '{"page_number": 2}', "p. 2", "improvements"),
+                ("unit-1", 1, '{"page_number": 7}', "p. 7", "stormwater"),
+                ("unit-2", 2, '{"page_number": 8}', "p. 8", "improvements"),
             ],
         )
         connection.execute(
@@ -239,7 +241,7 @@ def test_search_candidates_and_results_retain_source_unit_ranges(tmp_path: Path)
     assert len(results) == 1
     assert results[0].source_unit_start_id == "unit-1"
     assert results[0].source_unit_end_id == "unit-2"
-    assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 1"
+    assert results[0].citation == "Stormwater Report — 2026-05-01 — p. 7"
 
 
 def test_search_filters_by_document_metadata_and_meeting_date(tmp_path: Path) -> None:
@@ -270,6 +272,54 @@ def test_search_filters_by_document_metadata_and_meeting_date(tmp_path: Path) ->
     assert results[0].document_type == "staff_report"
     assert results[0].jurisdiction == "Example City"
     assert results[0].source_url == "https://example.test/stormwater.pdf"
+
+
+def test_mixed_source_search_defaults_to_all_types_and_filters_by_source_type(
+    tmp_path: Path,
+) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(),
+        vector_store=FakeVectorStore(),
+    )
+
+    all_results = engine.search("budget")
+    html_results = engine.search("budget", filters=SearchFilters(source_type="html"))
+    pdf_results = engine.search(
+        "budget",
+        filters=SearchFilters(source_type="pdf", body="City Council"),
+    )
+
+    assert {result.passage_id for result in all_results} == {"passage-b", "passage-j"}
+    assert [result.passage_id for result in html_results] == ["passage-j"]
+    assert html_results[0].source_type == "html"
+    assert html_results[0].citation == "Web Notice — Budget — block 3"
+    assert [result.passage_id for result in pdf_results] == ["passage-b"]
+    assert pdf_results[0].source_type == "pdf"
+
+
+def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
+    filters = SearchFilters(source_type="docx")
+
+    with pytest.raises(
+        SearchError,
+        match="Unsupported --source-type 'docx'; expected one of: html, pdf",
+    ):
+        filters.validate()
+
+    data_dir = tmp_path / ".newsrag"
+    initialize_storage(data_dir)
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "search", "budget", "--source-type", "docx"],
+    )
+
+    assert result.exit_code == 1
+    assert "Unsupported --source-type 'docx'; expected one of: html, pdf" in result.stdout
 
 
 def test_search_filters_vector_candidates_without_leaking_out_of_filter_results(
@@ -358,6 +408,7 @@ def test_search_help_documents_metadata_filters() -> None:
     assert "--body" in plain_output
     assert "--document-type" in plain_output
     assert "--source-url" in plain_output
+    assert "--source-type" in plain_output
     assert "--since" in plain_output
 
 
@@ -602,8 +653,39 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
     with sqlite3.connect(database_path) as connection:
         connection.executemany(
             """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES(?, 'local_path', ?, ?)
+            """,
+            [
+                ("source-a", "/tmp/stormwater.pdf", "/tmp/stormwater.pdf"),
+                ("source-b", "/tmp/budget.pdf", "/tmp/budget.pdf"),
+                ("source-c", "/tmp/zoning.pdf", "/tmp/zoning.pdf"),
+                ("source-d", "/tmp/mustang.pdf", "/tmp/mustang.pdf"),
+                ("source-html", "/tmp/notice.html", "/tmp/notice.html"),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(?, ?, ?, 10, ?, ?, CURRENT_TIMESTAMP, 'published')
+            """,
+            [
+                ("artifact-a", "source-a", "application/pdf", "hash-a", "/tmp/stormwater.pdf"),
+                ("artifact-b", "source-b", "application/pdf", "hash-b", "/tmp/budget.pdf"),
+                ("artifact-c", "source-c", "application/pdf", "hash-c", "/tmp/zoning.pdf"),
+                ("artifact-d", "source-d", "application/pdf", "hash-d", "/tmp/mustang.pdf"),
+                ("artifact-html", "source-html", "text/html", "hash-html", "/tmp/notice.html"),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO documents(
+                id, source_path, source_url, title, source_hash, normalized_path,
+                metadata_json, artifact_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -614,6 +696,7 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     "hash-a",
                     "/tmp/stormwater-ocr.pdf",
                     '{"body": "Planning Commission", "document_type": "staff_report", "jurisdiction": "Example City", "meeting_date": "2026-05-01"}',
+                    "artifact-a",
                 ),
                 (
                     "document-b",
@@ -623,6 +706,7 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     "hash-b",
                     "/tmp/budget-ocr.pdf",
                     '{"body": "City Council", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-04-20"}',
+                    "artifact-b",
                 ),
                 (
                     "document-c",
@@ -632,6 +716,7 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     "hash-c",
                     "/tmp/zoning-ocr.pdf",
                     '{"body": "Zoning Board", "document_type": "packet", "jurisdiction": "Example City", "meeting_date": "2026-03-15"}',
+                    "artifact-c",
                 ),
                 (
                     "document-d",
@@ -641,8 +726,33 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     "hash-d",
                     "/tmp/mustang-ocr.pdf",
                     '{"body": "City Manager", "document_type": "manager_report", "jurisdiction": "Mustang", "meeting_date": "2026-05-01"}',
+                    "artifact-d",
+                ),
+                (
+                    "document-html",
+                    "/tmp/notice.html",
+                    "https://example.test/notice.html",
+                    "Web Notice",
+                    "hash-html",
+                    None,
+                    '{"body": "City Council", "document_type": "notice", "jurisdiction": "Example City"}',
+                    "artifact-html",
                 ),
             ],
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(
+                'unit-html-3', 'artifact-html', 'document-html', 3, 'html_block',
+                '{"block_number": 3}', 'block 3', 'budget online public update',
+                '{"element_kind": "paragraph", "heading_path": ["Web Notice", "Budget"]}',
+                'static-html'
+            )
+            """
         )
         connection.executemany(
             """
@@ -731,7 +841,23 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     5,
                     "• Geeky Cauldron Book Club – A book club for adults who love reading Young Adult books.",
                 ),
+                (
+                    "passage-j",
+                    "chunk-j",
+                    "document-html",
+                    3,
+                    3,
+                    1,
+                    "budget online public update",
+                ),
             ],
+        )
+        connection.execute(
+            """
+            UPDATE passages
+            SET source_unit_start_id = 'unit-html-3', source_unit_end_id = 'unit-html-3'
+            WHERE id = 'passage-j'
+            """
         )
         connection.executemany(
             """
@@ -763,6 +889,7 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                     "passage-i",
                     "Geeky Cauldron Book Club A book club for adults who love reading Young Adult books",
                 ),
+                ("passage-j", "budget online public update"),
             ],
         )
         connection.commit()

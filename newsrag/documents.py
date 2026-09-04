@@ -7,6 +7,14 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from newsrag.sources import (
+    SOURCE_TYPE_HTML,
+    SOURCE_TYPE_PDF,
+    SUPPORTED_SOURCE_TYPES,
+    media_types_for_source_type,
+    source_type_for_media_type,
+)
+
 DEFAULT_DOCUMENT_LIST_LIMIT = 50
 MAX_DOCUMENT_LIST_LIMIT = 500
 
@@ -27,6 +35,7 @@ class DocumentFilters:
     document_type: str | None = None
     jurisdiction: str | None = None
     source_url: str | None = None
+    source_type: str | None = None
     since: str | None = None
     until: str | None = None
     ingested_since: str | None = None
@@ -43,8 +52,18 @@ class DocumentSummary:
     source_path: str | None
     source_url: str | None
     metadata: dict[str, Any]
-    page_count: int
+    source_type: str
+    extent_label: str
+    extent_count: int
     created_at: str
+
+    @property
+    def page_count(self) -> int | None:
+        """Return the PDF page count without inventing pages for other source types."""
+
+        if self.source_type != SOURCE_TYPE_PDF:
+            return None
+        return self.extent_count
 
 
 @dataclass(frozen=True)
@@ -58,8 +77,18 @@ class DocumentDetail:
     source_hash: str | None
     normalized_path: str | None
     metadata: dict[str, Any]
-    page_count: int
+    source_type: str
+    extent_label: str
+    extent_count: int
     created_at: str
+
+    @property
+    def page_count(self) -> int | None:
+        """Return the PDF page count without inventing pages for other source types."""
+
+        if self.source_type != SOURCE_TYPE_PDF:
+            return None
+        return self.extent_count
 
 
 @dataclass(frozen=True)
@@ -99,6 +128,7 @@ def list_document_summaries(
             f"""
             SELECT COUNT(*) AS total
             FROM documents
+            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             {query.where_sql}
             """,
             query.parameters,
@@ -112,11 +142,22 @@ def list_document_summaries(
                 documents.title,
                 documents.metadata_json,
                 documents.created_at,
-                COUNT(pages.id) AS page_count
+                source_artifacts.media_type,
+                (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                        AND source_units.location_type = 'html_block'
+                ) AS html_block_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                ) AS source_unit_count
             FROM documents
-            LEFT JOIN pages ON pages.document_id = documents.id
+            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             {query.where_sql}
-            GROUP BY documents.id
             ORDER BY documents.created_at DESC, documents.id ASC
             LIMIT ? OFFSET ?
             """,
@@ -149,11 +190,22 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
                 documents.normalized_path,
                 documents.metadata_json,
                 documents.created_at,
-                COUNT(pages.id) AS page_count
+                source_artifacts.media_type,
+                (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                        AND source_units.location_type = 'html_block'
+                ) AS html_block_count,
+                (
+                    SELECT COUNT(*)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                ) AS source_unit_count
             FROM documents
-            LEFT JOIN pages ON pages.document_id = documents.id
+            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             WHERE documents.id = ?
-            GROUP BY documents.id
             """,
             (document_id,),
         ).fetchone()
@@ -161,6 +213,7 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
     if row is None:
         raise DocumentNotFoundError(f"Unknown document: {document_id}")
 
+    source_type, extent_label, extent_count = _row_source_extent(row)
     return DocumentDetail(
         id=str(row["id"]),
         title=_optional_string(row["title"]),
@@ -169,7 +222,9 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
         source_hash=_optional_string(row["source_hash"]),
         normalized_path=_optional_string(row["normalized_path"]),
         metadata=_load_metadata(row["metadata_json"]),
-        page_count=int(row["page_count"]),
+        source_type=source_type,
+        extent_label=extent_label,
+        extent_count=extent_count,
         created_at=str(row["created_at"]),
     )
 
@@ -202,7 +257,8 @@ def format_document_list(page: DocumentListPage) -> str:
             f"meeting_date={_display_value(_metadata_string(metadata, 'meeting_date'))}",
             f"body={_display_value(_metadata_string(metadata, 'body'))}",
             f"document_type={_display_value(_metadata_string(metadata, 'document_type'))}",
-            f"pages={document.page_count}",
+            f"source_type={document.source_type}",
+            f"{document.extent_label}={document.extent_count}",
             f"source={_display_value(_best_source(document.source_url, document.source_path, metadata))}",
             f"created_at={document.created_at}",
         ]
@@ -219,7 +275,8 @@ def format_document_detail(document: DocumentDetail) -> str:
         f"id: {document.id}",
         f"title: {_display_value(document.title)}",
         f"created_at: {document.created_at}",
-        f"pages: {document.page_count}",
+        f"source_type: {document.source_type}",
+        f"{document.extent_label}: {document.extent_count}",
         f"source_url: {_display_value(document.source_url)}",
         f"source_path: {_display_value(document.source_path)}",
         f"source_hash: {_display_value(document.source_hash)}",
@@ -252,6 +309,13 @@ def _build_filter_query(filters: DocumentFilters) -> _QueryParts:
             continue
         clauses.append(f"json_extract(documents.metadata_json, '$.{key}') = ?")
         parameters.append(resolved_value)
+
+    source_type = _normalized_optional_string(filters.source_type)
+    if source_type is not None:
+        media_types = media_types_for_source_type(source_type.lower())
+        placeholders = ", ".join("?" for _ in media_types)
+        clauses.append(f"source_artifacts.media_type IN ({placeholders})")
+        parameters.extend(media_types)
 
     source_url = _normalized_optional_string(filters.source_url)
     if source_url is not None:
@@ -308,6 +372,7 @@ def _validate_pagination(*, limit: int, offset: int) -> None:
 
 
 def _validate_filters(filters: DocumentFilters) -> None:
+    _validate_source_type(filters.source_type)
     since_date = _parse_filter_date(filters.since, option_name="--since")
     until_date = _parse_filter_date(filters.until, option_name="--until")
     if since_date is not None and until_date is not None and since_date > until_date:
@@ -342,15 +407,40 @@ def _parse_filter_date(value: str | None, *, option_name: str) -> date | None:
 
 
 def _row_to_summary(row: sqlite3.Row) -> DocumentSummary:
+    source_type, extent_label, extent_count = _row_source_extent(row)
     return DocumentSummary(
         id=str(row["id"]),
         title=_optional_string(row["title"]),
         source_path=_optional_string(row["source_path"]),
         source_url=_optional_string(row["source_url"]),
         metadata=_load_metadata(row["metadata_json"]),
-        page_count=int(row["page_count"]),
+        source_type=source_type,
+        extent_label=extent_label,
+        extent_count=extent_count,
         created_at=str(row["created_at"]),
     )
+
+
+def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
+    media_type = _optional_string(row["media_type"])
+    source_type = source_type_for_media_type(media_type)
+    if source_type == SOURCE_TYPE_PDF:
+        return source_type, "pages", int(row["page_count"])
+    if source_type == SOURCE_TYPE_HTML:
+        return source_type, "blocks", int(row["html_block_count"])
+    return media_type or "unknown", "units", int(row["source_unit_count"])
+
+
+def _validate_source_type(value: str | None) -> None:
+    source_type = _normalized_optional_string(value)
+    if source_type is None:
+        return
+    normalized_source_type = source_type.lower()
+    if normalized_source_type not in SUPPORTED_SOURCE_TYPES:
+        raise DocumentError(
+            f"Unsupported --source-type {source_type!r}; expected one of: "
+            + ", ".join(sorted(SUPPORTED_SOURCE_TYPES))
+        )
 
 
 def _load_metadata(raw_metadata: object) -> dict[str, Any]:

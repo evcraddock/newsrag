@@ -19,7 +19,12 @@ from newsrag.embeddings import (
     build_embedding_provider,
     create_embedding_record,
 )
-from newsrag.sources import HTML_BLOCK_LOCATION_TYPE
+from newsrag.sources import (
+    HTML_BLOCK_LOCATION_TYPE,
+    PAGE_LOCATION_TYPE,
+    SUPPORTED_SOURCE_TYPES,
+    source_type_for_media_type,
+)
 
 DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_SEARCH_CANDIDATE_LIMIT = 20
@@ -44,6 +49,7 @@ class SearchFilters:
     document_type: str | None = None
     jurisdiction: str | None = None
     source_url: str | None = None
+    source_type: str | None = None
     since: str | None = None
     until: str | None = None
 
@@ -62,6 +68,7 @@ class SearchFilters:
             ("document_type", self.document_type),
             ("jurisdiction", self.jurisdiction),
             ("source_url", self.source_url),
+            ("source_type", self.source_type),
             ("since", self.since),
             ("until", self.until),
         ):
@@ -73,6 +80,7 @@ class SearchFilters:
     def validate(self) -> None:
         """Validate filter values before search execution."""
 
+        _validate_source_type(self.source_type)
         since_date = _parse_filter_date(self.since, option_name="--since")
         until_date = _parse_filter_date(self.until, option_name="--until")
         if since_date is not None and until_date is not None and since_date > until_date:
@@ -110,6 +118,7 @@ class SearchCandidate:
     jurisdiction: str | None = None
     source_url: str | None = None
     source_path: str | None = None
+    source_type: str | None = None
     source_unit_start_id: str | None = None
     source_unit_end_id: str | None = None
     keyword_score: float | None = None
@@ -136,12 +145,13 @@ class SearchResult:
     jurisdiction: str | None = None
     source_url: str | None = None
     source_path: str | None = None
+    source_type: str | None = None
     source_unit_start_id: str | None = None
     source_unit_end_id: str | None = None
 
 
 @dataclass(frozen=True)
-class _HtmlCitationDetails:
+class _CitationDetails:
     heading_path: tuple[str, ...]
     location_label: str
 
@@ -377,10 +387,12 @@ def search_keyword_candidates(
                 documents.source_url AS source_url,
                 documents.source_path AS source_path,
                 documents.metadata_json AS metadata_json,
+                source_artifacts.media_type AS source_media_type,
                 bm25(passages_fts) AS keyword_score
             FROM passages_fts
             JOIN passages ON passages.id = passages_fts.passage_id
             JOIN documents ON documents.id = passages.document_id
+            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             WHERE passages_fts MATCH ?
             ORDER BY bm25(passages_fts) ASC, passages.id ASC
             LIMIT ?
@@ -408,6 +420,7 @@ def search_keyword_candidates(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
                 source_unit_start_id=_optional_string(row["source_unit_start_id"]),
                 source_unit_end_id=_optional_string(row["source_unit_end_id"]),
                 keyword_score=float(row["keyword_score"]),
@@ -449,7 +462,7 @@ def merge_search_candidates(
         }
     )
 
-    source_citations = _load_html_citation_details(
+    source_citations = _load_citation_details(
         database_path,
         tuple(passage_context.values()),
     )
@@ -485,6 +498,7 @@ def merge_search_candidates(
             jurisdiction=context.jurisdiction,
             source_url=context.source_url,
             source_path=context.source_path,
+            source_type=context.source_type,
             source_unit_start_id=context.source_unit_start_id,
             source_unit_end_id=context.source_unit_end_id,
         )
@@ -527,10 +541,10 @@ def format_citation(
     return " — ".join(parts)
 
 
-def _load_html_citation_details(
+def _load_citation_details(
     database_path: Path,
     candidates: Sequence[SearchCandidate],
-) -> dict[str, _HtmlCitationDetails]:
+) -> dict[str, _CitationDetails]:
     source_unit_ids = {
         source_unit_id
         for candidate in candidates
@@ -556,7 +570,7 @@ def _load_html_citation_details(
         ).fetchall()
     units = {str(row["id"]): row for row in rows}
 
-    citations: dict[str, _HtmlCitationDetails] = {}
+    citations: dict[str, _CitationDetails] = {}
     for candidate in candidates:
         if candidate.source_unit_start_id is None:
             continue
@@ -564,13 +578,22 @@ def _load_html_citation_details(
         end_unit = units.get(candidate.source_unit_end_id or candidate.source_unit_start_id)
         if start_unit is None or end_unit is None:
             continue
-        if (
-            str(start_unit["location_type"]) != HTML_BLOCK_LOCATION_TYPE
-            or str(end_unit["location_type"]) != HTML_BLOCK_LOCATION_TYPE
-        ):
+        start_location_type = str(start_unit["location_type"])
+        if start_location_type != str(end_unit["location_type"]):
             continue
         start_location = _load_metadata(start_unit["location_json"])
         end_location = _load_metadata(end_unit["location_json"])
+        if start_location_type == PAGE_LOCATION_TYPE:
+            start_page = start_location.get("page_number")
+            if isinstance(start_page, bool) or not isinstance(start_page, int) or start_page < 1:
+                continue
+            citations[candidate.passage_id] = _CitationDetails(
+                heading_path=(),
+                location_label=f"p. {start_page}",
+            )
+            continue
+        if start_location_type != HTML_BLOCK_LOCATION_TYPE:
+            continue
         start_block = start_location.get("block_number")
         end_block = end_location.get("block_number")
         if (
@@ -598,7 +621,7 @@ def _load_html_citation_details(
             if start_block == end_block
             else f"blocks {start_block}–{end_block}"
         )
-        citations[candidate.passage_id] = _HtmlCitationDetails(
+        citations[candidate.passage_id] = _CitationDetails(
             heading_path=heading_path,
             location_label=location_label,
         )
@@ -808,6 +831,7 @@ def _expand_contextual_keyword_candidates(
                     jurisdiction=neighbor.jurisdiction,
                     source_url=neighbor.source_url,
                     source_path=neighbor.source_path,
+                    source_type=neighbor.source_type,
                     source_unit_start_id=neighbor.source_unit_start_id,
                     source_unit_end_id=neighbor.source_unit_end_id,
                     keyword_score=(candidate.keyword_score or 0.0) + 0.5,
@@ -869,9 +893,11 @@ def _load_passage_context(
                     documents.title AS title,
                     documents.source_url AS source_url,
                     documents.source_path AS source_path,
-                    documents.metadata_json AS metadata_json
+                    documents.metadata_json AS metadata_json,
+                    source_artifacts.media_type AS source_media_type
                 FROM passages
                 JOIN documents ON documents.id = passages.document_id
+                LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
                 WHERE passages.id IN ({placeholders})
                 """,
                 tuple(passage_ids_to_load),
@@ -895,6 +921,7 @@ def _load_passage_context(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
                 source_unit_start_id=_optional_string(row["source_unit_start_id"]),
                 source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             )
@@ -916,6 +943,7 @@ def _load_passage_context(
             jurisdiction=existing.jurisdiction,
             source_url=existing.source_url,
             source_path=existing.source_path,
+            source_type=existing.source_type,
             source_unit_start_id=existing.source_unit_start_id,
             source_unit_end_id=existing.source_unit_end_id,
             keyword_score=existing.keyword_score,
@@ -979,12 +1007,14 @@ def _load_adjacent_passages(
                 documents.title AS title,
                 documents.source_url AS source_url,
                 documents.source_path AS source_path,
-                documents.metadata_json AS metadata_json
+                documents.metadata_json AS metadata_json,
+                source_artifacts.media_type AS source_media_type
             FROM passages
             JOIN origin
                 ON passages.chunk_id = origin.chunk_id
                 AND ABS(passages.ordinal - origin.ordinal) = 1
             JOIN documents ON documents.id = passages.document_id
+            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             ORDER BY passages.ordinal ASC, passages.id ASC
             """,
             (passage_id,),
@@ -1010,6 +1040,7 @@ def _load_adjacent_passages(
                 source_path=_optional_string(row["source_path"])
                 or _optional_string(metadata.get("stored_source_path"))
                 or _optional_string(metadata.get("source_filename")),
+                source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
                 source_unit_start_id=_optional_string(row["source_unit_start_id"]),
                 source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             )
@@ -1041,6 +1072,7 @@ def _matches_search_filters(candidate: SearchCandidate, filters: SearchFilters) 
         and _matches_text_filter(candidate.document_type, filters.document_type)
         and _matches_text_filter(candidate.jurisdiction, filters.jurisdiction)
         and _matches_text_filter(candidate.source_url, filters.source_url)
+        and _matches_text_filter(candidate.source_type, filters.source_type)
         and _matches_date_filter(candidate.meeting_date, since=filters.since, until=filters.until)
     )
 
@@ -1069,6 +1101,18 @@ def _matches_date_filter(meeting_date: str | None, *, since: str | None, until: 
     if until_date is not None and parsed_meeting_date > until_date:
         return False
     return True
+
+
+def _validate_source_type(value: str | None) -> None:
+    source_type = _optional_string(value)
+    if source_type is None:
+        return
+    normalized_source_type = source_type.lower()
+    if normalized_source_type not in SUPPORTED_SOURCE_TYPES:
+        raise SearchError(
+            f"Unsupported --source-type {source_type!r}; expected one of: "
+            + ", ".join(sorted(SUPPORTED_SOURCE_TYPES))
+        )
 
 
 def _parse_filter_date(value: str | None, *, option_name: str) -> date | None:
