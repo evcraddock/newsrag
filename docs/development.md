@@ -63,6 +63,19 @@ Start the development environment:
 make dev
 ```
 
+The development daemon uses the repository's gitignored `.newsrag` directory by default instead of the installed corpus under `~/.local/share/newsrag`. Override the development location through the environment when needed:
+
+```bash
+NEWSRAG_DATA_DIR=/path/to/dev-corpus make dev
+```
+
+Use the same data directory explicitly for development CLI commands run outside Overmind:
+
+```bash
+uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" status
+uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" jobs list
+```
+
 Attach to one service terminal:
 
 ```bash
@@ -85,7 +98,9 @@ make dev-stop
 
 Current behavior:
 - `Procfile.dev` is present and wired into `make dev`.
-- The long-running process is `uv run newsrag daemon run` managed by Overmind.
+- The long-running process is `uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" daemon run` managed by Overmind.
+- Development runtime data stays under `.newsrag` unless `NEWSRAG_DATA_DIR` overrides it.
+- Installed commands continue to use the configured data directory or `${XDG_DATA_HOME:-~/.local/share}/newsrag`.
 
 ## Verification commands
 
