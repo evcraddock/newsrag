@@ -338,8 +338,9 @@ def ingest_url_command(
     ),
     pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
-    """Download one direct PDF URL and enqueue it for ingestion."""
+    """Enqueue one direct PDF URL for background acquisition and ingestion."""
 
+    from newsrag.acquisition import safe_url_reference
     from newsrag.ingest import IngestError, enqueue_ingest_url_job, normalize_pdf_extractor_mode
     from newsrag.storage import initialize_storage
 
@@ -367,13 +368,14 @@ def ingest_url_command(
         raise typer.Exit(code=1) from exc
 
     typer.echo("Enqueued 1 ingest job(s)")
-    typer.echo(f"{job.id} {job.payload['path']}")
+    typer.echo(f"{job.id} {safe_url_reference(str(job.payload['url']))}")
 
 
 @app.command("ingest-manifest")
 def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
     """Load a YAML manifest and enqueue one URL-ingest job per document."""
 
+    from newsrag.acquisition import safe_url_reference
     from newsrag.ingest import IngestError, enqueue_ingest_url_job
     from newsrag.manifests import ManifestError, load_manifest
     from newsrag.storage import initialize_storage
@@ -404,7 +406,7 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
 
     typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
     for job in jobs:
-        typer.echo(f"{job.id} {job.payload['path']}")
+        typer.echo(f"{job.id} {safe_url_reference(str(job.payload['url']))}")
 
 
 @app.command("search")
@@ -1087,12 +1089,16 @@ def run() -> None:
 
 
 def _format_job_line(job: Job) -> str:
+    from newsrag.acquisition import safe_url_reference
     from newsrag.jobs import FAILED
 
     parts = [job.id, job.status, job.kind, f"updated_at={job.updated_at}"]
     source_path = job.payload.get("path")
     if isinstance(source_path, str) and source_path.strip():
         parts.append(f"path={source_path}")
+    source_url = job.payload.get("url")
+    if isinstance(source_url, str) and source_url.strip():
+        parts.append(f"url={safe_url_reference(source_url)}")
     if job.result is not None:
         for key in ("outcome", "source_id", "artifact_id", "document_id"):
             value = job.result.get(key)

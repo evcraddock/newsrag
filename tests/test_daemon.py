@@ -260,6 +260,23 @@ def test_jobs_list_shows_all_job_statuses(tmp_path: Path) -> None:
     assert "error=boom" in result.stdout
 
 
+def test_jobs_list_redacts_url_query_values(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind="ingest-file",
+        payload={"url": "https://example.gov/packet.pdf?token=secret"},
+    )
+
+    result = runner.invoke(app, ["--data-dir", str(data_dir), "jobs", "list"])
+
+    assert result.exit_code == 0
+    assert job.id in result.stdout
+    assert "url=https://example.gov/packet.pdf" in result.stdout
+    assert "token=secret" not in result.stdout
+
+
 def test_failed_job_appears_in_status_with_error_count(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit, urlunsplit
@@ -22,7 +23,12 @@ class SourceIdentity:
     resolved_reference: str | None
 
 
-def build_source_identity(*, source_path: Path, source_url: str | None) -> SourceIdentity:
+def build_source_identity(
+    *,
+    source_path: Path,
+    source_url: str | None,
+    resolved_reference: str | None = None,
+) -> SourceIdentity:
     """Build the corpus-local identity fields for a URL or local path."""
 
     if source_url is not None:
@@ -33,17 +39,17 @@ def build_source_identity(*, source_path: Path, source_url: str | None) -> Sourc
             kind=SOURCE_KIND_URL,
             submitted_reference=submitted_reference,
             normalized_reference=normalized_reference,
-            resolved_reference=normalized_reference,
+            resolved_reference=resolved_reference or normalized_reference,
         )
 
     submitted_reference = str(source_path)
-    normalized_reference = str(source_path.expanduser().resolve())
+    normalized_reference = str(Path(os.path.abspath(os.path.expanduser(submitted_reference))))
     return SourceIdentity(
         id=_stable_id("source", SOURCE_KIND_LOCAL_PATH, normalized_reference),
         kind=SOURCE_KIND_LOCAL_PATH,
         submitted_reference=submitted_reference,
         normalized_reference=normalized_reference,
-        resolved_reference=normalized_reference,
+        resolved_reference=resolved_reference or str(Path(normalized_reference).resolve()),
     )
 
 

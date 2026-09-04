@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
-import shutil
+import os
 import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
 
-import httpx
 import lancedb  # type: ignore[import-untyped]
 
+from newsrag.acquisition import (
+    SOURCE_KIND_URL,
+    AcquisitionError,
+    AcquisitionRequest,
+    SafeSourceArtifactAcquirer,
+    SourceArtifactAcquirer,
+    preserve_staged_artifact,
+    safe_url_reference,
+    validate_url_submission,
+)
 from newsrag.adapters import (
     AdapterError,
     AdapterInput,
@@ -38,6 +45,7 @@ from newsrag.ingestion_identity import (
     OUTCOME_DUPLICATE_IGNORED,
     find_document_for_artifact,
     find_published_duplicate,
+    find_stored_artifact_path,
     register_acquired_artifact,
 )
 from newsrag.jobs import Job, create_job
@@ -93,13 +101,12 @@ __all__ = [
 INGEST_JOB_KIND = "ingest-file"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
-DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 VECTOR_TABLE_NAME = "chunk_embeddings"
 LOGGER = logging.getLogger(__name__)
 
 
 class IngestError(Exception):
-    """Raised when local PDF ingestion cannot complete."""
+    """Raised when source acquisition or PDF ingestion cannot complete."""
 
 
 @dataclass(frozen=True)
@@ -169,23 +176,6 @@ class ChunkVectorRecord:
     source_unit_end_id: str | None = None
 
 
-@dataclass(frozen=True)
-class DownloadedPdf:
-    """One downloaded direct-PDF artifact."""
-
-    path: Path
-    source_url: str
-    retrieved_at: str
-    content_hash: str
-
-
-class PdfDownloader(Protocol):
-    """Protocol for direct PDF downloads."""
-
-    def download_pdf(self, url: str, destination_dir: Path) -> DownloadedPdf:
-        """Download one direct PDF into the corpus data directory."""
-
-
 class Chunker(Protocol):
     """Protocol for canonical-source-unit chunking."""
 
@@ -211,42 +201,6 @@ class PassageVectorStore(Protocol):
 
     def delete_document(self, document_id: str) -> None:
         """Remove staged vectors for one failed document publication."""
-
-
-@dataclass(frozen=True)
-class HttpxPdfDownloader:
-    """Direct-PDF downloader backed by `httpx`."""
-
-    timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
-
-    def download_pdf(self, url: str, destination_dir: Path) -> DownloadedPdf:
-        try:
-            response = httpx.get(url, follow_redirects=True, timeout=self.timeout_seconds)
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise IngestError(f"Failed downloading {url}: {exc}") from exc
-
-        content = response.content
-        if not _looks_like_pdf(response.headers.get("Content-Type"), content):
-            raise IngestError(f"URL did not return a PDF-like response: {url}")
-
-        content_hash = _hash_bytes(content)
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        destination_path = destination_dir / f"{content_hash}.pdf"
-        if not destination_path.exists() or _hash_file(destination_path) != content_hash:
-            temporary_path = destination_path.with_name(f".{content_hash}-{uuid.uuid4().hex}.tmp")
-            try:
-                temporary_path.write_bytes(content)
-                temporary_path.replace(destination_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
-
-        return DownloadedPdf(
-            path=destination_path,
-            source_url=url,
-            retrieved_at=_current_timestamp(),
-            content_hash=content_hash,
-        )
 
 
 def build_pdf_text_extractor(mode: PdfExtractorMode = PDF_EXTRACTOR_AUTO) -> TextExtractor:
@@ -533,6 +487,7 @@ class IngestionPipeline:
         *,
         storage_paths: StoragePaths,
         embedding_config: EmbeddingConfig,
+        acquirer: SourceArtifactAcquirer | None = None,
         adapter: SourceAdapter | None = None,
         ocr_runner: OcrRunner | None = None,
         text_extractor: TextExtractor | None = None,
@@ -542,6 +497,7 @@ class IngestionPipeline:
         passage_vector_store: PassageVectorStore | None = None,
     ) -> None:
         self.storage_paths = storage_paths
+        self.acquirer = acquirer or SafeSourceArtifactAcquirer()
         resolved_adapter = adapter or PdfSourceAdapter(
             ocr_runner=ocr_runner or SubprocessOcrRunner(),
             text_extractor=text_extractor,
@@ -560,51 +516,84 @@ class IngestionPipeline:
         return await asyncio.to_thread(self.process_job, job)
 
     def process_job(self, job: Job) -> dict[str, object]:
-        source_path = _payload_path(job.payload)
+        request = _payload_acquisition_request(job.payload)
+        safe_reference = _safe_acquisition_reference(request)
         metadata = _payload_metadata(job.payload)
-        source_url = _metadata_source_url(metadata)
+        staged_artifact = None
 
         try:
-            with _ingest_stage(job.id, "artifact_preparation", source_path):
-                source_hash = _hash_file(source_path)
+            with _ingest_stage(job.id, "artifact_acquisition", safe_reference):
+                staged_artifact = self.acquirer.acquire(
+                    request,
+                    self.storage_paths.artifact_staging,
+                )
+
+            with _ingest_stage(job.id, "artifact_preparation", safe_reference):
                 duplicate = find_published_duplicate(
                     self.storage_paths.database,
-                    source_hash,
+                    staged_artifact.content_hash,
                 )
                 if duplicate is not None:
                     return self._completed_identity_result(job, duplicate.result())
 
-                source_copy_path = _copy_source_pdf(
-                    self.storage_paths,
-                    source_path,
-                    source_hash,
+                stored_path = find_stored_artifact_path(
+                    self.storage_paths.database,
+                    staged_artifact.content_hash,
+                )
+                if stored_path is None:
+                    stored_path = preserve_staged_artifact(
+                        staged_artifact,
+                        self.storage_paths.source_artifacts,
+                    )
+
+                source_url = (
+                    staged_artifact.submitted_reference
+                    if staged_artifact.source_kind == SOURCE_KIND_URL
+                    else _metadata_source_url(metadata)
+                )
+                resolved_reference = (
+                    staged_artifact.resolved_reference
+                    if source_url is None or staged_artifact.source_kind == SOURCE_KIND_URL
+                    else source_url
                 )
                 decision = register_acquired_artifact(
                     self.storage_paths.database,
                     source_identity=build_source_identity(
-                        source_path=source_path,
+                        source_path=Path(staged_artifact.submitted_reference),
                         source_url=source_url,
+                        resolved_reference=resolved_reference,
                     ),
-                    content_hash=source_hash,
+                    content_hash=staged_artifact.content_hash,
                     media_type=PDF_MEDIA_TYPE,
-                    byte_size=source_copy_path.stat().st_size,
-                    stored_path=source_copy_path,
-                    acquired_at=_metadata_retrieved_at(metadata) or _current_timestamp(),
+                    byte_size=staged_artifact.byte_size,
+                    stored_path=stored_path,
+                    acquired_at=staged_artifact.acquired_at,
+                    reported_media_type=staged_artifact.reported_media_type,
+                    provenance=staged_artifact.provenance,
                 )
                 if decision.action == "complete":
                     return self._completed_identity_result(job, decision.result())
+
+            document_metadata = dict(metadata)
+            document_metadata["source_size_bytes"] = staged_artifact.byte_size
+            file_mtime_ns = staged_artifact.provenance.get("file_mtime_ns")
+            if isinstance(file_mtime_ns, int):
+                document_metadata["source_mtime_ns"] = file_mtime_ns
+            if staged_artifact.source_kind == SOURCE_KIND_URL:
+                document_metadata["source_url"] = staged_artifact.submitted_reference
+                document_metadata["retrieved_at"] = staged_artifact.acquired_at
 
             try:
                 document_id = self.processor.process(
                     PreparedSourceArtifact(
                         source_path=decision.document_source_path,
                         artifact_path=decision.artifact_path,
-                        content_hash=source_hash,
+                        content_hash=staged_artifact.content_hash,
                         media_type=PDF_MEDIA_TYPE,
                         source_url=decision.document_source_url,
                         acquired_at=decision.acquired_at,
                         work_dir=self.storage_paths.ocr_pdfs,
-                        metadata=metadata,
+                        metadata=document_metadata,
                         adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
                     ),
                     job_id=job.id,
@@ -624,10 +613,15 @@ class IngestionPipeline:
                     )
                 raise
             return decision.result(outcome=OUTCOME_CREATED, document_id=document_id)
+        except AcquisitionError as exc:
+            raise IngestError(str(exc)) from exc
         except IngestError:
             raise
         except Exception as exc:
-            raise IngestError(f"Failed ingesting {source_path}: {exc}") from exc
+            raise IngestError(f"Failed ingesting {safe_reference}: {exc}") from exc
+        finally:
+            if staged_artifact is not None:
+                staged_artifact.staged_path.unlink(missing_ok=True)
 
     def _completed_identity_result(
         self,
@@ -679,20 +673,18 @@ def enqueue_ingest_url_job(
     storage_paths: StoragePaths,
     url: str,
     metadata: dict[str, Any] | None = None,
-    downloader: PdfDownloader | None = None,
     pdf_extractor: str | None = None,
 ) -> Job:
-    """Download one direct PDF URL and enqueue it for ingestion."""
+    """Enqueue one direct URL for safe background acquisition and ingestion."""
 
-    resolved_downloader = downloader or HttpxPdfDownloader()
-    downloaded_pdf = resolved_downloader.download_pdf(url, storage_paths.downloaded_pdfs)
-    payload_metadata = dict(metadata or {})
-    payload_metadata["source_url"] = downloaded_pdf.source_url
-    payload_metadata["retrieved_at"] = downloaded_pdf.retrieved_at
-
+    del storage_paths
+    try:
+        submitted_url = validate_url_submission(url)
+    except AcquisitionError as exc:
+        raise IngestError(str(exc)) from exc
     payload: dict[str, Any] = {
-        "path": str(downloaded_pdf.path),
-        "metadata": payload_metadata,
+        "url": submitted_url,
+        "metadata": dict(metadata or {}),
         "source": "ingest-url",
     }
     if pdf_extractor is not None:
@@ -709,6 +701,7 @@ def build_ingest_handler(
     *,
     data_dir: Path,
     embedding_config: EmbeddingConfig,
+    acquirer: SourceArtifactAcquirer | None = None,
     adapter: SourceAdapter | None = None,
     ocr_runner: OcrRunner | None = None,
     text_extractor: TextExtractor | None = None,
@@ -717,11 +710,12 @@ def build_ingest_handler(
     vector_store: VectorStore | None = None,
     passage_vector_store: PassageVectorStore | None = None,
 ) -> Callable[[Job], Awaitable[dict[str, object]]]:
-    """Build an async handler for local-PDF ingest jobs."""
+    """Build an async handler for safely acquired PDF ingest jobs."""
 
     pipeline = IngestionPipeline(
         storage_paths=initialize_storage(data_dir),
         embedding_config=embedding_config,
+        acquirer=acquirer,
         adapter=adapter,
         ocr_runner=ocr_runner,
         text_extractor=text_extractor,
@@ -875,39 +869,42 @@ def list_chunk_vectors(
 
 
 def _iter_pdf_inputs(source_path: Path) -> tuple[Path, ...]:
-    resolved_path = source_path.expanduser().resolve()
-    if not resolved_path.exists():
-        raise IngestError(f"Input path does not exist: {resolved_path}")
-
-    if resolved_path.is_file():
-        if resolved_path.suffix.lower() != ".pdf":
-            raise IngestError(f"Input file is not a PDF: {resolved_path}")
-        return (resolved_path,)
-
-    pdf_paths = tuple(
-        sorted(
-            candidate.resolve()
-            for candidate in resolved_path.rglob("*")
-            if candidate.is_file() and candidate.suffix.lower() == ".pdf"
+    submitted_path = Path(os.path.abspath(source_path.expanduser()))
+    if submitted_path.is_dir() and not submitted_path.is_symlink():
+        pdf_paths = tuple(
+            sorted(
+                Path(os.path.abspath(candidate))
+                for candidate in submitted_path.rglob("*")
+                if not candidate.is_symlink()
+                and candidate.is_file()
+                and candidate.suffix.lower() == ".pdf"
+            )
         )
-    )
-    if pdf_paths:
-        return pdf_paths
+        if pdf_paths:
+            return pdf_paths
+        raise IngestError(f"No PDF files found under {submitted_path}")
 
-    raise IngestError(f"No PDF files found under {resolved_path}")
+    if submitted_path.suffix.lower() != ".pdf":
+        raise IngestError(f"Input file is not a PDF: {submitted_path}")
+    return (submitted_path,)
 
 
-def _payload_path(payload: dict[str, Any]) -> Path:
+def _payload_acquisition_request(payload: dict[str, Any]) -> AcquisitionRequest:
+    raw_url = payload.get("url")
     raw_path = payload.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise IngestError("Ingest job payload is missing a valid path")
+    if isinstance(raw_url, str) and raw_url.strip():
+        if isinstance(raw_path, str) and raw_path.strip():
+            raise IngestError("Ingest job payload cannot contain both a URL and path")
+        return AcquisitionRequest(kind=SOURCE_KIND_URL, reference=raw_url.strip())
+    if isinstance(raw_path, str) and raw_path.strip():
+        return AcquisitionRequest(kind="local_path", reference=raw_path)
+    raise IngestError("Ingest job payload is missing a valid URL or path")
 
-    source_path = Path(raw_path).expanduser().resolve()
-    if not source_path.exists() or not source_path.is_file():
-        raise IngestError(f"Source PDF not found: {source_path}")
-    if source_path.suffix.lower() != ".pdf":
-        raise IngestError(f"Source file is not a PDF: {source_path}")
-    return source_path
+
+def _safe_acquisition_reference(request: AcquisitionRequest) -> str:
+    if request.kind == SOURCE_KIND_URL:
+        return safe_url_reference(request.reference)
+    return str(Path(os.path.abspath(Path(request.reference).expanduser())))
 
 
 def _payload_metadata(payload: dict[str, Any]) -> dict[str, Any]:
@@ -933,38 +930,31 @@ def _metadata_source_url(metadata: dict[str, Any]) -> str | None:
     return None
 
 
-def _metadata_retrieved_at(metadata: dict[str, Any]) -> str | None:
-    retrieved_at = metadata.get("retrieved_at")
-    if isinstance(retrieved_at, str) and retrieved_at.strip():
-        return retrieved_at.strip()
-    return None
-
-
 @contextmanager
-def _ingest_stage(job_id: str, stage: str, source_path: Path) -> Iterator[None]:
+def _ingest_stage(job_id: str, stage: str, source_reference: Path | str) -> Iterator[None]:
     started_at = perf_counter()
     LOGGER.info(
-        "ingest_stage_started job_id=%s stage=%s source_path=%r",
+        "ingest_stage_started job_id=%s stage=%s source_reference=%r",
         job_id,
         stage,
-        str(source_path),
+        str(source_reference),
     )
     try:
         yield
     except Exception:
         LOGGER.error(
-            "ingest_stage_failed job_id=%s stage=%s source_path=%r elapsed_ms=%d",
+            "ingest_stage_failed job_id=%s stage=%s source_reference=%r elapsed_ms=%d",
             job_id,
             stage,
-            str(source_path),
+            str(source_reference),
             round((perf_counter() - started_at) * 1000),
         )
         raise
     LOGGER.info(
-        "ingest_stage_completed job_id=%s stage=%s source_path=%r elapsed_ms=%d",
+        "ingest_stage_completed job_id=%s stage=%s source_reference=%r elapsed_ms=%d",
         job_id,
         stage,
-        str(source_path),
+        str(source_reference),
         round((perf_counter() - started_at) * 1000),
     )
 
@@ -1008,53 +998,12 @@ def _extractor_identity(name: str) -> ExtractorIdentity:
     return ExtractorIdentity(name=name)
 
 
-def _hash_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
-
-
-def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file_handle:
-        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _current_timestamp() -> str:
-    return datetime.now(UTC).isoformat()
-
-
-def _looks_like_pdf(content_type: str | None, content: bytes) -> bool:
-    normalized_content_type = (content_type or "").lower()
-    return "application/pdf" in normalized_content_type or content.startswith(b"%PDF-")
-
-
-def _copy_source_pdf(storage_paths: StoragePaths, source_path: Path, source_hash: str) -> Path:
-    destination = storage_paths.source_pdfs / f"{source_hash}.pdf"
-    if source_path.resolve() == destination.resolve():
-        return destination
-    if destination.exists():
-        if _hash_file(destination) != source_hash:
-            raise IngestError(f"Stored artifact failed integrity check: {destination}")
-        return destination
-
-    temporary_path = destination.with_name(f".{source_hash}-{uuid.uuid4().hex}.tmp")
-    try:
-        shutil.copy2(source_path, temporary_path)
-        if _hash_file(temporary_path) != source_hash:
-            raise IngestError(f"Source changed while acquiring artifact: {source_path}")
-        temporary_path.replace(destination)
-    finally:
-        temporary_path.unlink(missing_ok=True)
-    return destination
-
-
 def _build_document_metadata(
     metadata: dict[str, Any],
     source_path: Path,
     stored_source_path: Path,
 ) -> dict[str, Any]:
-    source_stat = source_path.stat()
+    source_stat = stored_source_path.stat()
     combined = dict(metadata)
     combined.setdefault("source_filename", source_path.name)
     combined.setdefault("source_size_bytes", source_stat.st_size)

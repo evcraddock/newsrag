@@ -9,6 +9,7 @@ from time import perf_counter
 
 from watchfiles import awatch
 
+from newsrag.acquisition import safe_url_reference
 from newsrag.config import EmbeddingConfig
 from newsrag.ingest import INGEST_JOB_KIND, build_ingest_handler
 from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
@@ -176,6 +177,9 @@ def _job_log_context(job: Job) -> str:
     source_path = job.payload.get("path")
     if isinstance(source_path, str):
         context += f" source_path={source_path!r}"
+    source_url = job.payload.get("url")
+    if isinstance(source_url, str):
+        context += f" source_url={safe_url_reference(source_url)!r}"
     return context
 
 
