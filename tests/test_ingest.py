@@ -4,7 +4,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -12,6 +12,12 @@ import lancedb  # type: ignore[import-untyped]
 import pytest
 from typer.testing import CliRunner
 
+from newsrag.adapters import (
+    AdapterInput,
+    AdapterResult,
+    CanonicalSourceUnit,
+    ExtractorIdentity,
+)
 from newsrag.cli import app
 from newsrag.config import EmbeddingConfig
 from newsrag.daemon import DaemonRunner
@@ -436,6 +442,102 @@ def test_ingest_url_download_failures_fail_clearly(
         enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
 
+def test_ingestion_pipeline_processes_an_injected_source_adapter(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {}},
+    )
+    adapter = FakeSourceAdapter()
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    assert get_job(paths.database, job.id).status == "done"
+    assert len(adapter.inputs) == 1
+    assert adapter.inputs[0].artifact_path.parent == paths.source_pdfs
+    assert adapter.inputs[0].media_type == "application/pdf"
+    with sqlite3.connect(paths.database) as connection:
+        unit = connection.execute(
+            """
+            SELECT location_type, location_json, human_label, normalized_text, extractor
+            FROM source_units
+            """
+        ).fetchone()
+    assert unit is not None
+    assert unit == ("page", '{"page_number": 1}', "p. 1", "Adapter agenda", "fake-adapter")
+
+
+def test_failed_vector_publication_leaves_no_searchable_document(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nmock")
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {}},
+    )
+    chunk_vector_store = RecordingChunkVectorStore()
+    passage_vector_store = FailingPassageVectorStore()
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=chunk_vector_store,
+        passage_vector_store=passage_vector_store,
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, job.id)
+    assert updated_job.status == FAILED
+    assert "passage vector boom" in (updated_job.error or "")
+    with sqlite3.connect(paths.database) as connection:
+        for table_name in (
+            "sources",
+            "source_artifacts",
+            "documents",
+            "source_units",
+            "pages",
+            "chunks",
+            "passages",
+            "embedding_records",
+            "chunks_fts",
+            "passages_fts",
+        ):
+            count = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+            assert count == (0,)
+    assert len(chunk_vector_store.added) == 1
+    assert len(chunk_vector_store.removed_document_ids) == 1
+    assert passage_vector_store.removed_document_ids == chunk_vector_store.removed_document_ids
+
+
 def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     tmp_path: Path,
 ) -> None:
@@ -771,6 +873,58 @@ def test_ingest_failures_are_recorded_with_context(tmp_path: Path) -> None:
     assert list_documents(paths.database) == []
     assert list_chunks(paths.database) == []
     assert list_chunk_vectors(paths.lancedb) == []
+
+
+@dataclass
+class FakeSourceAdapter:
+    inputs: list[AdapterInput] = field(default_factory=list)
+
+    @property
+    def media_types(self) -> tuple[str, ...]:
+        return ("application/pdf",)
+
+    def extract(self, artifact: AdapterInput) -> AdapterResult:
+        self.inputs.append(artifact)
+        return AdapterResult(
+            media_type="application/pdf",
+            units=(
+                CanonicalSourceUnit(
+                    ordinal=1,
+                    location_type="page",
+                    location={"page_number": 1},
+                    human_label="p. 1",
+                    normalized_text="Adapter agenda",
+                    structure={},
+                    extractor=ExtractorIdentity(name="fake-adapter"),
+                ),
+            ),
+            extractor=ExtractorIdentity(name="fake-adapter"),
+            derived_artifact_path=artifact.artifact_path,
+        )
+
+
+@dataclass
+class RecordingChunkVectorStore:
+    added: list[object] = field(default_factory=list)
+    removed_document_ids: list[str] = field(default_factory=list)
+
+    def add_chunks(self, chunks: Sequence[object]) -> None:
+        self.added.extend(chunks)
+
+    def delete_document(self, document_id: str) -> None:
+        self.removed_document_ids.append(document_id)
+
+
+@dataclass
+class FailingPassageVectorStore:
+    removed_document_ids: list[str] = field(default_factory=list)
+
+    def add_passages(self, passages: Sequence[object]) -> None:
+        del passages
+        raise RuntimeError("passage vector boom")
+
+    def delete_document(self, document_id: str) -> None:
+        self.removed_document_ids.append(document_id)
 
 
 @dataclass(frozen=True)

@@ -71,6 +71,14 @@ Processing is idempotent. The system hashes source content to avoid duplicate in
 
 The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Each extracted page is stored as an ordered page source unit before chunking, and source-unit ranges propagate through chunks, passages, embeddings, and search results while existing page citations remain stable.
 
+## Source adapter contract
+
+A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, and any derived artifact used for extraction.
+
+Each canonical source unit has a contiguous one-based ordinal, typed machine location, human-readable location label, normalized text, structure metadata, and extractor name/version. Adapters do not chunk, embed, index, publish documents, or modify source identity. Those stages belong to the shared ingestion pipeline.
+
+PDF is the first implementation of this contract. The PDF adapter validates the raw PDF, runs the existing OCR and extraction fallback behavior, and emits one page source unit per PDF page. The shared pipeline then performs page-compatible chunking, passage generation, embeddings, FTS/vector indexing, and publication. SQLite publication is transactional; failed vector publication rolls back the document bundle and removes staged vectors so incomplete documents cannot appear in search.
+
 ## Chunking and citations
 
 The MVP uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. This keeps citations simple and reliable for city hall PDFs, where page numbers are often the most important reference.
