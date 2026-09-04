@@ -9,7 +9,17 @@ from typer.testing import CliRunner
 
 from newsrag.cli import app
 from newsrag.daemon import DaemonRunner
-from newsrag.jobs import DONE, FAILED, PENDING, RUNNING, Job, create_job, get_job, set_job_status
+from newsrag.jobs import (
+    DONE,
+    FAILED,
+    PENDING,
+    RUNNING,
+    Job,
+    create_job,
+    get_job,
+    mark_job_done,
+    set_job_status,
+)
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
@@ -143,6 +153,34 @@ def test_mocked_job_moves_from_pending_to_running_to_done(
     assert "elapsed_ms=" in caplog.text
 
 
+def test_successful_job_persists_structured_result(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    job = create_job(paths.database, kind="mock")
+
+    async def handler(_: Job) -> dict[str, object]:
+        return {
+            "outcome": "created",
+            "artifact_id": "artifact-1",
+            "document_id": "document-1",
+        }
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={"mock": handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, job.id)
+    assert updated_job.status == DONE
+    assert updated_job.result == {
+        "artifact_id": "artifact-1",
+        "document_id": "document-1",
+        "outcome": "created",
+    }
+
+
 def test_failing_mocked_job_records_failed_state_and_error(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -197,7 +235,11 @@ def test_jobs_list_shows_all_job_statuses(tmp_path: Path) -> None:
     failed_job = create_job(paths.database, kind="failed-job", job_id="job-failed")
 
     set_job_status(paths.database, running_job.id, status=RUNNING)
-    set_job_status(paths.database, done_job.id, status=DONE)
+    mark_job_done(
+        paths.database,
+        done_job.id,
+        result={"outcome": "created", "document_id": "document-1"},
+    )
     set_job_status(paths.database, failed_job.id, status=FAILED, error="boom")
 
     result = runner.invoke(app, ["--data-dir", str(data_dir), "jobs", "list"])
@@ -210,6 +252,8 @@ def test_jobs_list_shows_all_job_statuses(tmp_path: Path) -> None:
     assert "running" in result.stdout
     assert done_job.id in result.stdout
     assert "done" in result.stdout
+    assert "outcome=created" in result.stdout
+    assert "document_id=document-1" in result.stdout
     assert failed_job.id in result.stdout
     assert "failed" in result.stdout
     assert "failed_at=" in result.stdout

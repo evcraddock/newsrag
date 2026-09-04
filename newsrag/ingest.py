@@ -14,7 +14,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
-from urllib.parse import unquote, urlparse
 
 import httpx
 import lancedb  # type: ignore[import-untyped]
@@ -33,6 +32,13 @@ from newsrag.embeddings import (
     EmbeddingMetadata,
     EmbeddingProvider,
     build_embedding_provider,
+)
+from newsrag.ingestion_identity import (
+    OUTCOME_CREATED,
+    OUTCOME_DUPLICATE_IGNORED,
+    find_document_for_artifact,
+    find_published_duplicate,
+    register_acquired_artifact,
 )
 from newsrag.jobs import Job, create_job
 from newsrag.passages import build_passage_rows
@@ -61,7 +67,6 @@ from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
-    SourceIdentity,
     artifact_id_for_hash,
     build_source_identity,
     source_unit_id_for_ordinal,
@@ -226,11 +231,15 @@ class HttpxPdfDownloader:
             raise IngestError(f"URL did not return a PDF-like response: {url}")
 
         content_hash = _hash_bytes(content)
-        filename = _download_filename(response.url)
         destination_dir.mkdir(parents=True, exist_ok=True)
-        destination_path = destination_dir / f"{content_hash}-{filename}"
-        if not destination_path.exists():
-            destination_path.write_bytes(content)
+        destination_path = destination_dir / f"{content_hash}.pdf"
+        if not destination_path.exists() or _hash_file(destination_path) != content_hash:
+            temporary_path = destination_path.with_name(f".{content_hash}-{uuid.uuid4().hex}.tmp")
+            try:
+                temporary_path.write_bytes(content)
+                temporary_path.replace(destination_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
 
         return DownloadedPdf(
             path=destination_path,
@@ -404,7 +413,7 @@ class SourceProcessingPipeline:
         self.vector_store = vector_store
         self.passage_vector_store = passage_vector_store
 
-    def process(self, artifact: PreparedSourceArtifact, *, job_id: str) -> None:
+    def process(self, artifact: PreparedSourceArtifact, *, job_id: str) -> str:
         with _ingest_stage(job_id, "adapter_extraction", artifact.source_path):
             adapter_result = self._extract_source_units(artifact)
         LOGGER.info(
@@ -435,10 +444,6 @@ class SourceProcessingPipeline:
 
         document_id = f"document-{uuid.uuid4().hex[:8]}"
         artifact_id = artifact_id_for_hash(artifact.content_hash)
-        source_identity = build_source_identity(
-            source_path=artifact.source_path,
-            source_url=artifact.source_url,
-        )
         document_metadata = _build_document_metadata(
             artifact.metadata,
             artifact.source_path,
@@ -474,12 +479,7 @@ class SourceProcessingPipeline:
             _publish_document_bundle(
                 self.storage_paths.database,
                 document_id=document_id,
-                source_identity=source_identity,
                 artifact_id=artifact_id,
-                artifact_byte_size=artifact.artifact_path.stat().st_size,
-                artifact_stored_path=artifact.artifact_path,
-                artifact_acquired_at=artifact.acquired_at,
-                artifact_media_type=adapter_result.media_type,
                 source_path=artifact.source_path,
                 source_url=artifact.source_url,
                 title=_resolve_document_title(artifact.metadata, artifact.source_path),
@@ -507,6 +507,7 @@ class SourceProcessingPipeline:
             len(chunk_rows),
             len(passage_rows),
         )
+        return document_id
 
     def _extract_source_units(self, artifact: PreparedSourceArtifact) -> AdapterResult:
         adapter_input = AdapterInput(
@@ -555,10 +556,10 @@ class IngestionPipeline:
             or LanceDbPassageVectorStore(storage_paths.lancedb),
         )
 
-    async def handle_job(self, job: Job) -> None:
-        await asyncio.to_thread(self.process_job, job)
+    async def handle_job(self, job: Job) -> dict[str, object]:
+        return await asyncio.to_thread(self.process_job, job)
 
-    def process_job(self, job: Job) -> None:
+    def process_job(self, job: Job) -> dict[str, object]:
         source_path = _payload_path(job.payload)
         metadata = _payload_metadata(job.payload)
         source_url = _metadata_source_url(metadata)
@@ -566,41 +567,81 @@ class IngestionPipeline:
         try:
             with _ingest_stage(job.id, "artifact_preparation", source_path):
                 source_hash = _hash_file(source_path)
-                existing_document = get_document_by_source_hash(
-                    self.storage_paths.database, source_hash
+                duplicate = find_published_duplicate(
+                    self.storage_paths.database,
+                    source_hash,
                 )
-                if existing_document is not None:
-                    LOGGER.info(
-                        "ingest_duplicate_skipped job_id=%s source_path=%r document_id=%s",
-                        job.id,
-                        str(source_path),
-                        existing_document.id,
-                    )
-                    return
+                if duplicate is not None:
+                    return self._completed_identity_result(job, duplicate.result())
 
                 source_copy_path = _copy_source_pdf(
                     self.storage_paths,
                     source_path,
                     source_hash,
                 )
-            self.processor.process(
-                PreparedSourceArtifact(
-                    source_path=source_path,
-                    artifact_path=source_copy_path,
+                decision = register_acquired_artifact(
+                    self.storage_paths.database,
+                    source_identity=build_source_identity(
+                        source_path=source_path,
+                        source_url=source_url,
+                    ),
                     content_hash=source_hash,
                     media_type=PDF_MEDIA_TYPE,
-                    source_url=source_url,
+                    byte_size=source_copy_path.stat().st_size,
+                    stored_path=source_copy_path,
                     acquired_at=_metadata_retrieved_at(metadata) or _current_timestamp(),
-                    work_dir=self.storage_paths.ocr_pdfs,
-                    metadata=metadata,
-                    adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
-                ),
-                job_id=job.id,
-            )
+                )
+                if decision.action == "complete":
+                    return self._completed_identity_result(job, decision.result())
+
+            try:
+                document_id = self.processor.process(
+                    PreparedSourceArtifact(
+                        source_path=decision.document_source_path,
+                        artifact_path=decision.artifact_path,
+                        content_hash=source_hash,
+                        media_type=PDF_MEDIA_TYPE,
+                        source_url=decision.document_source_url,
+                        acquired_at=decision.acquired_at,
+                        work_dir=self.storage_paths.ocr_pdfs,
+                        metadata=metadata,
+                        adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
+                    ),
+                    job_id=job.id,
+                )
+            except sqlite3.IntegrityError as exc:
+                published_document_id = find_document_for_artifact(
+                    self.storage_paths.database,
+                    decision.artifact_id,
+                )
+                if "documents.artifact_id" in str(exc) and published_document_id is not None:
+                    return self._completed_identity_result(
+                        job,
+                        decision.result(
+                            outcome=OUTCOME_DUPLICATE_IGNORED,
+                            document_id=published_document_id,
+                        ),
+                    )
+                raise
+            return decision.result(outcome=OUTCOME_CREATED, document_id=document_id)
         except IngestError:
             raise
         except Exception as exc:
             raise IngestError(f"Failed ingesting {source_path}: {exc}") from exc
+
+    def _completed_identity_result(
+        self,
+        job: Job,
+        result: dict[str, object],
+    ) -> dict[str, object]:
+        LOGGER.info(
+            "ingest_identity_decided job_id=%s outcome=%s artifact_id=%s document_id=%s",
+            job.id,
+            result["outcome"],
+            result["artifact_id"],
+            result.get("document_id", "-"),
+        )
+        return result
 
 
 def enqueue_ingest_jobs(
@@ -675,7 +716,7 @@ def build_ingest_handler(
     embedding_provider: EmbeddingProvider | None = None,
     vector_store: VectorStore | None = None,
     passage_vector_store: PassageVectorStore | None = None,
-) -> Callable[[Job], Awaitable[None]]:
+) -> Callable[[Job], Awaitable[dict[str, object]]]:
     """Build an async handler for local-PDF ingest jobs."""
 
     pipeline = IngestionPipeline(
@@ -988,20 +1029,23 @@ def _looks_like_pdf(content_type: str | None, content: bytes) -> bool:
     return "application/pdf" in normalized_content_type or content.startswith(b"%PDF-")
 
 
-def _download_filename(final_url: httpx.URL) -> str:
-    parsed_path = urlparse(str(final_url)).path
-    candidate_name = Path(unquote(parsed_path)).name or "downloaded.pdf"
-    if not candidate_name.lower().endswith(".pdf"):
-        return f"{candidate_name}.pdf"
-    return candidate_name
-
-
 def _copy_source_pdf(storage_paths: StoragePaths, source_path: Path, source_hash: str) -> Path:
-    destination = storage_paths.source_pdfs / f"{source_hash}-{source_path.name}"
+    destination = storage_paths.source_pdfs / f"{source_hash}.pdf"
     if source_path.resolve() == destination.resolve():
-        return source_path
+        return destination
+    if destination.exists():
+        if _hash_file(destination) != source_hash:
+            raise IngestError(f"Stored artifact failed integrity check: {destination}")
+        return destination
 
-    shutil.copy2(source_path, destination)
+    temporary_path = destination.with_name(f".{source_hash}-{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(source_path, temporary_path)
+        if _hash_file(temporary_path) != source_hash:
+            raise IngestError(f"Source changed while acquiring artifact: {source_path}")
+        temporary_path.replace(destination)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return destination
 
 
@@ -1196,12 +1240,7 @@ def _publish_document_bundle(
     database_path: Path,
     *,
     document_id: str,
-    source_identity: SourceIdentity,
     artifact_id: str,
-    artifact_byte_size: int,
-    artifact_stored_path: Path,
-    artifact_acquired_at: str,
-    artifact_media_type: str,
     source_path: Path,
     source_url: str | None,
     title: str,
@@ -1229,48 +1268,6 @@ def _publish_document_bundle(
     ) as connection:
         connection.execute(
             """
-            INSERT OR IGNORE INTO sources(
-                id,
-                kind,
-                submitted_reference,
-                normalized_reference,
-                resolved_reference
-            )
-            VALUES(?, ?, ?, ?, ?)
-            """,
-            (
-                source_identity.id,
-                source_identity.kind,
-                source_identity.submitted_reference,
-                source_identity.normalized_reference,
-                source_identity.resolved_reference,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO source_artifacts(
-                id,
-                source_id,
-                media_type,
-                byte_size,
-                content_hash,
-                stored_path,
-                acquired_at
-            )
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact_id,
-                source_identity.id,
-                artifact_media_type,
-                artifact_byte_size,
-                source_hash,
-                str(artifact_stored_path),
-                artifact_acquired_at,
-            ),
-        )
-        connection.execute(
-            """
             INSERT INTO documents(
                 id,
                 source_path,
@@ -1293,6 +1290,10 @@ def _publish_document_bundle(
                 metadata_json,
                 artifact_id,
             ),
+        )
+        connection.execute(
+            "UPDATE source_artifacts SET state = 'published' WHERE id = ?",
+            (artifact_id,),
         )
         connection.executemany(
             """
@@ -1396,8 +1397,9 @@ def _publication_transaction(
     vector_store: VectorStore,
     passage_vector_store: PassageVectorStore,
 ) -> Iterator[sqlite3.Connection]:
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, timeout=30)
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("BEGIN IMMEDIATE")
     try:
         yield connection
         connection.commit()
