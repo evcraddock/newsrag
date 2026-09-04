@@ -116,6 +116,8 @@ make dev-status
 make dev-stop
 ```
 
+`make dev-logs` streams daemon startup, job lifecycle, ingestion stage, completion, and failure messages. Set `NEWSRAG_LOG_LEVEL` in `.env` to `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; the default is `INFO`.
+
 ### Run verification
 
 ```bash

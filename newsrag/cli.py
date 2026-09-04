@@ -237,9 +237,15 @@ def daemon_run(
 
     from newsrag.daemon import DaemonConfig, run_daemon
     from newsrag.embeddings import EmbeddingError
+    from newsrag.logging_config import LoggingConfigError, configure_logging
 
     settings, _ = _resolve_runtime_settings(ctx)
-    typer.echo(f"NewsRAG daemon running for {settings.data_dir}")
+    try:
+        configure_logging()
+    except LoggingConfigError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
     try:
         asyncio.run(
             run_daemon(

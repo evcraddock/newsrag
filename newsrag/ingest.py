@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 import uuid
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
@@ -88,6 +90,7 @@ DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 VECTOR_TABLE_NAME = "chunk_embeddings"
+LOGGER = logging.getLogger(__name__)
 
 
 class IngestError(Exception):
@@ -401,14 +404,34 @@ class SourceProcessingPipeline:
         self.vector_store = vector_store
         self.passage_vector_store = passage_vector_store
 
-    def process(self, artifact: PreparedSourceArtifact) -> None:
-        adapter_result = self._extract_source_units(artifact)
-        chunks = self.chunker.chunk_units(adapter_result.units)
-        chunk_embeddings = self.embedding_provider.embed_chunks([chunk.text for chunk in chunks])
-        if len(chunk_embeddings) != len(chunks):
-            raise IngestError(
-                f"Embedded {len(chunk_embeddings)} chunks for {len(chunks)} chunk drafts"
+    def process(self, artifact: PreparedSourceArtifact, *, job_id: str) -> None:
+        with _ingest_stage(job_id, "adapter_extraction", artifact.source_path):
+            adapter_result = self._extract_source_units(artifact)
+        LOGGER.info(
+            "ingest_units_ready job_id=%s source_path=%r units=%d extractor=%s",
+            job_id,
+            str(artifact.source_path),
+            len(adapter_result.units),
+            adapter_result.extractor.name,
+        )
+
+        with _ingest_stage(job_id, "chunking", artifact.source_path):
+            chunks = self.chunker.chunk_units(adapter_result.units)
+        LOGGER.info(
+            "ingest_chunks_ready job_id=%s source_path=%r chunks=%d",
+            job_id,
+            str(artifact.source_path),
+            len(chunks),
+        )
+
+        with _ingest_stage(job_id, "chunk_embeddings", artifact.source_path):
+            chunk_embeddings = self.embedding_provider.embed_chunks(
+                [chunk.text for chunk in chunks]
             )
+            if len(chunk_embeddings) != len(chunks):
+                raise IngestError(
+                    f"Embedded {len(chunk_embeddings)} chunks for {len(chunks)} chunk drafts"
+                )
 
         document_id = f"document-{uuid.uuid4().hex[:8]}"
         artifact_id = artifact_id_for_hash(artifact.content_hash)
@@ -433,43 +456,56 @@ class SourceProcessingPipeline:
             source_unit_ids=source_unit_ids,
         )
         passage_rows = _build_passage_rows_from_chunks(chunk_rows)
-        passage_embeddings = self.embedding_provider.embed_chunks(
-            [passage_row[8] for passage_row in passage_rows]
-        )
-        if len(passage_embeddings) != len(passage_rows):
-            raise IngestError(
-                f"Embedded {len(passage_embeddings)} passages for {len(passage_rows)} passage rows"
+        with _ingest_stage(job_id, "passage_embeddings", artifact.source_path):
+            passage_embeddings = self.embedding_provider.embed_chunks(
+                [passage_row[8] for passage_row in passage_rows]
             )
+            if len(passage_embeddings) != len(passage_rows):
+                raise IngestError(
+                    f"Embedded {len(passage_embeddings)} passages for "
+                    f"{len(passage_rows)} passage rows"
+                )
         passage_vector_rows = _build_passage_vector_rows(
             passage_rows,
             passage_embeddings,
         )
 
-        _publish_document_bundle(
-            self.storage_paths.database,
-            document_id=document_id,
-            source_identity=source_identity,
-            artifact_id=artifact_id,
-            artifact_byte_size=artifact.artifact_path.stat().st_size,
-            artifact_stored_path=artifact.artifact_path,
-            artifact_acquired_at=artifact.acquired_at,
-            artifact_media_type=adapter_result.media_type,
-            source_path=artifact.source_path,
-            source_url=artifact.source_url,
-            title=_resolve_document_title(artifact.metadata, artifact.source_path),
-            source_hash=artifact.content_hash,
-            normalized_path=adapter_result.derived_artifact_path,
-            metadata=document_metadata,
-            source_units=source_unit_rows,
-            pages=page_rows,
-            chunks=chunk_rows,
-            chunk_embeddings=chunk_embeddings,
-            passages=passage_rows,
-            passage_embeddings=passage_embeddings,
-            chunk_vectors=vector_rows,
-            passage_vectors=passage_vector_rows,
-            vector_store=self.vector_store,
-            passage_vector_store=self.passage_vector_store,
+        with _ingest_stage(job_id, "publication", artifact.source_path):
+            _publish_document_bundle(
+                self.storage_paths.database,
+                document_id=document_id,
+                source_identity=source_identity,
+                artifact_id=artifact_id,
+                artifact_byte_size=artifact.artifact_path.stat().st_size,
+                artifact_stored_path=artifact.artifact_path,
+                artifact_acquired_at=artifact.acquired_at,
+                artifact_media_type=adapter_result.media_type,
+                source_path=artifact.source_path,
+                source_url=artifact.source_url,
+                title=_resolve_document_title(artifact.metadata, artifact.source_path),
+                source_hash=artifact.content_hash,
+                normalized_path=adapter_result.derived_artifact_path,
+                metadata=document_metadata,
+                source_units=source_unit_rows,
+                pages=page_rows,
+                chunks=chunk_rows,
+                chunk_embeddings=chunk_embeddings,
+                passages=passage_rows,
+                passage_embeddings=passage_embeddings,
+                chunk_vectors=vector_rows,
+                passage_vectors=passage_vector_rows,
+                vector_store=self.vector_store,
+                passage_vector_store=self.passage_vector_store,
+            )
+        LOGGER.info(
+            "ingest_published job_id=%s source_path=%r document_id=%s pages=%d chunks=%d "
+            "passages=%d",
+            job_id,
+            str(artifact.source_path),
+            document_id,
+            len(page_rows),
+            len(chunk_rows),
+            len(passage_rows),
         )
 
     def _extract_source_units(self, artifact: PreparedSourceArtifact) -> AdapterResult:
@@ -528,14 +564,25 @@ class IngestionPipeline:
         source_url = _metadata_source_url(metadata)
 
         try:
-            source_hash = _hash_file(source_path)
-            existing_document = get_document_by_source_hash(
-                self.storage_paths.database, source_hash
-            )
-            if existing_document is not None:
-                return
+            with _ingest_stage(job.id, "artifact_preparation", source_path):
+                source_hash = _hash_file(source_path)
+                existing_document = get_document_by_source_hash(
+                    self.storage_paths.database, source_hash
+                )
+                if existing_document is not None:
+                    LOGGER.info(
+                        "ingest_duplicate_skipped job_id=%s source_path=%r document_id=%s",
+                        job.id,
+                        str(source_path),
+                        existing_document.id,
+                    )
+                    return
 
-            source_copy_path = _copy_source_pdf(self.storage_paths, source_path, source_hash)
+                source_copy_path = _copy_source_pdf(
+                    self.storage_paths,
+                    source_path,
+                    source_hash,
+                )
             self.processor.process(
                 PreparedSourceArtifact(
                     source_path=source_path,
@@ -547,7 +594,8 @@ class IngestionPipeline:
                     work_dir=self.storage_paths.ocr_pdfs,
                     metadata=metadata,
                     adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
-                )
+                ),
+                job_id=job.id,
             )
         except IngestError:
             raise
@@ -849,6 +897,35 @@ def _metadata_retrieved_at(metadata: dict[str, Any]) -> str | None:
     if isinstance(retrieved_at, str) and retrieved_at.strip():
         return retrieved_at.strip()
     return None
+
+
+@contextmanager
+def _ingest_stage(job_id: str, stage: str, source_path: Path) -> Iterator[None]:
+    started_at = perf_counter()
+    LOGGER.info(
+        "ingest_stage_started job_id=%s stage=%s source_path=%r",
+        job_id,
+        stage,
+        str(source_path),
+    )
+    try:
+        yield
+    except Exception:
+        LOGGER.error(
+            "ingest_stage_failed job_id=%s stage=%s source_path=%r elapsed_ms=%d",
+            job_id,
+            stage,
+            str(source_path),
+            round((perf_counter() - started_at) * 1000),
+        )
+        raise
+    LOGGER.info(
+        "ingest_stage_completed job_id=%s stage=%s source_path=%r elapsed_ms=%d",
+        job_id,
+        stage,
+        str(source_path),
+        round((perf_counter() - started_at) * 1000),
+    )
 
 
 def _validate_adapter_result(result: AdapterResult, *, adapter: SourceAdapter) -> None:
