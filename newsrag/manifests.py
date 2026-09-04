@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
-from newsrag.ingest import IngestError
+from newsrag.acquisition import AcquisitionError, safe_url_reference, validate_url_submission
+from newsrag.ingest import IngestError, normalize_source_type_hint
+from newsrag.sources import normalize_url_reference
 
 ALLOWED_DOCUMENT_FIELDS = {
-    "url",
+    "source",
+    "type",
     "title",
     "meeting_date",
     "body",
@@ -22,7 +27,9 @@ ALLOWED_DOCUMENT_FIELDS = {
 class ManifestDocument:
     """One validated document entry from a YAML manifest."""
 
-    url: str
+    source: str
+    source_type: str | None
+    is_url: bool
     metadata: dict[str, str]
 
 
@@ -67,10 +74,17 @@ def load_manifest(path: Path) -> Manifest:
     if not raw_documents:
         raise ManifestError("Manifest field 'documents' must not be empty")
 
-    seen_urls: set[str] = set()
+    seen_sources: set[str] = set()
     documents: list[ManifestDocument] = []
     for index, raw_document in enumerate(raw_documents, start=1):
-        documents.append(_validate_document(raw_document, index=index, seen_urls=seen_urls))
+        documents.append(
+            _validate_document(
+                raw_document,
+                index=index,
+                manifest_directory=resolved_path.parent,
+                seen_sources=seen_sources,
+            )
+        )
 
     return Manifest(documents=tuple(documents))
 
@@ -79,7 +93,8 @@ def _validate_document(
     raw_document: object,
     *,
     index: int,
-    seen_urls: set[str],
+    manifest_directory: Path,
+    seen_sources: set[str],
 ) -> ManifestDocument:
     if not isinstance(raw_document, dict):
         raise ManifestError(f"Manifest document #{index} must be a mapping")
@@ -90,13 +105,27 @@ def _validate_document(
             f"Manifest document #{index} has unsupported fields: " + ", ".join(sorted(extra_fields))
         )
 
-    raw_url = raw_document.get("url")
-    if not isinstance(raw_url, str) or not raw_url.strip():
-        raise ManifestError(f"Manifest document #{index} is missing a non-empty 'url'")
-    url = raw_url.strip()
-    if url in seen_urls:
-        raise ManifestError(f"Manifest contains duplicate URL: {url}")
-    seen_urls.add(url)
+    raw_source = raw_document.get("source")
+    if not isinstance(raw_source, str) or not raw_source.strip():
+        raise ManifestError(f"Manifest document #{index} is missing a non-empty 'source'")
+    source = raw_source.strip()
+    is_url, identity = _manifest_source_identity(
+        source,
+        index=index,
+        manifest_directory=manifest_directory,
+    )
+    if identity in seen_sources:
+        display_source = safe_url_reference(source) if is_url else source
+        raise ManifestError(f"Manifest contains duplicate source: {display_source}")
+    seen_sources.add(identity)
+
+    raw_source_type = raw_document.get("type")
+    if raw_source_type is not None and not isinstance(raw_source_type, str):
+        raise ManifestError(f"Manifest document #{index} field 'type' must be a string")
+    try:
+        source_type = normalize_source_type_hint(raw_source_type)
+    except IngestError as exc:
+        raise ManifestError(f"Manifest document #{index}: {exc}") from exc
 
     metadata: dict[str, str] = {}
     for key in ("title", "body", "document_type", "jurisdiction"):
@@ -128,4 +157,41 @@ def _validate_document(
 
         metadata["meeting_date"] = normalized_meeting_date
 
-    return ManifestDocument(url=url, metadata=metadata)
+    return ManifestDocument(
+        source=source,
+        source_type=source_type,
+        is_url=is_url,
+        metadata=metadata,
+    )
+
+
+def _manifest_source_identity(
+    source: str,
+    *,
+    index: int,
+    manifest_directory: Path,
+) -> tuple[bool, str]:
+    try:
+        parsed = urlsplit(source)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ManifestError(f"Manifest document #{index} has a malformed source URL") from exc
+
+    if parsed.scheme.lower() in {"http", "https"}:
+        try:
+            validate_url_submission(source)
+        except AcquisitionError as exc:
+            raise ManifestError(f"Manifest document #{index}: {exc}") from exc
+        if parsed.hostname is None:
+            raise ManifestError(f"Manifest document #{index} URL must include a host")
+        return True, f"url:{normalize_url_reference(source)}"
+
+    if parsed.scheme:
+        raise ManifestError(
+            f"Manifest document #{index} uses unsupported source scheme {parsed.scheme!r}"
+        )
+
+    local_path = Path(os.path.expanduser(source))
+    if not local_path.is_absolute():
+        local_path = manifest_directory / local_path
+    return False, f"path:{os.path.abspath(local_path)}"

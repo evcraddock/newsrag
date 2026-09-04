@@ -19,6 +19,7 @@ from newsrag.config import (
 
 if TYPE_CHECKING:
     from newsrag.discovery_browse import DiscoveryBrowseFilters
+    from newsrag.ingest import IngestEnqueueResult
     from newsrag.jobs import Job
     from newsrag.search import SearchFilters
 
@@ -265,28 +266,33 @@ def daemon_run(
 @app.command("ingest")
 def ingest_command(
     ctx: typer.Context,
-    path: Path,
-    title: str | None = typer.Option(None, help="Document title override for the ingested PDFs."),
-    body: str | None = typer.Option(None, help="Civic body metadata for the ingested PDFs."),
+    source: str,
+    title: str | None = typer.Option(None, help="Document title override for ingested sources."),
+    body: str | None = typer.Option(None, help="Civic body metadata for ingested sources."),
     document_type: str | None = typer.Option(
         None,
         "--document-type",
-        help="Document type metadata for the ingested PDFs.",
+        help="Document type metadata for ingested sources.",
     ),
     meeting_date: str | None = typer.Option(
         None,
         "--meeting-date",
-        help="Meeting date metadata for the ingested PDFs.",
+        help="Meeting date metadata for ingested sources.",
     ),
     jurisdiction: str | None = typer.Option(
         None,
-        help="Jurisdiction metadata for the ingested PDFs.",
+        help="Jurisdiction metadata for ingested sources.",
+    ),
+    source_type: str | None = typer.Option(
+        None,
+        "--type",
+        help="Explicit source type hint; currently supported: pdf.",
     ),
     pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
-    """Enqueue one local PDF or directory of PDFs for ingestion."""
+    """Enqueue one URL, local file, or local directory for ingestion."""
 
-    from newsrag.ingest import IngestError, enqueue_ingest_jobs, normalize_pdf_extractor_mode
+    from newsrag.ingest import IngestError, enqueue_ingest_source
     from newsrag.storage import initialize_storage
 
     settings, _ = _resolve_runtime_settings(ctx)
@@ -300,83 +306,29 @@ def ingest_command(
     )
 
     try:
-        extraction_mode = normalize_pdf_extractor_mode(pdf_extractor)
-        jobs = enqueue_ingest_jobs(
+        result = enqueue_ingest_source(
             database_path,
-            source_path=path,
+            source=source,
             metadata=metadata,
-            pdf_extractor=extraction_mode,
+            source_type=source_type,
+            pdf_extractor=pdf_extractor,
         )
     except IngestError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
-    typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
-    for job in jobs:
-        typer.echo(f"{job.id} {job.payload['path']}")
-
-
-@app.command("ingest-url")
-def ingest_url_command(
-    ctx: typer.Context,
-    url: str,
-    title: str | None = typer.Option(None, help="Document title override for the downloaded PDF."),
-    body: str | None = typer.Option(None, help="Civic body metadata for the downloaded PDF."),
-    document_type: str | None = typer.Option(
-        None,
-        "--document-type",
-        help="Document type metadata for the downloaded PDF.",
-    ),
-    meeting_date: str | None = typer.Option(
-        None,
-        "--meeting-date",
-        help="Meeting date metadata for the downloaded PDF.",
-    ),
-    jurisdiction: str | None = typer.Option(
-        None,
-        help="Jurisdiction metadata for the downloaded PDF.",
-    ),
-    pdf_extractor: str = PDF_EXTRACTOR_OPTION,
-) -> None:
-    """Enqueue one direct PDF URL for background acquisition and ingestion."""
-
-    from newsrag.acquisition import safe_url_reference
-    from newsrag.ingest import IngestError, enqueue_ingest_url_job, normalize_pdf_extractor_mode
-    from newsrag.storage import initialize_storage
-
-    settings, _ = _resolve_runtime_settings(ctx)
-    storage_paths = initialize_storage(settings.data_dir)
-    metadata = _build_document_metadata_options(
-        title=title,
-        body=body,
-        document_type=document_type,
-        meeting_date=meeting_date,
-        jurisdiction=jurisdiction,
-    )
-
-    try:
-        extraction_mode = normalize_pdf_extractor_mode(pdf_extractor)
-        job = enqueue_ingest_url_job(
-            storage_paths.database,
-            storage_paths=storage_paths,
-            url=url,
-            metadata=metadata,
-            pdf_extractor=extraction_mode,
-        )
-    except IngestError as exc:
-        typer.echo(str(exc))
-        raise typer.Exit(code=1) from exc
-
-    typer.echo("Enqueued 1 ingest job(s)")
-    typer.echo(f"{job.id} {safe_url_reference(str(job.payload['url']))}")
+    _echo_ingest_result(result)
 
 
 @app.command("ingest-manifest")
 def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
-    """Load a YAML manifest and enqueue one URL-ingest job per document."""
+    """Validate a YAML source manifest and atomically enqueue its jobs."""
 
-    from newsrag.acquisition import safe_url_reference
-    from newsrag.ingest import IngestError, enqueue_ingest_url_job
+    from newsrag.ingest import (
+        IngestError,
+        enqueue_prepared_ingest_batches,
+        prepare_ingest_source,
+    )
     from newsrag.manifests import ManifestError, load_manifest
     from newsrag.storage import initialize_storage
 
@@ -385,28 +337,24 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
 
     try:
         manifest = load_manifest(path)
-    except ManifestError as exc:
-        typer.echo(str(exc))
-        raise typer.Exit(code=1) from exc
-
-    jobs = []
-    try:
-        for document in manifest.documents:
-            jobs.append(
-                enqueue_ingest_url_job(
-                    storage_paths.database,
-                    storage_paths=storage_paths,
-                    url=document.url,
-                    metadata=document.metadata,
-                )
+        manifest_directory = path.expanduser().resolve().parent
+        batches = tuple(
+            prepare_ingest_source(
+                source=document.source,
+                metadata=document.metadata,
+                source_type=document.source_type,
+                origin="manifest",
+                base_dir=manifest_directory,
+                require_existing=not document.is_url,
             )
-    except IngestError as exc:
+            for document in manifest.documents
+        )
+        result = enqueue_prepared_ingest_batches(storage_paths.database, batches)
+    except (ManifestError, IngestError) as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
-    typer.echo(f"Enqueued {len(jobs)} ingest job(s)")
-    for job in jobs:
-        typer.echo(f"{job.id} {safe_url_reference(str(job.payload['url']))}")
+    _echo_ingest_result(result)
 
 
 @app.command("search")
@@ -1086,6 +1034,30 @@ def run() -> None:
     """Run the Typer application."""
 
     app()
+
+
+def _echo_ingest_result(result: IngestEnqueueResult) -> None:
+    from newsrag.acquisition import safe_url_reference
+
+    typer.echo(f"Enqueued {len(result.jobs)} ingest job(s)")
+    typer.echo(f"Queued by type: {_format_type_counts(result.queued_by_type)}")
+    typer.echo(f"Skipped by type: {_format_type_counts(result.skipped_by_type)}")
+    for job in result.jobs:
+        source_path = job.payload.get("path")
+        source_url = job.payload.get("url")
+        if isinstance(source_path, str):
+            reference = source_path
+        elif isinstance(source_url, str):
+            reference = safe_url_reference(source_url)
+        else:
+            reference = "unknown-source"
+        typer.echo(f"{job.id} {reference}")
+
+
+def _format_type_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "none"
+    return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
 
 
 def _format_job_line(job: Job) -> str:

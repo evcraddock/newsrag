@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -52,8 +53,7 @@ from newsrag.ingest import (
     PyMuPdfTextExtractor,
     build_ingest_handler,
     build_pdf_text_extractor,
-    enqueue_ingest_jobs,
-    enqueue_ingest_url_job,
+    enqueue_ingest_source,
     list_chunk_vectors,
     list_chunks,
     list_documents,
@@ -82,6 +82,11 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     (source_dir / "packet-b.PDF").write_bytes(b"%PDF-1.4\nB")
     (source_dir / "alias.pdf").symlink_to(source_dir / "packet-a.pdf")
     (source_dir / "notes.txt").write_text("ignore me", encoding="utf-8")
+    os.mkfifo(source_dir / "special.pdf")
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    (external_dir / "hidden.pdf").write_bytes(b"%PDF-1.4\nhidden")
+    (source_dir / "linked-directory").symlink_to(external_dir, target_is_directory=True)
 
     result = runner.invoke(
         app,
@@ -102,6 +107,8 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.stdout
     assert "Enqueued 2 ingest job(s)" in result.stdout
+    assert "Queued by type: pdf=2" in result.stdout
+    assert "Skipped by type: special=1, symlink=2, txt=1" in result.stdout
     assert len(jobs) == 2
     assert all(job.kind == INGEST_JOB_KIND for job in jobs)
     assert jobs[0].payload["metadata"]["body"] == "City Council"
@@ -134,7 +141,72 @@ def test_ingest_command_records_pdf_extractor_mode(tmp_path: Path) -> None:
     assert jobs[0].payload["pdf_extractor"] == PDF_EXTRACTOR_TABLE
 
 
-def test_ingest_url_command_enqueues_background_acquisition(tmp_path: Path) -> None:
+def test_source_type_hint_selects_pdf_without_bypassing_validation(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_file = tmp_path / "not-a-pdf.bin"
+    source_file.write_bytes(b"plain text")
+
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "pdf"],
+    )
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+    assert result.exit_code == 0, result.stdout
+    assert jobs[0].payload["source_type"] == "pdf"
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, jobs[0].id)
+    assert updated_job.status == FAILED
+    assert "invalid signature" in (updated_job.error or "")
+
+
+def test_ingest_rejects_unsupported_source_type_hint_before_enqueue(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_file = tmp_path / "packet.pdf"
+    source_file.write_bytes(b"%PDF-1.4\nmock")
+
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "html"],
+    )
+
+    paths = initialize_storage(data_dir)
+    assert result.exit_code == 1
+    assert "Unsupported source type 'html'" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_ingest_rejects_unsupported_source_scheme_before_enqueue(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "ingest", "ftp://example.gov/packet.pdf"],
+    )
+
+    paths = initialize_storage(data_dir)
+    assert result.exit_code == 1
+    assert "Unsupported source scheme 'ftp'" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_ingest_command_enqueues_url_for_background_acquisition(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     url = "https://example.gov/packet.pdf?token=secret"
 
@@ -143,7 +215,7 @@ def test_ingest_url_command_enqueues_background_acquisition(tmp_path: Path) -> N
         [
             "--data-dir",
             str(data_dir),
-            "ingest-url",
+            "ingest",
             url,
             "--body",
             "City Council",
@@ -178,7 +250,7 @@ def test_ingest_url_rejects_credentials_without_persisting_or_displaying_them(
         [
             "--data-dir",
             str(data_dir),
-            "ingest-url",
+            "ingest",
             "https://user:secret@example.gov/packet.pdf",
         ],
     )
@@ -190,12 +262,12 @@ def test_ingest_url_rejects_credentials_without_persisting_or_displaying_them(
     assert list_jobs(paths.database) == []
 
 
-def test_enqueue_ingest_url_job_does_not_fetch_before_daemon_processing(tmp_path: Path) -> None:
+def test_enqueue_ingest_url_does_not_fetch_before_daemon_processing(tmp_path: Path) -> None:
     paths = initialize_storage(tmp_path / ".newsrag")
     url = "https://example.gov/packet.pdf"
 
-    first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
-    second_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    first_job = enqueue_ingest_source(paths.database, source=url).jobs[0]
+    second_job = enqueue_ingest_source(paths.database, source=url).jobs[0]
 
     assert first_job.payload["url"] == url
     assert second_job.payload["url"] == url
@@ -213,7 +285,7 @@ def test_url_ingest_stores_source_url_and_acquisition_provenance(tmp_path: Path)
         resolved_url_by_url={url: resolved_url},
     )
 
-    enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    enqueue_ingest_source(paths.database, source=url)
 
     handler = build_ingest_handler(
         data_dir=data_dir,
@@ -264,14 +336,14 @@ def test_url_ingest_stores_source_url_and_acquisition_provenance(tmp_path: Path)
 def test_safe_url_acquisition_runs_inside_daemon(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
-    url = "https://example.gov/packet.pdf"
+    url = "https://example.gov/download"
     response = PipelineHttpResponse(
         status_code=200,
         headers={"content-type": "application/pdf"},
         chunks=(b"%PDF-1.4\nbackground",),
     )
     transport = PipelineHttpTransport(response=response)
-    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    job = enqueue_ingest_source(paths.database, source=url).jobs[0]
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
@@ -304,7 +376,7 @@ def test_ingest_url_reports_non_pdf_validation_failure_from_background_job(
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     url = "https://example.gov/not-a-pdf"
-    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    job = enqueue_ingest_source(paths.database, source=url).jobs[0]
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
@@ -328,11 +400,28 @@ def test_ingest_url_reports_non_pdf_validation_failure_from_background_job(
 
     updated_job = get_job(paths.database, job.id)
     assert updated_job.status == FAILED
-    assert "invalid signature" in (updated_job.error or "")
+    assert "Unsupported source type" in (updated_job.error or "")
     with sqlite3.connect(paths.database) as connection:
         assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM documents").fetchone() == (0,)
+        assert connection.execute("SELECT media_type FROM source_artifacts").fetchone() == (
+            "application/octet-stream",
+        )
+
+    hinted_job = enqueue_ingest_source(paths.database, source=url, source_type="pdf").jobs[0]
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+    assert get_job(paths.database, hinted_job.id).status == FAILED
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT media_type FROM source_artifacts").fetchone() == (
+            "application/pdf",
+        )
 
 
 def test_ingest_manifest_enqueues_one_job_per_document(tmp_path: Path) -> None:
@@ -341,12 +430,12 @@ def test_ingest_manifest_enqueues_one_job_per_document(tmp_path: Path) -> None:
     manifest_path.write_text(
         """
         documents:
-          - url: https://example.gov/packet-1.pdf
+          - source: https://example.gov/packet-1.pdf
             title: Packet One
             meeting_date: 2026-05-01
             body: City Council
             document_type: agenda_packet
-          - url: https://example.gov/packet-2.pdf
+          - source: https://example.gov/packet-2.pdf
             jurisdiction: Example City
         """.strip(),
         encoding="utf-8",
@@ -373,13 +462,93 @@ def test_ingest_manifest_enqueues_one_job_per_document(tmp_path: Path) -> None:
     assert list(paths.source_artifacts.iterdir()) == []
 
 
-def test_invalid_manifest_missing_url_fails_without_enqueuing(tmp_path: Path) -> None:
+def test_manifest_accepts_url_and_relative_local_path_with_type_hint(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    local_pdf = manifest_dir / "packet.pdf"
+    local_pdf.write_bytes(b"%PDF-1.4\nlocal")
+    manifest_path = manifest_dir / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - source: https://example.gov/remote.pdf
+            type: pdf
+          - source: ./packet.pdf
+            type: pdf
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+    assert result.exit_code == 0, result.stdout
+    assert "Queued by type: pdf=2" in result.stdout
+    assert len(jobs) == 2
+    payloads_by_reference = {
+        str(job.payload.get("url") or job.payload.get("path")): job.payload for job in jobs
+    }
+    assert "https://example.gov/remote.pdf" in payloads_by_reference
+    assert str(local_pdf) in payloads_by_reference
+    assert all(job.payload["source_type"] == "pdf" for job in jobs)
+
+
+def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     manifest_path = tmp_path / "sources.yaml"
     manifest_path.write_text(
         """
         documents:
-          - title: Missing URL
+          - source: https://example.gov/packet.pdf
+          - source: https://example.gov/page.html
+            type: html
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+
+    paths = initialize_storage(data_dir)
+    assert result.exit_code == 1
+    assert "Unsupported source type 'html'" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_manifest_missing_local_path_fails_before_any_jobs_are_created(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - source: https://example.gov/packet.pdf
+          - source: ./missing.pdf
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
+    )
+
+    paths = initialize_storage(data_dir)
+    assert result.exit_code == 1
+    assert "Local source path does not exist" in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_invalid_manifest_missing_source_fails_without_enqueuing(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    manifest_path = tmp_path / "sources.yaml"
+    manifest_path.write_text(
+        """
+        documents:
+          - title: Missing Source
         """.strip(),
         encoding="utf-8",
     )
@@ -390,7 +559,7 @@ def test_invalid_manifest_missing_url_fails_without_enqueuing(tmp_path: Path) ->
     paths = initialize_storage(data_dir)
 
     assert result.exit_code == 1
-    assert "missing a non-empty 'url'" in result.stdout
+    assert "missing a non-empty 'source'" in result.stdout
     assert list_jobs(paths.database) == []
 
 
@@ -400,7 +569,7 @@ def test_invalid_manifest_invalid_meeting_date_fails_without_enqueuing(tmp_path:
     manifest_path.write_text(
         """
         documents:
-          - url: https://example.gov/packet.pdf
+          - source: https://example.gov/packet.pdf
             meeting_date: 05-01-2026
         """.strip(),
         encoding="utf-8",
@@ -416,14 +585,14 @@ def test_invalid_manifest_invalid_meeting_date_fails_without_enqueuing(tmp_path:
     assert list_jobs(paths.database) == []
 
 
-def test_invalid_manifest_duplicate_urls_fail_without_partial_work(tmp_path: Path) -> None:
+def test_invalid_manifest_duplicate_sources_fail_without_partial_work(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     manifest_path = tmp_path / "sources.yaml"
     manifest_path.write_text(
         """
         documents:
-          - url: https://example.gov/packet.pdf
-          - url: https://example.gov/packet.pdf
+          - source: https://example.gov/packet.pdf?token=secret
+          - source: https://example.gov/packet.pdf?token=secret
         """.strip(),
         encoding="utf-8",
     )
@@ -434,7 +603,8 @@ def test_invalid_manifest_duplicate_urls_fail_without_partial_work(tmp_path: Pat
     paths = initialize_storage(data_dir)
 
     assert result.exit_code == 1
-    assert "duplicate URL" in result.stdout
+    assert "duplicate source" in result.stdout
+    assert "token=secret" not in result.stdout
     assert list_jobs(paths.database) == []
 
 
@@ -443,7 +613,7 @@ def test_invalid_manifest_unsupported_fields_fail(tmp_path: Path) -> None:
     manifest_path.write_text(
         """
         documents:
-          - url: https://example.gov/packet.pdf
+          - source: https://example.gov/packet.pdf
             committee: Finance
         """.strip(),
         encoding="utf-8",
@@ -459,7 +629,7 @@ def test_manifest_metadata_is_preserved_on_created_documents(tmp_path: Path) -> 
     manifest_path.write_text(
         """
         documents:
-          - url: https://example.gov/packet.pdf
+          - source: https://example.gov/packet.pdf
             title: Manifest Packet
             meeting_date: 2026-05-01
             body: City Council
@@ -511,7 +681,7 @@ def test_ingest_url_acquisition_failures_are_recorded_by_background_job(
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     url = "https://example.gov/packet.pdf"
-    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    job = enqueue_ingest_source(paths.database, source=url).jobs[0]
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
@@ -784,7 +954,7 @@ def test_explicit_symlink_is_acquired_in_background_with_both_paths(
     submitted_path = tmp_path / "submitted.pdf"
     submitted_path.symlink_to(target_path)
     paths = initialize_storage(data_dir)
-    jobs = enqueue_ingest_jobs(paths.database, source_path=submitted_path)
+    jobs = list(enqueue_ingest_source(paths.database, source=str(submitted_path)).jobs)
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
@@ -1025,7 +1195,7 @@ def test_same_bytes_from_different_urls_ignore_the_second_source(tmp_path: Path)
     second_url = "https://two.example.gov/renamed.pdf"
     content = b"%PDF-1.4\nidentical-url"
     acquirer = FakeUrlAcquirer(content_by_url={first_url: content, second_url: content})
-    first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=first_url)
+    first_job = enqueue_ingest_source(paths.database, source=first_url).jobs[0]
     adapter = FakeSourceAdapter()
     handler = build_ingest_handler(
         data_dir=data_dir,
@@ -1042,7 +1212,7 @@ def test_same_bytes_from_different_urls_ignore_the_second_source(tmp_path: Path)
     )
 
     asyncio.run(runner_instance.run_cycle())
-    second_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=second_url)
+    second_job = enqueue_ingest_source(paths.database, source=second_url).jobs[0]
     asyncio.run(runner_instance.run_cycle())
 
     with sqlite3.connect(paths.database) as connection:
@@ -1333,7 +1503,7 @@ def test_missing_local_source_failure_is_recorded_by_background_job(
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     missing_path = tmp_path / "missing.pdf"
-    jobs = enqueue_ingest_jobs(paths.database, source_path=missing_path)
+    jobs = list(enqueue_ingest_source(paths.database, source=str(missing_path)).jobs)
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),

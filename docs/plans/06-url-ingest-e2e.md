@@ -6,7 +6,7 @@ Allow users to ingest a direct PDF URL into the selected corpus with supplied ci
 
 ## Requirements
 
-- Add `newsrag ingest-url <url>` with metadata options such as title, meeting date, body, document type, and jurisdiction.
+- Add direct URL ingestion with metadata options such as title, meeting date, body, document type, and jurisdiction; this workflow now uses the unified `newsrag ingest <source>` interface.
 - Download direct PDF URLs into the data directory while preserving source URL and retrieval timestamp.
 - Hash downloaded content and avoid duplicate indexing of unchanged files.
 - Reuse the same background processing path as local PDF ingestion.
@@ -14,7 +14,7 @@ Allow users to ingest a direct PDF URL into the selected corpus with supplied ci
 
 ## Acceptance criteria
 
-- [ ] `newsrag ingest-url` enqueues a processing job for a direct PDF URL.
+- [ ] The ingestion command enqueues a processing job for a direct PDF URL.
 - [ ] Download behavior is unit-tested with mocked HTTP responses.
 - [ ] Source URL and retrieval timestamp are stored with the document.
 - [ ] Download failures create failed jobs or clear CLI errors with actionable messages.
