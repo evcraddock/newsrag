@@ -17,7 +17,7 @@ newsrag doctor
 newsrag daemon run
 newsrag watch add ./pdfs --body "City Council" --document-type agenda_packet
 newsrag ingest ./pdfs --body "City Council" --document-type agenda_packet
-newsrag ingest-url https://example.gov/packet.pdf --meeting-date 2026-04-12
+newsrag ingest https://example.gov/packet.pdf --meeting-date 2026-04-12
 newsrag ingest-manifest sources.yaml
 newsrag search "stormwater downtown" --body "Planning Commission" --since 2025-01-01
 newsrag packet "affordable housing funding" --out packets/housing.md
@@ -53,13 +53,14 @@ NewsRAG is organized around a small set of durable entities rather than a server
 
 ## Ingestion pipeline
 
-Ingestion registers documents and jobs quickly; processing happens in the daemon. Sources supported by the MVP are local PDFs/folders, direct PDF URLs, and YAML manifests. URL support is direct PDF download only. A manifest is the preferred way to provide civic metadata for multiple documents.
+Ingestion registers documents and jobs quickly; processing happens in the daemon. `newsrag ingest <source>` accepts one public HTTP(S) URL, local file, or local directory. A one-time directory scan recursively queues supported regular files, does not follow symlinks, and reports queued and skipped inputs by type. Watched folders remain a separate continuous-ingestion workflow. A manifest is the preferred way to provide civic metadata for multiple documents; every entry is validated before its jobs are created atomically, and relative local paths resolve from the manifest file's directory.
 
 Example manifest:
 
 ```yaml
 documents:
-  - url: https://example.gov/council/packet-2026-04-12.pdf
+  - source: https://example.gov/council/packet-2026-04-12.pdf
+    type: pdf
     title: City Council Packet
     meeting_date: 2026-04-12
     body: City Council
@@ -83,7 +84,7 @@ Each PDF is normalized through OCR, then text is extracted from the normalized P
 
 ## Source adapter contract
 
-A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, and any derived artifact used for extraction.
+A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, and any derived artifact used for extraction. The adapter registry selects a supported adapter from an optional `--type` hint, reported media type, conservative content signature, and filename extension, in that order. A hint selects an adapter but never bypasses that adapter's validation. PDF is the only currently registered source type.
 
 Each canonical source unit has a contiguous one-based ordinal, typed machine location, human-readable location label, normalized text, structure metadata, and extractor name/version. Adapters do not chunk, embed, index, publish documents, or modify source identity. Those stages belong to the shared ingestion pipeline.
 

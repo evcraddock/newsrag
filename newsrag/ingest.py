@@ -6,12 +6,14 @@ import logging
 import os
 import sqlite3
 import uuid
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import lancedb  # type: ignore[import-untyped]
 
@@ -29,9 +31,12 @@ from newsrag.adapters import (
     AdapterError,
     AdapterInput,
     AdapterResult,
+    AdapterSelectionError,
     CanonicalSourceUnit,
     ExtractorIdentity,
+    RegisteredSourceAdapter,
     SourceAdapter,
+    SourceAdapterRegistry,
 )
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import (
@@ -48,7 +53,7 @@ from newsrag.ingestion_identity import (
     find_stored_artifact_path,
     register_acquired_artifact,
 )
-from newsrag.jobs import Job, create_job
+from newsrag.jobs import Job, create_jobs
 from newsrag.passages import build_passage_rows
 from newsrag.pdf_adapter import (
     PDF_EXTRACTOR_AUTO,
@@ -77,6 +82,7 @@ from newsrag.sources import (
     PDF_MEDIA_TYPE,
     artifact_id_for_hash,
     build_source_identity,
+    normalize_url_reference,
     source_unit_id_for_ordinal,
     source_unit_id_for_page,
 )
@@ -102,11 +108,34 @@ INGEST_JOB_KIND = "ingest-file"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 VECTOR_TABLE_NAME = "chunk_embeddings"
+SOURCE_TYPE_PDF = "pdf"
+SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_PDF})
+_PDF_EXTENSIONS = (".pdf",)
+_PDF_SIGNATURES = (b"%PDF-",)
+_UNKNOWN_MEDIA_TYPE = "application/octet-stream"
 LOGGER = logging.getLogger(__name__)
 
 
 class IngestError(Exception):
-    """Raised when source acquisition or PDF ingestion cannot complete."""
+    """Raised when source acquisition or ingestion cannot complete."""
+
+
+@dataclass(frozen=True)
+class PreparedIngestBatch:
+    """Validated job payloads and scan reporting before durable enqueue."""
+
+    payloads: tuple[dict[str, Any], ...]
+    queued_by_type: dict[str, int]
+    skipped_by_type: dict[str, int]
+
+
+@dataclass(frozen=True)
+class IngestEnqueueResult:
+    """Durable jobs and grouped results for one ingestion request."""
+
+    jobs: tuple[Job, ...]
+    queued_by_type: dict[str, int]
+    skipped_by_type: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -367,9 +396,16 @@ class SourceProcessingPipeline:
         self.vector_store = vector_store
         self.passage_vector_store = passage_vector_store
 
-    def process(self, artifact: PreparedSourceArtifact, *, job_id: str) -> str:
+    def process(
+        self,
+        artifact: PreparedSourceArtifact,
+        *,
+        job_id: str,
+        adapter: SourceAdapter | None = None,
+    ) -> str:
+        resolved_adapter = adapter or self.adapter
         with _ingest_stage(job_id, "adapter_extraction", artifact.source_path):
-            adapter_result = self._extract_source_units(artifact)
+            adapter_result = self._extract_source_units(artifact, adapter=resolved_adapter)
         LOGGER.info(
             "ingest_units_ready job_id=%s source_path=%r units=%d extractor=%s",
             job_id,
@@ -434,6 +470,7 @@ class SourceProcessingPipeline:
                 self.storage_paths.database,
                 document_id=document_id,
                 artifact_id=artifact_id,
+                media_type=adapter_result.media_type,
                 source_path=artifact.source_path,
                 source_url=artifact.source_url,
                 title=_resolve_document_title(artifact.metadata, artifact.source_path),
@@ -463,7 +500,12 @@ class SourceProcessingPipeline:
         )
         return document_id
 
-    def _extract_source_units(self, artifact: PreparedSourceArtifact) -> AdapterResult:
+    def _extract_source_units(
+        self,
+        artifact: PreparedSourceArtifact,
+        *,
+        adapter: SourceAdapter,
+    ) -> AdapterResult:
         adapter_input = AdapterInput(
             artifact_path=artifact.artifact_path,
             content_hash=artifact.content_hash,
@@ -472,10 +514,10 @@ class SourceProcessingPipeline:
             options=artifact.adapter_options,
         )
         try:
-            result = self.adapter.extract(adapter_input)
+            result = adapter.extract(adapter_input)
         except AdapterError as exc:
             raise IngestError(f"Source adapter failed for {artifact.source_path}: {exc}") from exc
-        _validate_adapter_result(result, adapter=self.adapter)
+        _validate_adapter_result(result, adapter=adapter)
         return result
 
 
@@ -489,6 +531,7 @@ class IngestionPipeline:
         embedding_config: EmbeddingConfig,
         acquirer: SourceArtifactAcquirer | None = None,
         adapter: SourceAdapter | None = None,
+        adapter_registry: SourceAdapterRegistry | None = None,
         ocr_runner: OcrRunner | None = None,
         text_extractor: TextExtractor | None = None,
         chunker: Chunker | None = None,
@@ -501,6 +544,17 @@ class IngestionPipeline:
         resolved_adapter = adapter or PdfSourceAdapter(
             ocr_runner=ocr_runner or SubprocessOcrRunner(),
             text_extractor=text_extractor,
+        )
+        self.adapter_registry = adapter_registry or SourceAdapterRegistry(
+            (
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_PDF,
+                    media_type=PDF_MEDIA_TYPE,
+                    extensions=_PDF_EXTENSIONS,
+                    signatures=_PDF_SIGNATURES,
+                    adapter=resolved_adapter,
+                ),
+            )
         )
         self.processor = SourceProcessingPipeline(
             storage_paths=storage_paths,
@@ -536,6 +590,18 @@ class IngestionPipeline:
                 if duplicate is not None:
                     return self._completed_identity_result(job, duplicate.result())
 
+                selected_adapter: RegisteredSourceAdapter | None = None
+                selection_error: AdapterSelectionError | None = None
+                try:
+                    selected_adapter = self.adapter_registry.select(
+                        artifact_path=staged_artifact.staged_path,
+                        source_type_hint=_payload_source_type_hint(job.payload),
+                        reported_media_type=staged_artifact.reported_media_type,
+                        filename=_source_filename(staged_artifact.submitted_reference),
+                    )
+                except AdapterSelectionError as exc:
+                    selection_error = exc
+
                 stored_path = find_stored_artifact_path(
                     self.storage_paths.database,
                     staged_artifact.content_hash,
@@ -564,7 +630,11 @@ class IngestionPipeline:
                         resolved_reference=resolved_reference,
                     ),
                     content_hash=staged_artifact.content_hash,
-                    media_type=PDF_MEDIA_TYPE,
+                    media_type=(
+                        selected_adapter.media_type
+                        if selected_adapter is not None
+                        else _UNKNOWN_MEDIA_TYPE
+                    ),
                     byte_size=staged_artifact.byte_size,
                     stored_path=stored_path,
                     acquired_at=staged_artifact.acquired_at,
@@ -573,6 +643,12 @@ class IngestionPipeline:
                 )
                 if decision.action == "complete":
                     return self._completed_identity_result(job, decision.result())
+                if selection_error is not None:
+                    raise IngestError(
+                        f"Source adapter selection failed for {safe_reference}: {selection_error}"
+                    ) from selection_error
+                if selected_adapter is None:
+                    raise IngestError(f"Source adapter selection failed for {safe_reference}")
 
             document_metadata = dict(metadata)
             document_metadata["source_size_bytes"] = staged_artifact.byte_size
@@ -589,7 +665,7 @@ class IngestionPipeline:
                         source_path=decision.document_source_path,
                         artifact_path=decision.artifact_path,
                         content_hash=staged_artifact.content_hash,
-                        media_type=PDF_MEDIA_TYPE,
+                        media_type=selected_adapter.media_type,
                         source_url=decision.document_source_url,
                         acquired_at=decision.acquired_at,
                         work_dir=self.storage_paths.ocr_pdfs,
@@ -597,6 +673,7 @@ class IngestionPipeline:
                         adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
                     ),
                     job_id=job.id,
+                    adapter=selected_adapter.adapter,
                 )
             except sqlite3.IntegrityError as exc:
                 published_document_id = find_document_for_artifact(
@@ -638,63 +715,137 @@ class IngestionPipeline:
         return result
 
 
-def enqueue_ingest_jobs(
-    database_path: Path,
-    *,
-    source_path: Path,
-    metadata: dict[str, Any] | None = None,
-    pdf_extractor: str | None = None,
-) -> list[Job]:
-    """Enqueue local-PDF ingestion jobs for one file or directory."""
+def normalize_source_type_hint(value: str | None) -> str | None:
+    """Normalize an optional source-type hint accepted by the current registry."""
 
-    payload_metadata = dict(metadata or {})
-    payload: dict[str, Any] = {
-        "metadata": payload_metadata,
-        "source": "cli",
-    }
-    if pdf_extractor is not None:
-        payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
-
-    jobs: list[Job] = []
-    for pdf_path in _iter_pdf_inputs(source_path):
-        jobs.append(
-            create_job(
-                database_path,
-                kind=INGEST_JOB_KIND,
-                payload={**payload, "path": str(pdf_path)},
-            )
+    if value is None or not value.strip():
+        return None
+    normalized = value.strip().lower()
+    if normalized not in SUPPORTED_SOURCE_TYPES:
+        raise IngestError(
+            f"Unsupported source type {value!r}; expected one of: "
+            + ", ".join(sorted(SUPPORTED_SOURCE_TYPES))
         )
-    return jobs
+    return normalized
 
 
-def enqueue_ingest_url_job(
+def prepare_ingest_source(
+    *,
+    source: str,
+    metadata: dict[str, Any] | None = None,
+    source_type: str | None = None,
+    pdf_extractor: str | None = None,
+    origin: str = "cli",
+    base_dir: Path | None = None,
+    require_existing: bool = False,
+) -> PreparedIngestBatch:
+    """Validate one source and prepare job payloads without writing them."""
+
+    reference = source.strip()
+    if not reference:
+        raise IngestError("Source must not be empty")
+    normalized_source_type = normalize_source_type_hint(source_type)
+    base_payload: dict[str, Any] = {
+        "metadata": dict(metadata or {}),
+        "source": origin,
+    }
+    if normalized_source_type is not None:
+        base_payload["source_type"] = normalized_source_type
+    if pdf_extractor is not None:
+        base_payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
+
+    try:
+        parsed = urlsplit(reference)
+        _ = parsed.port
+    except ValueError as exc:
+        raise IngestError("Source URL is malformed") from exc
+    if parsed.scheme.lower() in {"http", "https"}:
+        try:
+            submitted_url = validate_url_submission(reference)
+        except AcquisitionError as exc:
+            raise IngestError(str(exc)) from exc
+        queued_type = (
+            normalized_source_type or _source_type_for_extension(Path(parsed.path)) or "auto"
+        )
+        return PreparedIngestBatch(
+            payloads=({**base_payload, "url": submitted_url},),
+            queued_by_type={queued_type: 1},
+            skipped_by_type={},
+        )
+    if parsed.scheme:
+        raise IngestError(
+            f"Unsupported source scheme {parsed.scheme!r}; expected HTTP(S) or a local path"
+        )
+
+    submitted_path = Path(os.path.expanduser(reference))
+    if not submitted_path.is_absolute():
+        submitted_path = (base_dir or Path.cwd()) / submitted_path
+    absolute_path = Path(os.path.abspath(submitted_path))
+    if require_existing and not absolute_path.exists():
+        raise IngestError(f"Local source path does not exist: {absolute_path}")
+
+    if absolute_path.is_dir() and not absolute_path.is_symlink():
+        paths, queued_by_type, skipped_by_type = _scan_ingest_directory(
+            absolute_path,
+            source_type=normalized_source_type,
+        )
+        return PreparedIngestBatch(
+            payloads=tuple({**base_payload, "path": str(path)} for path in paths),
+            queued_by_type=queued_by_type,
+            skipped_by_type=skipped_by_type,
+        )
+
+    queued_type = normalized_source_type or _source_type_for_extension(absolute_path) or "auto"
+    return PreparedIngestBatch(
+        payloads=({**base_payload, "path": str(absolute_path)},),
+        queued_by_type={queued_type: 1},
+        skipped_by_type={},
+    )
+
+
+def enqueue_prepared_ingest_batches(
+    database_path: Path,
+    batches: Sequence[PreparedIngestBatch],
+) -> IngestEnqueueResult:
+    """Atomically enqueue fully prepared ingestion batches."""
+
+    payloads = tuple(payload for batch in batches for payload in batch.payloads)
+    seen_references: set[tuple[str, str]] = set()
+    for payload in payloads:
+        identity = _job_payload_identity(payload)
+        if identity in seen_references:
+            raise IngestError("Ingestion batch contains a duplicate source")
+        seen_references.add(identity)
+    jobs = create_jobs(database_path, kind=INGEST_JOB_KIND, payloads=payloads)
+    queued_by_type: Counter[str] = Counter()
+    skipped_by_type: Counter[str] = Counter()
+    for batch in batches:
+        queued_by_type.update(batch.queued_by_type)
+        skipped_by_type.update(batch.skipped_by_type)
+    return IngestEnqueueResult(
+        jobs=tuple(jobs),
+        queued_by_type=dict(sorted(queued_by_type.items())),
+        skipped_by_type=dict(sorted(skipped_by_type.items())),
+    )
+
+
+def enqueue_ingest_source(
     database_path: Path,
     *,
-    storage_paths: StoragePaths,
-    url: str,
+    source: str,
     metadata: dict[str, Any] | None = None,
+    source_type: str | None = None,
     pdf_extractor: str | None = None,
-) -> Job:
-    """Enqueue one direct URL for safe background acquisition and ingestion."""
+) -> IngestEnqueueResult:
+    """Validate and enqueue one URL, local file, or local directory."""
 
-    del storage_paths
-    try:
-        submitted_url = validate_url_submission(url)
-    except AcquisitionError as exc:
-        raise IngestError(str(exc)) from exc
-    payload: dict[str, Any] = {
-        "url": submitted_url,
-        "metadata": dict(metadata or {}),
-        "source": "ingest-url",
-    }
-    if pdf_extractor is not None:
-        payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
-
-    return create_job(
-        database_path,
-        kind=INGEST_JOB_KIND,
-        payload=payload,
+    batch = prepare_ingest_source(
+        source=source,
+        metadata=metadata,
+        source_type=source_type,
+        pdf_extractor=pdf_extractor,
     )
+    return enqueue_prepared_ingest_batches(database_path, (batch,))
 
 
 def build_ingest_handler(
@@ -703,6 +854,7 @@ def build_ingest_handler(
     embedding_config: EmbeddingConfig,
     acquirer: SourceArtifactAcquirer | None = None,
     adapter: SourceAdapter | None = None,
+    adapter_registry: SourceAdapterRegistry | None = None,
     ocr_runner: OcrRunner | None = None,
     text_extractor: TextExtractor | None = None,
     chunker: Chunker | None = None,
@@ -717,6 +869,7 @@ def build_ingest_handler(
         embedding_config=embedding_config,
         acquirer=acquirer,
         adapter=adapter,
+        adapter_registry=adapter_registry,
         ocr_runner=ocr_runner,
         text_extractor=text_extractor,
         chunker=chunker,
@@ -868,25 +1021,77 @@ def list_chunk_vectors(
     return [dict(row) for row in rows if isinstance(row, dict)]
 
 
-def _iter_pdf_inputs(source_path: Path) -> tuple[Path, ...]:
-    submitted_path = Path(os.path.abspath(source_path.expanduser()))
-    if submitted_path.is_dir() and not submitted_path.is_symlink():
-        pdf_paths = tuple(
-            sorted(
-                Path(os.path.abspath(candidate))
-                for candidate in submitted_path.rglob("*")
-                if not candidate.is_symlink()
-                and candidate.is_file()
-                and candidate.suffix.lower() == ".pdf"
-            )
-        )
-        if pdf_paths:
-            return pdf_paths
-        raise IngestError(f"No PDF files found under {submitted_path}")
+def _scan_ingest_directory(
+    directory: Path,
+    *,
+    source_type: str | None,
+) -> tuple[tuple[Path, ...], dict[str, int], dict[str, int]]:
+    queued_paths: list[Path] = []
+    queued_by_type: Counter[str] = Counter()
+    skipped_by_type: Counter[str] = Counter()
 
-    if submitted_path.suffix.lower() != ".pdf":
-        raise IngestError(f"Input file is not a PDF: {submitted_path}")
-    return (submitted_path,)
+    def raise_scan_error(error: OSError) -> None:
+        raise IngestError(
+            f"Could not scan directory {directory} ({type(error).__name__})"
+        ) from error
+
+    for root, directory_names, filenames in os.walk(
+        directory,
+        topdown=True,
+        onerror=raise_scan_error,
+        followlinks=False,
+    ):
+        root_path = Path(root)
+        retained_directories: list[str] = []
+        for name in sorted(directory_names):
+            candidate = root_path / name
+            if candidate.is_symlink():
+                skipped_by_type["symlink"] += 1
+            else:
+                retained_directories.append(name)
+        directory_names[:] = retained_directories
+
+        for name in sorted(filenames):
+            candidate = root_path / name
+            if candidate.is_symlink():
+                skipped_by_type["symlink"] += 1
+                continue
+            if not candidate.is_file():
+                skipped_by_type["special"] += 1
+                continue
+            selected_type = source_type or _source_type_for_extension(candidate)
+            if selected_type is None:
+                skipped_by_type[_unsupported_extension_label(candidate)] += 1
+                continue
+            queued_paths.append(Path(os.path.abspath(candidate)))
+            queued_by_type[selected_type] += 1
+
+    return (
+        tuple(queued_paths),
+        dict(sorted(queued_by_type.items())),
+        dict(sorted(skipped_by_type.items())),
+    )
+
+
+def _source_type_for_extension(path: Path) -> str | None:
+    if path.suffix.lower() in _PDF_EXTENSIONS:
+        return SOURCE_TYPE_PDF
+    return None
+
+
+def _unsupported_extension_label(path: Path) -> str:
+    extension = path.suffix.lower().lstrip(".")
+    return extension or "no-extension"
+
+
+def _job_payload_identity(payload: dict[str, Any]) -> tuple[str, str]:
+    raw_url = payload.get("url")
+    if isinstance(raw_url, str) and raw_url.strip():
+        return "url", normalize_url_reference(raw_url)
+    raw_path = payload.get("path")
+    if isinstance(raw_path, str) and raw_path.strip():
+        return "path", str(Path(os.path.abspath(Path(raw_path).expanduser())))
+    raise IngestError("Ingest job payload is missing a valid URL or path")
 
 
 def _payload_acquisition_request(payload: dict[str, Any]) -> AcquisitionRequest:
@@ -899,6 +1104,22 @@ def _payload_acquisition_request(payload: dict[str, Any]) -> AcquisitionRequest:
     if isinstance(raw_path, str) and raw_path.strip():
         return AcquisitionRequest(kind="local_path", reference=raw_path)
     raise IngestError("Ingest job payload is missing a valid URL or path")
+
+
+def _payload_source_type_hint(payload: dict[str, Any]) -> str | None:
+    value = payload.get("source_type")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise IngestError("Ingest job payload source_type must be a string")
+    return normalize_source_type_hint(value)
+
+
+def _source_filename(reference: str) -> str:
+    parsed = urlsplit(reference)
+    if parsed.scheme.lower() in {"http", "https"}:
+        return Path(parsed.path).name
+    return Path(reference).name
 
 
 def _safe_acquisition_reference(request: AcquisitionRequest) -> str:
@@ -1190,6 +1411,7 @@ def _publish_document_bundle(
     *,
     document_id: str,
     artifact_id: str,
+    media_type: str,
     source_path: Path,
     source_url: str | None,
     title: str,
@@ -1241,8 +1463,8 @@ def _publish_document_bundle(
             ),
         )
         connection.execute(
-            "UPDATE source_artifacts SET state = 'published' WHERE id = ?",
-            (artifact_id,),
+            "UPDATE source_artifacts SET state = 'published', media_type = ? WHERE id = ?",
+            (media_type, artifact_id),
         )
         connection.executemany(
             """

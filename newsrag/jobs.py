@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,19 +45,48 @@ def create_job(
     """Insert a durable pending job into SQLite."""
 
     resolved_job_id = job_id or f"job-{uuid.uuid4().hex[:8]}"
-    payload_json = json.dumps(payload or {}, sort_keys=True)
+    return create_jobs(
+        database_path,
+        kind=kind,
+        payloads=(payload or {},),
+        job_ids=(resolved_job_id,),
+    )[0]
 
+
+def create_jobs(
+    database_path: Path,
+    *,
+    kind: str,
+    payloads: Sequence[dict[str, Any]],
+    job_ids: Sequence[str] | None = None,
+) -> list[Job]:
+    """Atomically insert a batch of durable pending jobs into SQLite."""
+
+    resolved_job_ids = (
+        tuple(job_ids)
+        if job_ids is not None
+        else tuple(f"job-{uuid.uuid4().hex[:8]}" for _ in payloads)
+    )
+    if len(resolved_job_ids) != len(payloads):
+        raise ValueError("job_ids must contain one ID for each payload")
+    if not payloads:
+        return []
+
+    rows = [
+        (job_id, kind, PENDING, json.dumps(payload, sort_keys=True))
+        for job_id, payload in zip(resolved_job_ids, payloads, strict=True)
+    ]
     with sqlite3.connect(database_path) as connection:
-        connection.execute(
+        connection.executemany(
             """
             INSERT INTO jobs(id, kind, status, payload_json, error)
             VALUES(?, ?, ?, ?, NULL)
             """,
-            (resolved_job_id, kind, PENDING, payload_json),
+            rows,
         )
         connection.commit()
 
-    return get_job(database_path, resolved_job_id)
+    return [get_job(database_path, job_id) for job_id in resolved_job_ids]
 
 
 def get_job(database_path: Path, job_id: str) -> Job:

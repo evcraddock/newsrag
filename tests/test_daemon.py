@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -16,13 +17,29 @@ from newsrag.jobs import (
     RUNNING,
     Job,
     create_job,
+    create_jobs,
     get_job,
+    list_jobs,
     mark_job_done,
     set_job_status,
 )
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
+
+
+def test_create_jobs_rolls_back_the_entire_batch_on_failure(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+
+    with pytest.raises(sqlite3.IntegrityError):
+        create_jobs(
+            paths.database,
+            kind="test",
+            payloads=({"index": 1}, {"index": 2}),
+            job_ids=("job-duplicate", "job-duplicate"),
+        )
+
+    assert list_jobs(paths.database) == []
 
 
 def test_daemon_run_command_starts_against_initialized_storage(tmp_path: Path) -> None:

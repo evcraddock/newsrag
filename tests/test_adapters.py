@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from newsrag.adapters import AdapterError, AdapterInput
+from newsrag.adapters import (
+    AdapterError,
+    AdapterInput,
+    AdapterSelectionError,
+    RegisteredSourceAdapter,
+    SourceAdapterRegistry,
+)
 from newsrag.pdf_adapter import ExtractedPage, PdfSourceAdapter
 
 
@@ -93,6 +99,92 @@ def test_pdf_adapter_rejects_invalid_artifacts(
                 work_dir=tmp_path / "normalized",
                 options=_empty_options(),
             )
+        )
+
+
+def test_adapter_registry_uses_hint_media_signature_and_extension_without_extracting(
+    tmp_path: Path,
+) -> None:
+    artifact_path = tmp_path / "artifact"
+    artifact_path.write_bytes(b"%PDF-1.4\nmock")
+    adapter = PdfSourceAdapter(
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=()),
+    )
+    registration = RegisteredSourceAdapter(
+        source_type="pdf",
+        media_type="application/pdf",
+        extensions=(".pdf",),
+        signatures=(b"%PDF-",),
+        adapter=adapter,
+    )
+    registry = SourceAdapterRegistry((registration,))
+
+    assert (
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint="pdf",
+            reported_media_type="text/plain",
+            filename="wrong.txt",
+        )
+        is registration
+    )
+    assert (
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint=None,
+            reported_media_type="application/pdf",
+            filename="wrong.txt",
+        )
+        is registration
+    )
+    assert (
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint=None,
+            reported_media_type=None,
+            filename="no-extension",
+        )
+        is registration
+    )
+
+    artifact_path.write_bytes(b"unknown")
+    assert (
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint=None,
+            reported_media_type=None,
+            filename="packet.PDF",
+        )
+        is registration
+    )
+
+
+def test_adapter_registry_rejects_unsupported_evidence(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "unknown.bin"
+    artifact_path.write_bytes(b"unknown")
+    adapter = PdfSourceAdapter(
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=()),
+    )
+    registry = SourceAdapterRegistry(
+        (
+            RegisteredSourceAdapter(
+                source_type="pdf",
+                media_type="application/pdf",
+                extensions=(".pdf",),
+                signatures=(b"%PDF-",),
+                adapter=adapter,
+            ),
+        )
+    )
+
+    with pytest.raises(AdapterSelectionError, match="provide --type"):
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint=None,
+            reported_media_type="application/octet-stream",
+            filename=artifact_path.name,
         )
 
 

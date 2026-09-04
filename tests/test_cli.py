@@ -24,7 +24,7 @@ def test_help_shows_cli_commands() -> None:
     assert "status" in result.stdout
     assert "daemon" in result.stdout
     assert "ingest" in result.stdout
-    assert "ingest-url" in result.stdout
+    assert "ingest-url" not in result.stdout
     assert "ingest-manifest" in result.stdout
     assert "search" in result.stdout
     assert "jobs" in result.stdout
@@ -36,6 +36,14 @@ def test_help_shows_cli_commands() -> None:
     assert "entities" in result.stdout
     assert "timeline" in result.stdout
     assert "leads" in result.stdout
+
+
+def test_ingest_help_describes_unified_source_input() -> None:
+    result = runner.invoke(app, ["ingest", "--help"])
+
+    assert result.exit_code == 0
+    assert "URL, local file, or local directory" in result.stdout
+    assert "--type" in result.stdout
 
 
 def test_version_option_shows_project_version() -> None:

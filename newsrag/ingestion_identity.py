@@ -92,6 +92,18 @@ def register_acquired_artifact(
 
         artifact_row = _artifact_row(connection, content_hash)
         if artifact_row is not None:
+            if (
+                artifact_row["document_id"] is None
+                and str(artifact_row["state"]) == ARTIFACT_STATE_PROCESSING
+                and str(artifact_row["media_type"]) != media_type
+            ):
+                connection.execute(
+                    "UPDATE source_artifacts SET media_type = ? WHERE id = ?",
+                    (media_type, str(artifact_row["artifact_id"])),
+                )
+                artifact_row = _artifact_row(connection, content_hash)
+                if artifact_row is None:
+                    raise RuntimeError("Updated source artifact could not be reloaded")
             decision = _decision_for_existing_artifact(connection, artifact_row)
             connection.commit()
             return decision
@@ -252,6 +264,7 @@ def _artifact_row(connection: sqlite3.Connection, content_hash: str) -> sqlite3.
             source_artifacts.stored_path,
             source_artifacts.acquired_at,
             source_artifacts.state,
+            source_artifacts.media_type,
             sources.kind AS source_kind,
             sources.submitted_reference,
             documents.id AS document_id

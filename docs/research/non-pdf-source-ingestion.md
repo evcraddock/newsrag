@@ -29,7 +29,7 @@ A separate discovery tool may supply a concrete URL, but NewsRAG has no dependen
 
 ## One ingestion interface
 
-`newsrag ingest <source>` is the primary command for one public HTTP(S) URL, local file, or local directory. The redundant `newsrag ingest-url` command will be removed without a deprecation period.
+`newsrag ingest <source>` is the primary command for one public HTTP(S) URL, local file, or local directory. A separate URL-specific command is not retained.
 
 `newsrag ingest <directory>` performs a one-time recursive scan. It queues supported regular files, does not follow symlinks, and reports queued and skipped files by type. Continuous folder watching remains a separate workflow.
 
