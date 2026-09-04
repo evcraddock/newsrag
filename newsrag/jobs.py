@@ -13,6 +13,8 @@ RUNNING: JobStatus = "running"
 DONE: JobStatus = "done"
 FAILED: JobStatus = "failed"
 
+_DUPLICATE_IGNORED_OUTCOME = "duplicate_ignored"
+
 
 class JobRetryError(Exception):
     """Raised when a durable job cannot be retried."""
@@ -26,6 +28,7 @@ class Job:
     kind: str
     status: JobStatus
     payload: dict[str, Any]
+    result: dict[str, Any] | None
     error: str | None
     created_at: str
     updated_at: str
@@ -63,7 +66,7 @@ def get_job(database_path: Path, job_id: str) -> Job:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT id, kind, status, payload_json, error, created_at, updated_at
+            SELECT id, kind, status, payload_json, result_json, error, created_at, updated_at
             FROM jobs
             WHERE id = ?
             """,
@@ -82,7 +85,7 @@ def list_jobs(database_path: Path) -> list[Job]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, kind, status, payload_json, error, created_at, updated_at
+            SELECT id, kind, status, payload_json, result_json, error, created_at, updated_at
             FROM jobs
             ORDER BY created_at ASC, id ASC
             """
@@ -116,7 +119,7 @@ def claim_next_job(database_path: Path) -> Job | None:
         connection.execute(
             """
             UPDATE jobs
-            SET status = ?, error = NULL, updated_at = CURRENT_TIMESTAMP
+            SET status = ?, result_json = NULL, error = NULL, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (RUNNING, job_id),
@@ -126,16 +129,37 @@ def claim_next_job(database_path: Path) -> Job | None:
     return get_job(database_path, job_id)
 
 
-def mark_job_done(database_path: Path, job_id: str) -> Job:
-    """Mark a running job done."""
+def mark_job_done(
+    database_path: Path,
+    job_id: str,
+    *,
+    result: dict[str, Any] | None = None,
+) -> Job:
+    """Mark a running job done with an optional structured result."""
 
-    return _set_job_status(database_path, job_id, status=DONE, error=None)
+    return _set_job_status(
+        database_path,
+        job_id,
+        status=DONE,
+        result=result,
+        error=None,
+        discard_payload=(
+            result is not None and result.get("outcome") == _DUPLICATE_IGNORED_OUTCOME
+        ),
+    )
 
 
 def mark_job_failed(database_path: Path, job_id: str, *, error: str) -> Job:
     """Mark a running job failed with context."""
 
-    return _set_job_status(database_path, job_id, status=FAILED, error=error)
+    return _set_job_status(
+        database_path,
+        job_id,
+        status=FAILED,
+        result=None,
+        error=error,
+        discard_payload=False,
+    )
 
 
 def retry_failed_job(database_path: Path, job_id: str) -> Job:
@@ -149,7 +173,14 @@ def retry_failed_job(database_path: Path, job_id: str) -> Job:
     if job.status != FAILED:
         raise JobRetryError(f"Job {job_id} is {job.status}; only failed jobs can be retried")
 
-    return _set_job_status(database_path, job_id, status=PENDING, error=None)
+    return _set_job_status(
+        database_path,
+        job_id,
+        status=PENDING,
+        result=None,
+        error=None,
+        discard_payload=False,
+    )
 
 
 def set_job_status(
@@ -164,7 +195,14 @@ def set_job_status(
     This is primarily useful for deterministic tests and status shaping.
     """
 
-    return _set_job_status(database_path, job_id, status=status, error=error)
+    return _set_job_status(
+        database_path,
+        job_id,
+        status=status,
+        result=None,
+        error=error,
+        discard_payload=False,
+    )
 
 
 def _set_job_status(
@@ -172,16 +210,23 @@ def _set_job_status(
     job_id: str,
     *,
     status: JobStatus,
+    result: dict[str, Any] | None,
     error: str | None,
+    discard_payload: bool,
 ) -> Job:
+    result_json = json.dumps(result, sort_keys=True) if result is not None else None
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
             UPDATE jobs
-            SET status = ?, error = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = ?,
+                payload_json = CASE WHEN ? THEN '{}' ELSE payload_json END,
+                result_json = ?,
+                error = ?,
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (status, error, job_id),
+            (status, discard_payload, result_json, error, job_id),
         )
         connection.commit()
 
@@ -189,15 +234,22 @@ def _set_job_status(
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:
-    payload = json.loads(str(row["payload_json"]))
-    if not isinstance(payload, dict):
-        payload = {}
+    payload = _load_json_mapping(row["payload_json"]) or {}
+    result = _load_json_mapping(row["result_json"])
     return Job(
         id=str(row["id"]),
         kind=str(row["kind"]),
         status=str(row["status"]),
         payload=payload,
+        result=result,
         error=str(row["error"]) if row["error"] is not None else None,
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
+
+
+def _load_json_mapping(raw_value: object) -> dict[str, Any] | None:
+    if raw_value is None:
+        return None
+    value = json.loads(str(raw_value))
+    return value if isinstance(value, dict) else None

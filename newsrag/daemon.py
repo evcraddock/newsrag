@@ -15,7 +15,8 @@ from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
 from newsrag.storage import initialize_storage
 from newsrag.watches import DEFAULT_WATCH_STABILITY_SECONDS, WatchDebouncer, list_watches
 
-JobHandler = Callable[[Job], Awaitable[None]]
+JobResult = dict[str, object]
+JobHandler = Callable[[Job], Awaitable[JobResult | None]]
 LOGGER = logging.getLogger(__name__)
 
 
@@ -66,7 +67,7 @@ class DaemonRunner:
         log_context = _job_log_context(job)
         LOGGER.info("job_started %s", log_context)
         try:
-            await self._handle_job(job)
+            result = await self._handle_job(job)
         except Exception as exc:
             await asyncio.to_thread(mark_job_failed, self.database_path, job.id, error=str(exc))
             LOGGER.error(
@@ -76,7 +77,12 @@ class DaemonRunner:
                 str(exc),
             )
         else:
-            await asyncio.to_thread(mark_job_done, self.database_path, job.id)
+            await asyncio.to_thread(
+                mark_job_done,
+                self.database_path,
+                job.id,
+                result=result,
+            )
             LOGGER.info(
                 "job_completed %s elapsed_ms=%d",
                 log_context,
@@ -84,11 +90,11 @@ class DaemonRunner:
             )
         return True
 
-    async def _handle_job(self, job: Job) -> None:
+    async def _handle_job(self, job: Job) -> JobResult | None:
         handler = self.handlers.get(job.kind)
         if handler is None:
             raise UnknownJobKindError(f"No handler registered for job kind '{job.kind}'")
-        await handler(job)
+        return await handler(job)
 
 
 WatchStreamFactory = Callable[[tuple[str, ...]], AsyncIterator[set[tuple[object, str]]]]

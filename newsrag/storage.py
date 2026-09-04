@@ -79,7 +79,7 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifacts", "artifacts"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
@@ -129,6 +129,7 @@ SCHEMA_STATEMENTS = (
         content_hash TEXT NOT NULL UNIQUE,
         stored_path TEXT NOT NULL,
         acquired_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'processing',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(source_id) REFERENCES sources(id)
     )
@@ -231,6 +232,7 @@ SCHEMA_STATEMENTS = (
         kind TEXT NOT NULL,
         status TEXT NOT NULL,
         payload_json TEXT NOT NULL DEFAULT '{}',
+        result_json TEXT,
         error TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -377,8 +379,11 @@ def initialize_storage(data_dir: Path) -> StoragePaths:
     for directory in _iter_directories(paths):
         directory.mkdir(parents=True, exist_ok=True)
 
-    vector_migration_required = _initialize_database(paths.database)
+    vector_migration_required, removed_document_ids = _initialize_database(paths.database)
+    if removed_document_ids:
+        _delete_document_vectors(paths.lancedb, removed_document_ids)
     if vector_migration_required:
+        _delete_orphan_document_vectors(paths.database, paths.lancedb)
         _backfill_vector_source_unit_ranges(paths.database, paths.lancedb)
     _set_schema_version(paths.database)
     return paths
@@ -530,7 +535,7 @@ def _iter_directories(paths: StoragePaths) -> tuple[Path, ...]:
     return tuple(directory for _, directory in _directory_checks(paths))
 
 
-def _initialize_database(database_path: Path) -> bool:
+def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         for statement in SCHEMA_STATEMENTS:
@@ -547,6 +552,13 @@ def _initialize_database(database_path: Path) -> bool:
             "artifact_id",
             "TEXT REFERENCES source_artifacts(id)",
         )
+        _ensure_column(
+            connection,
+            "source_artifacts",
+            "state",
+            "TEXT NOT NULL DEFAULT 'processing'",
+        )
+        _ensure_column(connection, "jobs", "result_json", "TEXT")
         _ensure_column(connection, "pages", "extractor", "TEXT NOT NULL DEFAULT 'unknown'")
         _ensure_column(
             connection,
@@ -590,6 +602,25 @@ def _initialize_database(database_path: Path) -> bool:
         )
         _backfill_passages(connection)
         _backfill_pdf_source_model(connection)
+        removed_document_ids = _consolidate_duplicate_documents(connection)
+        connection.execute(
+            """
+            UPDATE source_artifacts
+            SET state = 'published'
+            WHERE id IN (
+                SELECT artifact_id
+                FROM documents
+                WHERE artifact_id IS NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_unique_artifact
+            ON documents(artifact_id)
+            WHERE artifact_id IS NOT NULL
+            """
+        )
         connection.execute(
             """
             INSERT INTO passages_fts(passage_id, text)
@@ -600,7 +631,10 @@ def _initialize_database(database_path: Path) -> bool:
         )
         connection.commit()
 
-    return previous_schema_version is None or str(previous_schema_version[0]) != SCHEMA_VERSION
+    migration_required = (
+        previous_schema_version is None or str(previous_schema_version[0]) != SCHEMA_VERSION
+    )
+    return migration_required, removed_document_ids
 
 
 def _set_schema_version(database_path: Path) -> None:
@@ -856,6 +890,131 @@ def _backfill_pdf_source_model(connection: sqlite3.Connection) -> None:
             """,
             (source_kind,),
         )
+
+
+def _consolidate_duplicate_documents(connection: sqlite3.Connection) -> tuple[str, ...]:
+    rows = connection.execute(
+        """
+        SELECT
+            documents.id,
+            COALESCE(source_artifacts.content_hash, documents.source_hash) AS content_hash
+        FROM documents
+        LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+        WHERE COALESCE(source_artifacts.content_hash, documents.source_hash) IS NOT NULL
+        ORDER BY documents.created_at ASC, documents.id ASC
+        """
+    ).fetchall()
+    seen_hashes: set[str] = set()
+    duplicate_ids: list[str] = []
+    for document_id, content_hash in rows:
+        normalized_hash = str(content_hash)
+        if normalized_hash in seen_hashes:
+            duplicate_ids.append(str(document_id))
+        else:
+            seen_hashes.add(normalized_hash)
+
+    for document_id in duplicate_ids:
+        _delete_duplicate_document(connection, document_id)
+
+    connection.execute(
+        """
+        DELETE FROM sources
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM source_artifacts
+            WHERE source_artifacts.source_id = sources.id
+        )
+        """
+    )
+    return tuple(duplicate_ids)
+
+
+def _delete_duplicate_document(connection: sqlite3.Connection, document_id: str) -> None:
+    connection.execute(
+        """
+        DELETE FROM discovery_evidence
+        WHERE document_id = ?
+            OR item_id IN (SELECT id FROM discovery_items WHERE document_id = ?)
+        """,
+        (document_id, document_id),
+    )
+    connection.execute(
+        """
+        DELETE FROM discovery_items_fts
+        WHERE item_id IN (SELECT id FROM discovery_items WHERE document_id = ?)
+        """,
+        (document_id,),
+    )
+    connection.execute("DELETE FROM discovery_items WHERE document_id = ?", (document_id,))
+    connection.execute(
+        """
+        DELETE FROM document_briefs_fts
+        WHERE brief_id IN (SELECT id FROM document_briefs WHERE document_id = ?)
+        """,
+        (document_id,),
+    )
+    connection.execute("DELETE FROM document_briefs WHERE document_id = ?", (document_id,))
+    connection.execute("DELETE FROM document_profiles WHERE document_id = ?", (document_id,))
+    connection.execute(
+        """
+        DELETE FROM embedding_records
+        WHERE (source_kind = 'chunk' AND source_key IN (
+                SELECT id FROM chunks WHERE document_id = ?
+            ))
+            OR (source_kind = 'passage' AND source_key IN (
+                SELECT id FROM passages WHERE document_id = ?
+            ))
+        """,
+        (document_id, document_id),
+    )
+    connection.execute(
+        "DELETE FROM passages_fts WHERE passage_id IN "
+        "(SELECT id FROM passages WHERE document_id = ?)",
+        (document_id,),
+    )
+    connection.execute("DELETE FROM passages WHERE document_id = ?", (document_id,))
+    connection.execute(
+        "DELETE FROM chunks_fts WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?)",
+        (document_id,),
+    )
+    connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+    connection.execute("DELETE FROM pages WHERE document_id = ?", (document_id,))
+    connection.execute("DELETE FROM source_units WHERE document_id = ?", (document_id,))
+    connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+
+
+def _delete_document_vectors(lancedb_path: Path, document_ids: tuple[str, ...]) -> None:
+    database = lancedb.connect(lancedb_path)
+    for table_name in ("chunk_embeddings", "passage_embeddings"):
+        try:
+            table = database.open_table(table_name)
+        except ValueError:
+            continue
+        for document_id in document_ids:
+            escaped_document_id = document_id.replace("'", "''")
+            table.delete(f"document_id = '{escaped_document_id}'")
+
+
+def _delete_orphan_document_vectors(database_path: Path, lancedb_path: Path) -> None:
+    with sqlite3.connect(database_path) as connection:
+        document_ids = {
+            str(row[0]) for row in connection.execute("SELECT id FROM documents").fetchall()
+        }
+
+    database = lancedb.connect(lancedb_path)
+    for table_name in ("chunk_embeddings", "passage_embeddings"):
+        try:
+            table = database.open_table(table_name)
+        except ValueError:
+            continue
+        orphan_ids = {
+            str(row["document_id"])
+            for row in table.to_arrow().to_pylist()
+            if str(row["document_id"]) not in document_ids
+        }
+        for document_id in orphan_ids:
+            escaped_document_id = document_id.replace("'", "''")
+            table.delete(f"document_id = '{escaped_document_id}'")
 
 
 def _load_metadata_json(raw_metadata: object) -> dict[str, object]:

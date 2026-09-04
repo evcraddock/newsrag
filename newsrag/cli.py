@@ -1093,6 +1093,11 @@ def _format_job_line(job: Job) -> str:
     source_path = job.payload.get("path")
     if isinstance(source_path, str) and source_path.strip():
         parts.append(f"path={source_path}")
+    if job.result is not None:
+        for key in ("outcome", "source_id", "artifact_id", "document_id"):
+            value = job.result.get(key)
+            if isinstance(value, str) and value:
+                parts.append(f"{key}={value}")
     if job.status == FAILED and job.error is not None:
         parts.append(f"failed_at={job.updated_at}")
         parts.append(f"error={job.error}")

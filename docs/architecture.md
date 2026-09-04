@@ -47,7 +47,7 @@ NewsRAG is organized around a small set of durable entities rather than a server
 - **Page**: the PDF-specific compatibility record linked one-to-one to a page source unit. Existing page numbers and page citations remain the source of citation truth for PDFs.
 - **Chunk**: searchable text derived from source units. Chunks retain both the existing PDF page span and a source-unit range for source-neutral retrieval.
 - **Embedding**: a vector representation of a chunk or passage stored in LanceDB, linked back to its source record, source-unit range, and embedding provider/model/version.
-- **Job**: durable processing work tracked through pending, running, done, and failed states, with error details and retry support.
+- **Job**: durable processing work tracked through pending, running, done, and failed states, with structured completion outcomes, error details, and retry support.
 - **Watch**: a configured folder watcher with default metadata used when new PDFs appear.
 - **Packet**: a generated Markdown evidence file assembled from retrieved chunks and source metadata.
 
@@ -67,7 +67,11 @@ documents:
     jurisdiction: Example City
 ```
 
-Processing is idempotent. The system hashes source content to avoid duplicate indexing and to detect changed documents. Raw bytes are retained as an immutable source artifact. Each PDF is normalized through OCR, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path.
+Processing uses exact raw-byte SHA-256 identity within one corpus. It does not compare normalized or extracted text and does not use fuzzy or semantic duplicate detection. A published exact duplicate completes with `duplicate_ignored`; it creates no new source, artifact, document, alias, or metadata and discards the repeated submission payload. The job result retains the existing artifact and document IDs. Artifacts retained after a failed attempt can be reused by a retry.
+
+When a known source returns different bytes, NewsRAG preserves the new artifact with `change_detected_artifact_saved` but does not replace the source's current document. Repeating those changed bytes reports `change_already_detected`. New publications report `created`. A unique document-to-artifact constraint and transactional cleanup make concurrent duplicate processing converge without exposing partial document records or vectors. The complete policy is recorded in [Source identity and repeated ingestion](research/source-identity-and-repeated-ingestion.md).
+
+Raw bytes are retained as immutable, content-addressed source artifacts. Each PDF is normalized through OCR, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path.
 
 The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Each extracted page is stored as an ordered page source unit before chunking, and source-unit ranges propagate through chunks, passages, embeddings, and search results while existing page citations remain stable.
 

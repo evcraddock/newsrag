@@ -295,6 +295,7 @@ def test_initialize_storage_migrates_pdf_records_to_source_units(tmp_path: Path)
     assert artifact["byte_size"] == len(source_bytes)
     assert artifact["content_hash"] == source_hash
     assert artifact["stored_path"] == str(source_pdf)
+    assert artifact["state"] == "published"
     assert document is not None
     assert document["artifact_id"] == artifact["id"]
     assert unit is not None
@@ -318,6 +319,149 @@ def test_initialize_storage_migrates_pdf_records_to_source_units(tmp_path: Path)
     assert chunk_vector["source_unit_end_id"] == unit["id"]
     assert passage_vector["source_unit_start_id"] == unit["id"]
     assert passage_vector["source_unit_end_id"] == unit["id"]
+
+
+def test_initialize_storage_consolidates_legacy_exact_hash_documents(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute("DROP INDEX idx_documents_unique_artifact")
+        connection.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/packet.pdf', '/tmp/packet.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at
+            )
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 10, 'same-hash',
+                '/tmp/packet.pdf', CURRENT_TIMESTAMP
+            )
+            """
+        )
+        for suffix in ("a", "b"):
+            document_id = f"document-{suffix}"
+            unit_id = f"unit-{suffix}"
+            chunk_id = f"chunk-{suffix}"
+            passage_id = f"passage-{suffix}"
+            connection.execute(
+                """
+                INSERT INTO documents(id, source_path, title, source_hash, metadata_json, artifact_id)
+                VALUES(?, '/tmp/packet.pdf', ?, 'same-hash', '{}', 'artifact-1')
+                """,
+                (document_id, f"Packet {suffix.upper()}"),
+            )
+            connection.execute(
+                """
+                INSERT INTO source_units(
+                    id, artifact_id, document_id, ordinal, location_type, location_json,
+                    human_label, normalized_text, structure_json, extractor
+                )
+                VALUES(?, 'artifact-1', ?, 1, 'page', '{"page_number": 1}', 'p. 1', ?, '{}', 'test')
+                """,
+                (unit_id, document_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                """
+                INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+                VALUES(?, ?, 1, ?, ?, 'test')
+                """,
+                (f"page-{suffix}", document_id, unit_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                """
+                INSERT INTO chunks(
+                    id, document_id, page_start, page_end, source_unit_start_id,
+                    source_unit_end_id, text
+                )
+                VALUES(?, ?, 1, 1, ?, ?, ?)
+                """,
+                (chunk_id, document_id, unit_id, unit_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                "INSERT INTO chunks_fts(chunk_id, text) VALUES(?, ?)",
+                (chunk_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                """
+                INSERT INTO passages(
+                    id, chunk_id, document_id, page_start, page_end, source_unit_start_id,
+                    source_unit_end_id, ordinal, text
+                )
+                VALUES(?, ?, ?, 1, 1, ?, ?, 1, ?)
+                """,
+                (passage_id, chunk_id, document_id, unit_id, unit_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                "INSERT INTO passages_fts(passage_id, text) VALUES(?, ?)",
+                (passage_id, f"Agenda {suffix}"),
+            )
+            connection.execute(
+                """
+                INSERT INTO embedding_records(
+                    id, source_kind, source_key, provider, model, version, dimensions,
+                    source_unit_start_id, source_unit_end_id
+                )
+                VALUES(?, 'passage', ?, 'test', 'test', 'v1', 2, ?, ?)
+                """,
+                (f"embedding-{suffix}", passage_id, unit_id, unit_id),
+            )
+        connection.commit()
+
+    lance_database = lancedb.connect(paths.lancedb)
+    for table_name, key_name, key_prefix in (
+        ("chunk_embeddings", "chunk_id", "chunk"),
+        ("passage_embeddings", "passage_id", "passage"),
+    ):
+        lance_database.create_table(
+            table_name,
+            data=[
+                {
+                    key_name: f"{key_prefix}-{suffix}",
+                    "document_id": f"document-{suffix}",
+                    "vector": [0.1, 0.2],
+                }
+                for suffix in ("a", "b")
+            ],
+        )
+
+    initialize_storage(paths.data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        documents = connection.execute("SELECT id FROM documents ORDER BY id").fetchall()
+        units = connection.execute("SELECT document_id FROM source_units").fetchall()
+        pages = connection.execute("SELECT document_id FROM pages").fetchall()
+        chunks = connection.execute("SELECT document_id FROM chunks").fetchall()
+        passages = connection.execute("SELECT document_id FROM passages").fetchall()
+        embeddings = connection.execute("SELECT source_key FROM embedding_records").fetchall()
+        chunk_fts = connection.execute("SELECT chunk_id FROM chunks_fts").fetchall()
+        passage_fts = connection.execute("SELECT passage_id FROM passages_fts").fetchall()
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO documents(id, source_hash, metadata_json, artifact_id)
+                VALUES('document-c', 'same-hash', '{}', 'artifact-1')
+                """
+            )
+    chunk_vectors = lance_database.open_table("chunk_embeddings").to_arrow().to_pylist()
+    passage_vectors = lance_database.open_table("passage_embeddings").to_arrow().to_pylist()
+
+    assert documents == [("document-a",)]
+    assert units == [("document-a",)]
+    assert pages == [("document-a",)]
+    assert chunks == [("document-a",)]
+    assert passages == [("document-a",)]
+    assert embeddings == [("passage-a",)]
+    assert chunk_fts == [("chunk-a",)]
+    assert passage_fts == [("passage-a",)]
+    assert [row["document_id"] for row in chunk_vectors] == ["document-a"]
+    assert [row["document_id"] for row in passage_vectors] == ["document-a"]
 
 
 def test_source_unit_locations_can_represent_non_page_units(tmp_path: Path) -> None:

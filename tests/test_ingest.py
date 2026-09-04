@@ -5,8 +5,10 @@ import json
 import logging
 import sqlite3
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Barrier
 
 import httpx
 import lancedb  # type: ignore[import-untyped]
@@ -14,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 from newsrag.adapters import (
+    AdapterError,
     AdapterInput,
     AdapterResult,
     CanonicalSourceUnit,
@@ -48,7 +51,14 @@ from newsrag.ingest import (
     list_documents,
     list_pages,
 )
-from newsrag.jobs import FAILED, create_job, get_job, list_jobs, set_job_status
+from newsrag.jobs import (
+    FAILED,
+    create_job,
+    get_job,
+    list_jobs,
+    retry_failed_job,
+    set_job_status,
+)
 from newsrag.manifests import ManifestError, load_manifest
 from newsrag.storage import initialize_storage
 
@@ -535,8 +545,6 @@ def test_failed_vector_publication_leaves_no_searchable_document(tmp_path: Path)
     assert "passage vector boom" in (updated_job.error or "")
     with sqlite3.connect(paths.database) as connection:
         for table_name in (
-            "sources",
-            "source_artifacts",
             "documents",
             "source_units",
             "pages",
@@ -548,6 +556,10 @@ def test_failed_vector_publication_leaves_no_searchable_document(tmp_path: Path)
         ):
             count = connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
             assert count == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT state FROM source_artifacts").fetchone() == (
+            "processing",
+        )
     assert len(chunk_vector_store.added) == 1
     assert len(chunk_vector_store.removed_document_ids) == 1
     assert passage_vector_store.removed_document_ids == chunk_vector_store.removed_document_ids
@@ -763,16 +775,16 @@ def test_reingesting_unchanged_pdf_does_not_duplicate_records(tmp_path: Path) ->
     source_pdf.write_bytes(b"%PDF-1.4\nmock")
     paths = initialize_storage(data_dir)
 
-    create_job(
+    first_job = create_job(
         paths.database,
         kind=INGEST_JOB_KIND,
         payload={"path": str(source_pdf.resolve()), "metadata": {"body": "City Council"}},
         job_id="job-first",
     )
-    create_job(
+    second_job = create_job(
         paths.database,
         kind=INGEST_JOB_KIND,
-        payload={"path": str(source_pdf.resolve()), "metadata": {"body": "City Council"}},
+        payload={"path": str(source_pdf.resolve()), "metadata": {"body": "Other Council"}},
         job_id="job-second",
     )
 
@@ -793,11 +805,339 @@ def test_reingesting_unchanged_pdf_does_not_duplicate_records(tmp_path: Path) ->
     asyncio.run(runner_instance.run_cycle())
     asyncio.run(runner_instance.run_cycle())
 
-    assert len(list_documents(paths.database)) == 1
+    documents = list_documents(paths.database)
+    first_result = get_job(paths.database, first_job.id).result
+    updated_second_job = get_job(paths.database, second_job.id)
+    second_result = updated_second_job.result
+
+    assert len(documents) == 1
+    assert documents[0].metadata["body"] == "City Council"
+    assert first_result is not None
+    assert first_result["outcome"] == "created"
+    assert second_result is not None
+    assert second_result["outcome"] == "duplicate_ignored"
+    assert second_result["document_id"] == first_result["document_id"]
+    assert second_result["artifact_id"] == first_result["artifact_id"]
+    assert updated_second_job.payload == {}
     assert len(list_pages(paths.database)) == 1
     assert len(list_chunks(paths.database)) == 1
     assert len(list_chunk_vectors(paths.lancedb)) == 1
     assert len(list_embedding_records(paths.database)) == 2
+
+
+def test_same_bytes_from_different_local_paths_ignore_the_second_source(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    first_pdf = tmp_path / "first.pdf"
+    second_pdf = tmp_path / "renamed.pdf"
+    content = b"%PDF-1.4\nidentical"
+    first_pdf.write_bytes(content)
+    second_pdf.write_bytes(content)
+    paths = initialize_storage(data_dir)
+    first_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(first_pdf.resolve()), "metadata": {}},
+        job_id="job-a-first",
+    )
+    second_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(second_pdf.resolve()), "metadata": {}},
+        job_id="job-z-second",
+    )
+    adapter = FakeSourceAdapter()
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    runner_instance = DaemonRunner(
+        database_path=paths.database,
+        handlers={INGEST_JOB_KIND: handler},
+        poll_interval=0,
+    )
+
+    asyncio.run(runner_instance.run_cycle())
+    asyncio.run(runner_instance.run_cycle())
+
+    with sqlite3.connect(paths.database) as connection:
+        sources = connection.execute(
+            "SELECT submitted_reference FROM sources ORDER BY id"
+        ).fetchall()
+        artifact_count = connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone()
+    assert get_job(paths.database, first_job.id).result["outcome"] == "created"  # type: ignore[index]
+    updated_second_job = get_job(paths.database, second_job.id)
+    assert updated_second_job.result["outcome"] == "duplicate_ignored"  # type: ignore[index]
+    assert updated_second_job.payload == {}
+    assert sources == [(str(first_pdf.resolve()),)]
+    assert artifact_count == (1,)
+    assert len(adapter.inputs) == 1
+
+
+def test_same_bytes_from_different_urls_ignore_the_second_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    first_url = "https://one.example.gov/packet.pdf"
+    second_url = "https://two.example.gov/renamed.pdf"
+    content = b"%PDF-1.4\nidentical-url"
+    monkeypatch.setattr(
+        "newsrag.ingest.httpx.get",
+        _fake_pdf_url_map_getter({first_url: content, second_url: content}),
+    )
+    first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=first_url)
+    adapter = FakeSourceAdapter()
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    runner_instance = DaemonRunner(
+        database_path=paths.database,
+        handlers={INGEST_JOB_KIND: handler},
+        poll_interval=0,
+    )
+
+    asyncio.run(runner_instance.run_cycle())
+    second_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=second_url)
+    asyncio.run(runner_instance.run_cycle())
+
+    with sqlite3.connect(paths.database) as connection:
+        sources = connection.execute(
+            "SELECT submitted_reference FROM sources ORDER BY id"
+        ).fetchall()
+    first_result = get_job(paths.database, first_job.id).result
+    second_result = get_job(paths.database, second_job.id).result
+    assert first_result is not None and first_result["outcome"] == "created"
+    assert second_result is not None and second_result["outcome"] == "duplicate_ignored"
+    assert get_job(paths.database, second_job.id).payload == {}
+    assert sources == [(first_url,)]
+    assert len(list(paths.downloaded_pdfs.iterdir())) == 1
+    assert len(list(paths.source_pdfs.iterdir())) == 1
+    assert len(adapter.inputs) == 1
+
+
+def test_changed_source_bytes_are_preserved_without_replacing_document(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nfirst")
+    paths = initialize_storage(data_dir)
+    first_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {"title": "First title"}},
+    )
+    adapter = FakeSourceAdapter()
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    runner_instance = DaemonRunner(
+        database_path=paths.database,
+        handlers={INGEST_JOB_KIND: handler},
+        poll_interval=0,
+    )
+    asyncio.run(runner_instance.run_cycle())
+
+    source_pdf.write_bytes(b"%PDF-1.4\nchanged")
+    changed_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {"title": "Changed title"}},
+    )
+    asyncio.run(runner_instance.run_cycle())
+    repeated_path = tmp_path / "same-change-at-new-path.pdf"
+    repeated_path.write_bytes(b"%PDF-1.4\nchanged")
+    repeated_change_job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(repeated_path.resolve()), "metadata": {}},
+    )
+    asyncio.run(runner_instance.run_cycle())
+
+    documents = list_documents(paths.database)
+    with sqlite3.connect(paths.database) as connection:
+        artifact_states = connection.execute(
+            "SELECT state FROM source_artifacts ORDER BY state"
+        ).fetchall()
+        source_count = connection.execute("SELECT COUNT(*) FROM sources").fetchone()
+    first_result = get_job(paths.database, first_job.id).result
+    changed_result = get_job(paths.database, changed_job.id).result
+    repeated_result = get_job(paths.database, repeated_change_job.id).result
+    assert first_result is not None and first_result["outcome"] == "created"
+    assert changed_result is not None
+    assert changed_result["outcome"] == "change_detected_artifact_saved"
+    assert changed_result["document_id"] == first_result["document_id"]
+    assert repeated_result is not None
+    assert repeated_result["outcome"] == "change_already_detected"
+    assert len(documents) == 1
+    assert documents[0].title == "First title"
+    assert artifact_states == [("change_detected",), ("published",)]
+    assert source_count == (1,)
+    assert len(adapter.inputs) == 1
+
+
+def test_different_raw_bytes_with_same_extracted_text_create_distinct_documents(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    first_pdf = tmp_path / "first.pdf"
+    second_pdf = tmp_path / "second.pdf"
+    first_pdf.write_bytes(b"%PDF-1.4\nraw-a")
+    second_pdf.write_bytes(b"%PDF-1.4\nraw-b")
+    paths = initialize_storage(data_dir)
+    jobs = [
+        create_job(
+            paths.database,
+            kind=INGEST_JOB_KIND,
+            payload={"path": str(path.resolve()), "metadata": {}},
+        )
+        for path in (first_pdf, second_pdf)
+    ]
+    adapter = FakeSourceAdapter()
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    runner_instance = DaemonRunner(
+        database_path=paths.database,
+        handlers={INGEST_JOB_KIND: handler},
+        poll_interval=0,
+    )
+
+    asyncio.run(runner_instance.run_cycle())
+    asyncio.run(runner_instance.run_cycle())
+
+    assert [get_job(paths.database, job.id).result["outcome"] for job in jobs] == [  # type: ignore[index]
+        "created",
+        "created",
+    ]
+    assert len(list_documents(paths.database)) == 2
+    assert len(adapter.inputs) == 2
+
+
+def test_failed_unpublished_artifact_is_reused_on_retry(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_pdf = tmp_path / "packet.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\nretry")
+    paths = initialize_storage(data_dir)
+    job = create_job(
+        paths.database,
+        kind=INGEST_JOB_KIND,
+        payload={"path": str(source_pdf.resolve()), "metadata": {}},
+    )
+    failing_handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=FailingSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: failing_handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone() == (0,)
+    retry_failed_job(paths.database, job.id)
+    successful_handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: successful_handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, job.id)
+    assert updated_job.status == "done"
+    assert updated_job.result is not None and updated_job.result["outcome"] == "created"
+    assert len(list_documents(paths.database)) == 1
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
+        assert connection.execute("SELECT state FROM source_artifacts").fetchone() == ("published",)
+
+
+def test_concurrent_exact_duplicates_converge_on_one_document(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    first_pdf = tmp_path / "first.pdf"
+    second_pdf = tmp_path / "second.pdf"
+    content = b"%PDF-1.4\nconcurrent"
+    first_pdf.write_bytes(content)
+    second_pdf.write_bytes(content)
+    paths = initialize_storage(data_dir)
+    jobs = [
+        create_job(
+            paths.database,
+            kind=INGEST_JOB_KIND,
+            payload={"path": str(path.resolve()), "metadata": {}},
+        )
+        for path in (first_pdf, second_pdf)
+    ]
+    adapter = BarrierSourceAdapter(Barrier(2))
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=adapter,
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    def run_one_cycle() -> bool:
+        return asyncio.run(
+            DaemonRunner(
+                database_path=paths.database,
+                handlers={INGEST_JOB_KIND: handler},
+                poll_interval=0,
+            ).run_cycle()
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        processed = list(executor.map(lambda _: run_one_cycle(), range(2)))
+
+    outcomes = sorted(
+        str(get_job(paths.database, job.id).result["outcome"])  # type: ignore[index]
+        for job in jobs
+    )
+    assert processed == [True, True]
+    assert outcomes == ["created", "duplicate_ignored"]
+    assert len(list_documents(paths.database)) == 1
+    assert len(list_pages(paths.database)) == 1
+    assert len(list_chunks(paths.database)) == 1
+    assert len(list_chunk_vectors(paths.lancedb)) == 1
+    assert len(list(paths.source_pdfs.iterdir())) == 1
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
 
 
 def test_retried_ingest_job_keeps_duplicate_detection_idempotent(tmp_path: Path) -> None:
@@ -914,6 +1254,44 @@ class FakeSourceAdapter:
                 ),
             ),
             extractor=ExtractorIdentity(name="fake-adapter"),
+            derived_artifact_path=artifact.artifact_path,
+        )
+
+
+@dataclass(frozen=True)
+class FailingSourceAdapter:
+    @property
+    def media_types(self) -> tuple[str, ...]:
+        return ("application/pdf",)
+
+    def extract(self, artifact: AdapterInput) -> AdapterResult:
+        raise AdapterError(f"extract failed for {artifact.artifact_path}")
+
+
+@dataclass(frozen=True)
+class BarrierSourceAdapter:
+    barrier: Barrier
+
+    @property
+    def media_types(self) -> tuple[str, ...]:
+        return ("application/pdf",)
+
+    def extract(self, artifact: AdapterInput) -> AdapterResult:
+        self.barrier.wait(timeout=5)
+        return AdapterResult(
+            media_type="application/pdf",
+            units=(
+                CanonicalSourceUnit(
+                    ordinal=1,
+                    location_type="page",
+                    location={"page_number": 1},
+                    human_label="p. 1",
+                    normalized_text="Concurrent agenda",
+                    structure={},
+                    extractor=ExtractorIdentity(name="barrier-adapter"),
+                ),
+            ),
+            extractor=ExtractorIdentity(name="barrier-adapter"),
             derived_artifact_path=artifact.artifact_path,
         )
 
