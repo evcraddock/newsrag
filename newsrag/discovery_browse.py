@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from newsrag.discovery import DiscoveryEvidenceRecord, DiscoveryItemRecord
+from newsrag.source_locations import format_evidence_location
 
 DEFAULT_DISCOVERY_LIST_LIMIT = 50
 MAX_DISCOVERY_LIST_LIMIT = 500
@@ -368,6 +369,10 @@ def _load_evidence_for_rows(
             id,
             item_id,
             document_id,
+            source_unit_start_id,
+            source_unit_end_id,
+            location_type,
+            location_label,
             page_id,
             passage_id,
             page_start,
@@ -422,10 +427,14 @@ def _row_to_evidence(row: sqlite3.Row) -> DiscoveryEvidenceRecord:
         id=str(row["id"]),
         item_id=str(row["item_id"]),
         document_id=str(row["document_id"]),
+        source_unit_start_id=str(row["source_unit_start_id"]),
+        source_unit_end_id=str(row["source_unit_end_id"]),
+        location_type=str(row["location_type"]),
+        location_label=str(row["location_label"]),
         page_id=str(row["page_id"]) if row["page_id"] is not None else None,
         passage_id=str(row["passage_id"]) if row["passage_id"] is not None else None,
-        page_start=int(row["page_start"]),
-        page_end=int(row["page_end"]),
+        page_start=int(row["page_start"]) if row["page_start"] is not None else None,
+        page_end=int(row["page_end"]) if row["page_end"] is not None else None,
         quote=str(row["quote"]),
         validation_status=str(row["validation_status"]),
         created_at=str(row["created_at"]),
@@ -489,11 +498,14 @@ def _first_citation(item: DiscoveryItemRecord) -> str | None:
 
 
 def _format_evidence_reference(evidence: DiscoveryEvidenceRecord) -> str:
-    if evidence.page_start == evidence.page_end:
-        page_label = f"p.{evidence.page_start}"
-    else:
-        page_label = f"pp.{evidence.page_start}-{evidence.page_end}"
-    return f"{evidence.document_id} {page_label}"
+    location_label = format_evidence_location(
+        location_type=evidence.location_type,
+        location_label=evidence.location_label,
+        page_start=evidence.page_start,
+        page_end=evidence.page_end,
+        compact_pdf=True,
+    )
+    return f"{evidence.document_id} {location_label}"
 
 
 def _best_source(item: DiscoveryBrowseItem) -> str | None:

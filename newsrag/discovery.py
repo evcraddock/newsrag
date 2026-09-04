@@ -8,6 +8,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from newsrag.source_locations import (
+    ResolvedSourceRange,
+    SourceLocationError,
+    load_document_extent,
+    resolve_source_range,
+    validate_evidence_quote,
+)
+
 
 class DiscoveryError(Exception):
     """Raised when discovery records cannot be persisted or loaded."""
@@ -19,7 +27,9 @@ class DocumentProfileRecord:
 
     id: str
     document_id: str
-    page_count: int
+    source_type: str
+    extent_type: str
+    extent_count: int
     text_length: int
     extraction_quality: dict[str, Any]
     extractor: str
@@ -51,11 +61,10 @@ class DiscoveryEvidenceDraft:
     """Evidence reference to persist for one discovery item."""
 
     document_id: str
-    page_start: int
-    page_end: int
+    source_unit_start_id: str
+    source_unit_end_id: str
     quote: str
     validation_status: str
-    page_id: str | None = None
     passage_id: str | None = None
 
 
@@ -66,10 +75,14 @@ class DiscoveryEvidenceRecord:
     id: str
     item_id: str
     document_id: str
+    source_unit_start_id: str
+    source_unit_end_id: str
+    location_type: str
+    location_label: str
     page_id: str | None
     passage_id: str | None
-    page_start: int
-    page_end: int
+    page_start: int | None
+    page_end: int | None
     quote: str
     validation_status: str
     created_at: str
@@ -97,7 +110,6 @@ def create_document_profile(
     database_path: Path,
     *,
     document_id: str,
-    page_count: int,
     text_length: int,
     extraction_quality: dict[str, Any] | None = None,
     extractor: str,
@@ -109,8 +121,6 @@ def create_document_profile(
 
     _validate_non_empty(document_id, field_name="document_id")
     _validate_non_empty(extractor, field_name="extractor")
-    if page_count < 0:
-        raise DiscoveryError("page_count must be zero or greater")
     if text_length < 0:
         raise DiscoveryError("text_length must be zero or greater")
 
@@ -118,21 +128,29 @@ def create_document_profile(
     quality_json = _dump_json_object(extraction_quality or {}, field_name="extraction_quality")
 
     with sqlite3.connect(database_path) as connection:
+        try:
+            extent = load_document_extent(connection, document_id)
+        except SourceLocationError as exc:
+            raise DiscoveryError(str(exc)) from exc
         connection.execute(
             """
             INSERT INTO document_profiles(
                 id,
                 document_id,
-                page_count,
+                source_type,
+                extent_type,
+                extent_count,
                 text_length,
                 extraction_quality_json,
                 extractor,
                 provider,
                 model
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(document_id) DO UPDATE SET
-                page_count = excluded.page_count,
+                source_type = excluded.source_type,
+                extent_type = excluded.extent_type,
+                extent_count = excluded.extent_count,
                 text_length = excluded.text_length,
                 extraction_quality_json = excluded.extraction_quality_json,
                 extractor = excluded.extractor,
@@ -143,7 +161,9 @@ def create_document_profile(
             (
                 resolved_profile_id,
                 document_id,
-                page_count,
+                extent.source_type,
+                extent.extent_type,
+                extent.extent_count,
                 text_length,
                 quality_json,
                 extractor.strip(),
@@ -166,7 +186,9 @@ def get_document_profile(database_path: Path, document_id: str) -> DocumentProfi
             SELECT
                 id,
                 document_id,
-                page_count,
+                source_type,
+                extent_type,
+                extent_count,
                 text_length,
                 extraction_quality_json,
                 extractor,
@@ -344,6 +366,21 @@ def create_discovery_item(
     value_json = _dump_json_object(value or {}, field_name="value")
 
     with sqlite3.connect(database_path) as connection:
+        resolved_evidence: list[ResolvedSourceRange] = []
+        try:
+            for draft in evidence:
+                resolved = resolve_source_range(
+                    connection,
+                    document_id=document_id,
+                    source_unit_start_id=draft.source_unit_start_id,
+                    source_unit_end_id=draft.source_unit_end_id,
+                    passage_id=draft.passage_id,
+                )
+                validate_evidence_quote(resolved, draft.quote)
+                resolved_evidence.append(resolved)
+        except SourceLocationError as exc:
+            raise DiscoveryError(str(exc)) from exc
+
         connection.execute(
             """
             INSERT INTO discovery_items(
@@ -386,6 +423,10 @@ def create_discovery_item(
                 id,
                 item_id,
                 document_id,
+                source_unit_start_id,
+                source_unit_end_id,
+                location_type,
+                location_label,
                 page_id,
                 passage_id,
                 page_start,
@@ -393,21 +434,25 @@ def create_discovery_item(
                 quote,
                 validation_status
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     f"evidence-{uuid.uuid4().hex[:8]}",
                     resolved_item_id,
                     draft.document_id,
-                    draft.page_id,
-                    draft.passage_id,
-                    draft.page_start,
-                    draft.page_end,
+                    resolved.source_unit_start_id,
+                    resolved.source_unit_end_id,
+                    resolved.location_type,
+                    resolved.location_label,
+                    resolved.page_id,
+                    resolved.passage_id,
+                    resolved.page_start,
+                    resolved.page_end,
                     draft.quote,
                     draft.validation_status.strip(),
                 )
-                for draft in evidence
+                for draft, resolved in zip(evidence, resolved_evidence, strict=True)
             ],
         )
         connection.commit()
@@ -480,6 +525,10 @@ def list_discovery_items(
                     id,
                     item_id,
                     document_id,
+                    source_unit_start_id,
+                    source_unit_end_id,
+                    location_type,
+                    location_label,
                     page_id,
                     passage_id,
                     page_start,
@@ -529,10 +578,14 @@ def _validate_evidence_draft(
     _validate_non_empty(draft.validation_status, field_name="evidence.validation_status")
     if draft.document_id != item_document_id:
         raise DiscoveryError("evidence.document_id must match discovery item document_id")
-    if draft.page_start < 1:
-        raise DiscoveryError("evidence.page_start must be 1 or greater")
-    if draft.page_end < draft.page_start:
-        raise DiscoveryError("evidence.page_end must be greater than or equal to page_start")
+    _validate_non_empty(
+        draft.source_unit_start_id,
+        field_name="evidence.source_unit_start_id",
+    )
+    _validate_non_empty(
+        draft.source_unit_end_id,
+        field_name="evidence.source_unit_end_id",
+    )
 
 
 def _dump_json_object(value: dict[str, Any], *, field_name: str) -> str:
@@ -572,7 +625,9 @@ def _row_to_document_profile(row: sqlite3.Row) -> DocumentProfileRecord:
     return DocumentProfileRecord(
         id=str(row["id"]),
         document_id=str(row["document_id"]),
-        page_count=int(row["page_count"]),
+        source_type=str(row["source_type"]),
+        extent_type=str(row["extent_type"]),
+        extent_count=int(row["extent_count"]),
         text_length=int(row["text_length"]),
         extraction_quality=_load_json_object(row["extraction_quality_json"]),
         extractor=str(row["extractor"]),
@@ -604,10 +659,14 @@ def _row_to_discovery_evidence(row: sqlite3.Row) -> DiscoveryEvidenceRecord:
         id=str(row["id"]),
         item_id=str(row["item_id"]),
         document_id=str(row["document_id"]),
+        source_unit_start_id=str(row["source_unit_start_id"]),
+        source_unit_end_id=str(row["source_unit_end_id"]),
+        location_type=str(row["location_type"]),
+        location_label=str(row["location_label"]),
         page_id=str(row["page_id"]) if row["page_id"] is not None else None,
         passage_id=str(row["passage_id"]) if row["passage_id"] is not None else None,
-        page_start=int(row["page_start"]),
-        page_end=int(row["page_end"]),
+        page_start=int(row["page_start"]) if row["page_start"] is not None else None,
+        page_end=int(row["page_end"]) if row["page_end"] is not None else None,
         quote=str(row["quote"]),
         validation_status=str(row["validation_status"]),
         created_at=str(row["created_at"]),

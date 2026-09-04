@@ -145,6 +145,32 @@ def test_leads_list_and_show_include_supporting_evidence(tmp_path: Path) -> None
     assert 'quote: "Council awarded a $250,000 stormwater contract."' in show_result.stdout
 
 
+def test_html_topics_timeline_and_leads_use_heading_block_citations(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    _seed_html_discovery_browse_data(data_dir)
+
+    topics_result = runner.invoke(app, ["--data-dir", str(data_dir), "topics", "list"])
+    timeline_result = runner.invoke(app, ["--data-dir", str(data_dir), "timeline"])
+    leads_result = runner.invoke(app, ["--data-dir", str(data_dir), "leads", "list"])
+    show_result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "leads", "show", "lead-html-budget"],
+    )
+
+    citation = "document-html Council Update — Budget — block 3"
+    assert topics_result.exit_code == 0, topics_result.stdout
+    assert timeline_result.exit_code == 0, timeline_result.stdout
+    assert leads_result.exit_code == 0, leads_result.stdout
+    assert show_result.exit_code == 0, show_result.stdout
+    assert f"citation={citation}" in topics_result.stdout
+    assert f"citation={citation}" in timeline_result.stdout
+    assert f"citation={citation}" in leads_result.stdout
+    assert citation in show_result.stdout
+    assert 'quote: "Council approved the $500,000 budget amendment."' in show_result.stdout
+
+
 def test_leads_show_missing_id_fails_clearly(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     initialize_storage(data_dir)
@@ -160,6 +186,38 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
     with sqlite3.connect(database_path) as connection:
         connection.executemany(
             """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES(?, 'local_path', ?, ?)
+            """,
+            [
+                ("source-council", "/tmp/council.pdf", "/tmp/council.pdf"),
+                ("source-planning", "/tmp/planning.pdf", "/tmp/planning.pdf"),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(?, ?, 'application/pdf', 10, ?, ?, CURRENT_TIMESTAMP, 'published')
+            """,
+            [
+                (
+                    "artifact-council",
+                    "source-council",
+                    "hash-council",
+                    "/tmp/council.pdf",
+                ),
+                (
+                    "artifact-planning",
+                    "source-planning",
+                    "hash-planning",
+                    "/tmp/planning.pdf",
+                ),
+            ],
+        )
+        connection.executemany(
+            """
             INSERT INTO documents(
                 id,
                 source_path,
@@ -168,9 +226,10 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
                 source_hash,
                 normalized_path,
                 metadata_json,
+                artifact_id,
                 created_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -181,6 +240,7 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
                     "hash-council",
                     "/tmp/council-ocr.pdf",
                     '{"body": "City Council", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-05-12"}',
+                    "artifact-council",
                     "2026-05-12T00:00:00+00:00",
                 ),
                 (
@@ -191,20 +251,51 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
                     "hash-planning",
                     "/tmp/planning-ocr.pdf",
                     '{"body": "Planning Board", "document_type": "staff_report", "jurisdiction": "Example City", "meeting_date": "2026-04-10"}',
+                    "artifact-planning",
                     "2026-04-10T00:00:00+00:00",
                 ),
             ],
         )
         connection.executemany(
             """
-            INSERT INTO pages(id, document_id, page_number, text, extractor)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(?, ?, ?, ?, 'page', ?, ?, ?, '{}', 'pymupdf')
+            """,
+            [
+                (
+                    "unit-council-2",
+                    "artifact-council",
+                    "document-council",
+                    2,
+                    '{"page_number": 2}',
+                    "p. 2",
+                    "Council awarded a $250,000 stormwater contract. Work must begin by June 1, 2026.",
+                ),
+                (
+                    "unit-planning-1",
+                    "artifact-planning",
+                    "document-planning",
+                    1,
+                    '{"page_number": 1}',
+                    "p. 1",
+                    "Planning Board reviewed the zoning request.",
+                ),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+            VALUES(?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     "page-council-2",
                     "document-council",
                     2,
+                    "unit-council-2",
                     "Council awarded a $250,000 stormwater contract. Work must begin by June 1, 2026.",
                     "pymupdf",
                 ),
@@ -212,6 +303,7 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
                     "page-planning-1",
                     "document-planning",
                     1,
+                    "unit-planning-1",
                     "Planning Board reviewed the zoning request.",
                     "pymupdf",
                 ),
@@ -307,6 +399,79 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
     return database_path
 
 
+def _seed_html_discovery_browse_data(data_dir: Path) -> Path:
+    database_path = initialize_storage(data_dir).database
+    quote = "Council approved the $500,000 budget amendment."
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-html', 'local_path', '/tmp/update.html', '/tmp/update.html')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-html', 'source-html', 'text/html', 10, 'hash-html',
+                '/tmp/update.html', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(id, source_path, title, source_hash, metadata_json, artifact_id)
+            VALUES(
+                'document-html', '/tmp/update.html', 'Council Update', 'hash-html',
+                '{"body": "City Council"}', 'artifact-html'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(
+                'unit-html-3', 'artifact-html', 'document-html', 3, 'html_block',
+                '{"block_number": 3}', 'block 3', ?,
+                '{"heading_path": ["Council Update", "Budget"]}', 'static-html'
+            )
+            """,
+            (quote,),
+        )
+        connection.commit()
+
+    for item_id, item_type, label in (
+        ("topic-html-budget", "topic", "budget"),
+        ("action-html-approved", "action", "approved"),
+        ("lead-html-budget", "story_lead", "Follow budget amendment"),
+    ):
+        create_discovery_item(
+            database_path,
+            document_id="document-html",
+            item_id=item_id,
+            item_type=item_type,
+            label=label,
+            summary="Evidence from the web update.",
+            confidence=0.8,
+            extractor="test-extractor",
+            evidence=(
+                DiscoveryEvidenceDraft(
+                    document_id="document-html",
+                    source_unit_start_id="unit-html-3",
+                    source_unit_end_id="unit-html-3",
+                    quote=quote,
+                    validation_status="validated",
+                ),
+            ),
+        )
+    return database_path
+
+
 def _create_item(
     database_path: Path,
     *,
@@ -321,6 +486,7 @@ def _create_item(
     quote: str,
     value: dict[str, object] | None = None,
 ) -> None:
+    del page
     create_discovery_item(
         database_path,
         document_id=document_id,
@@ -336,9 +502,8 @@ def _create_item(
         evidence=(
             DiscoveryEvidenceDraft(
                 document_id=document_id,
-                page_id=page_id,
-                page_start=page,
-                page_end=page,
+                source_unit_start_id=page_id.replace("page-", "unit-"),
+                source_unit_end_id=page_id.replace("page-", "unit-"),
                 quote=quote,
                 validation_status="validated",
             ),

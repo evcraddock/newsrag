@@ -45,7 +45,6 @@ def test_document_profile_can_be_created_and_replaced(tmp_path: Path) -> None:
     first_profile = create_document_profile(
         database_path,
         document_id="document-a",
-        page_count=2,
         text_length=42,
         extraction_quality={"empty_pages": 0},
         extractor="deterministic",
@@ -56,7 +55,6 @@ def test_document_profile_can_be_created_and_replaced(tmp_path: Path) -> None:
     second_profile = create_document_profile(
         database_path,
         document_id="document-a",
-        page_count=3,
         text_length=84,
         extraction_quality={"empty_pages": 1},
         extractor="deterministic",
@@ -68,12 +66,48 @@ def test_document_profile_can_be_created_and_replaced(tmp_path: Path) -> None:
 
     assert first_profile.id == "profile-a"
     assert second_profile.id == "profile-a"
-    assert loaded_profile.page_count == 3
+    assert loaded_profile.source_type == "pdf"
+    assert loaded_profile.extent_type == "pages"
+    assert loaded_profile.extent_count == 2
     assert loaded_profile.text_length == 84
     assert loaded_profile.extraction_quality == {"empty_pages": 1}
     assert loaded_profile.extractor == "deterministic"
     assert loaded_profile.provider == "rules"
     assert loaded_profile.model == "rules-v2"
+
+
+def test_html_profile_and_evidence_use_typed_block_locations(tmp_path: Path) -> None:
+    database_path = _seed_html_discovery_document(tmp_path)
+
+    profile = create_document_profile(
+        database_path,
+        document_id="document-html",
+        text_length=54,
+        extractor="deterministic",
+    )
+    item = create_discovery_item(
+        database_path,
+        document_id="document-html",
+        item_type="topic",
+        label="budget",
+        extractor="deterministic",
+        evidence=(
+            DiscoveryEvidenceDraft(
+                document_id="document-html",
+                source_unit_start_id="unit-html-3",
+                source_unit_end_id="unit-html-3",
+                quote="Council approved the budget amendment.",
+                validation_status="validated",
+            ),
+        ),
+    )
+
+    assert profile.source_type == "html"
+    assert profile.extent_type == "blocks"
+    assert profile.extent_count == 1
+    assert item.evidence[0].location_type == "html_block"
+    assert item.evidence[0].location_label == "Council Update — Budget — block 3"
+    assert item.evidence[0].page_start is None
 
 
 def test_document_brief_persists_provider_identity_and_fts(tmp_path: Path) -> None:
@@ -129,10 +163,9 @@ def test_discovery_item_persists_evidence_references_and_identity(
         evidence=(
             DiscoveryEvidenceDraft(
                 document_id="document-a",
-                page_id="page-a-1",
+                source_unit_start_id="unit-a-1",
+                source_unit_end_id="unit-a-1",
                 passage_id="passage-a-1",
-                page_start=1,
-                page_end=1,
                 quote="Approve a $250,000 stormwater contract.",
                 validation_status="validated",
             ),
@@ -155,6 +188,10 @@ def test_discovery_item_persists_evidence_references_and_identity(
     assert item.model == "rules-v1"
     assert len(item.evidence) == 1
     assert item.evidence[0].document_id == "document-a"
+    assert item.evidence[0].source_unit_start_id == "unit-a-1"
+    assert item.evidence[0].source_unit_end_id == "unit-a-1"
+    assert item.evidence[0].location_type == "page"
+    assert item.evidence[0].location_label == "p. 1"
     assert item.evidence[0].page_id == "page-a-1"
     assert item.evidence[0].passage_id == "passage-a-1"
     assert item.evidence[0].page_start == 1
@@ -171,7 +208,7 @@ def test_discovery_item_persists_evidence_references_and_identity(
     ]
 
 
-def test_discovery_item_validates_confidence_and_evidence_pages(tmp_path: Path) -> None:
+def test_discovery_item_validates_typed_evidence_and_quotes(tmp_path: Path) -> None:
     database_path = _seed_discovery_document(tmp_path)
 
     with pytest.raises(DiscoveryError, match="confidence must be between 0 and 1"):
@@ -184,7 +221,7 @@ def test_discovery_item_validates_confidence_and_evidence_pages(tmp_path: Path) 
             extractor="deterministic",
         )
 
-    with pytest.raises(DiscoveryError, match="evidence.page_end"):
+    with pytest.raises(DiscoveryError, match="source-unit range is reversed"):
         create_discovery_item(
             database_path,
             document_id="document-a",
@@ -194,9 +231,9 @@ def test_discovery_item_validates_confidence_and_evidence_pages(tmp_path: Path) 
             evidence=(
                 DiscoveryEvidenceDraft(
                     document_id="document-a",
-                    page_start=2,
-                    page_end=1,
-                    quote="Stormwater",
+                    source_unit_start_id="unit-a-2",
+                    source_unit_end_id="unit-a-1",
+                    quote="Second page",
                     validation_status="validated",
                 ),
             ),
@@ -212,8 +249,8 @@ def test_discovery_item_validates_confidence_and_evidence_pages(tmp_path: Path) 
             evidence=(
                 DiscoveryEvidenceDraft(
                     document_id="document-other",
-                    page_start=1,
-                    page_end=1,
+                    source_unit_start_id="unit-a-1",
+                    source_unit_end_id="unit-a-1",
                     quote="Stormwater",
                     validation_status="validated",
                 ),
@@ -230,13 +267,78 @@ def test_discovery_item_validates_confidence_and_evidence_pages(tmp_path: Path) 
             evidence=(
                 DiscoveryEvidenceDraft(
                     document_id="document-a",
-                    page_start=1,
-                    page_end=1,
+                    source_unit_start_id="unit-a-1",
+                    source_unit_end_id="unit-a-1",
                     quote="",
                     validation_status="validated",
                 ),
             ),
         )
+
+    with pytest.raises(DiscoveryError, match="quote was not found"):
+        create_discovery_item(
+            database_path,
+            document_id="document-a",
+            item_type="topic",
+            label="Stormwater",
+            extractor="deterministic",
+            evidence=(
+                DiscoveryEvidenceDraft(
+                    document_id="document-a",
+                    source_unit_start_id="unit-a-1",
+                    source_unit_end_id="unit-a-1",
+                    quote="Unsupported quote",
+                    validation_status="validated",
+                ),
+            ),
+        )
+
+
+def _seed_html_discovery_document(tmp_path: Path) -> Path:
+    database_path = initialize_storage(tmp_path / ".newsrag").database
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-html', 'local_path', '/tmp/update.html', '/tmp/update.html')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-html', 'source-html', 'text/html', 10, 'hash-html',
+                '/tmp/update.html', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(id, source_path, title, source_hash, metadata_json, artifact_id)
+            VALUES(
+                'document-html', '/tmp/update.html', 'Council Update', 'hash-html',
+                '{}', 'artifact-html'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(
+                'unit-html-3', 'artifact-html', 'document-html', 3, 'html_block',
+                '{"block_number": 3}', 'block 3',
+                'Council approved the budget amendment.',
+                '{"heading_path": ["Council Update", "Budget"]}', 'static-html'
+            )
+            """
+        )
+        connection.commit()
+    return database_path
 
 
 def _seed_discovery_document(tmp_path: Path) -> Path:
@@ -245,8 +347,28 @@ def _seed_discovery_document(tmp_path: Path) -> Path:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
             """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-a', 'local_path', '/tmp/stormwater.pdf', '/tmp/stormwater.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-a', 'source-a', 'application/pdf', 10, 'hash-a',
+                '/tmp/stormwater.pdf', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, source_path, source_url, title, source_hash, normalized_path,
+                metadata_json, artifact_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "document-a",
@@ -256,38 +378,67 @@ def _seed_discovery_document(tmp_path: Path) -> Path:
                 "hash-a",
                 "/tmp/stormwater-ocr.pdf",
                 '{"body": "Planning Commission", "meeting_date": "2026-05-01"}',
+                "artifact-a",
             ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(?, 'artifact-a', 'document-a', ?, 'page', ?, ?, ?, '{}', 'pymupdf')
+            """,
+            [
+                (
+                    "unit-a-1",
+                    1,
+                    '{"page_number": 1}',
+                    "p. 1",
+                    "Approve a $250,000 stormwater contract.",
+                ),
+                ("unit-a-2", 2, '{"page_number": 2}', "p. 2", "Second page text."),
+            ],
         )
         connection.execute(
             """
-            INSERT INTO pages(id, document_id, page_number, text, extractor)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+            VALUES(?, ?, ?, ?, ?, ?)
             """,
             (
                 "page-a-1",
                 "document-a",
                 1,
+                "unit-a-1",
                 "Approve a $250,000 stormwater contract.",
                 "pymupdf",
             ),
         )
         connection.execute(
             """
-            INSERT INTO chunks(id, document_id, page_start, page_end, text)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO chunks(
+                id, document_id, page_start, page_end, source_unit_start_id,
+                source_unit_end_id, text
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "chunk-a-1",
                 "document-a",
                 1,
                 1,
+                "unit-a-1",
+                "unit-a-1",
                 "Approve a $250,000 stormwater contract.",
             ),
         )
         connection.execute(
             """
-            INSERT INTO passages(id, chunk_id, document_id, page_start, page_end, ordinal, text)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO passages(
+                id, chunk_id, document_id, page_start, page_end, source_unit_start_id,
+                source_unit_end_id, ordinal, text
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "passage-a-1",
@@ -295,6 +446,8 @@ def _seed_discovery_document(tmp_path: Path) -> Path:
                 "document-a",
                 1,
                 1,
+                "unit-a-1",
+                "unit-a-1",
                 1,
                 "Approve a $250,000 stormwater contract.",
             ),

@@ -14,6 +14,12 @@ from newsrag.discovery import (
     create_discovery_item,
     create_document_brief,
 )
+from newsrag.source_locations import (
+    ResolvedSourceRange,
+    SourceLocationError,
+    format_evidence_location,
+    resolve_source_range,
+)
 
 ENRICHMENT_EXTRACTOR = "structured-llm-enrichment"
 SUMMARY_ITEM_TYPE = "summary"
@@ -31,9 +37,13 @@ class EvidenceContext:
     """Page or passage text available for quote validation."""
 
     document_id: str
-    page_start: int
-    page_end: int
+    source_unit_start_id: str
+    source_unit_end_id: str
+    location_type: str
+    location_label: str
     text: str
+    page_start: int | None = None
+    page_end: int | None = None
     page_id: str | None = None
     passage_id: str | None = None
 
@@ -178,10 +188,17 @@ def format_enrichment_result(result: EnrichmentResult) -> str:
         "items:",
     ]
     for item in result.items:
-        page_label = ""
+        location = ""
         if item.evidence:
-            page_label = f" p.{item.evidence[0].page_start}"
-        lines.append(f"- {item.item_type}: {item.label}{page_label}")
+            evidence = item.evidence[0]
+            location = " " + format_evidence_location(
+                location_type=evidence.location_type,
+                location_label=evidence.location_label,
+                page_start=evidence.page_start,
+                page_end=evidence.page_end,
+                compact_pdf=True,
+            )
+        lines.append(f"- {item.item_type}: {item.label}{location}")
     return "\n".join(lines)
 
 
@@ -215,47 +232,47 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
         if document_row is None:
             raise EnrichmentError(f"Unknown document: {document_id}")
 
-        page_rows = connection.execute(
+        source_unit_rows = connection.execute(
             """
-            SELECT id, page_number, text
-            FROM pages
+            SELECT id
+            FROM source_units
             WHERE document_id = ?
-            ORDER BY page_number ASC, id ASC
+            ORDER BY ordinal ASC, id ASC
             """,
             (document_id,),
         ).fetchall()
         passage_rows = connection.execute(
             """
-            SELECT id, page_start, page_end, text
+            SELECT id
             FROM passages
-            WHERE document_id = ?
+            WHERE document_id = ? AND source_unit_start_id IS NOT NULL
             ORDER BY page_start ASC, ordinal ASC, id ASC
             """,
             (document_id,),
         ).fetchall()
+        contexts: list[EvidenceContext] = []
+        try:
+            for row in source_unit_rows:
+                source_unit_id = str(row["id"])
+                resolved = resolve_source_range(
+                    connection,
+                    document_id=document_id,
+                    source_unit_start_id=source_unit_id,
+                    source_unit_end_id=source_unit_id,
+                )
+                contexts.append(_resolved_to_evidence_context(resolved))
+            for row in passage_rows:
+                passage_id = str(row["id"])
+                resolved = resolve_source_range(
+                    connection,
+                    document_id=document_id,
+                    source_unit_start_id=None,
+                    passage_id=passage_id,
+                )
+                contexts.append(_resolved_to_evidence_context(resolved))
+        except SourceLocationError as exc:
+            raise EnrichmentError(str(exc)) from exc
 
-    contexts = [
-        EvidenceContext(
-            document_id=document_id,
-            page_id=str(row["id"]),
-            page_start=int(row["page_number"]),
-            page_end=int(row["page_number"]),
-            text=str(row["text"]),
-        )
-        for row in page_rows
-        if str(row["text"]).strip()
-    ]
-    contexts.extend(
-        EvidenceContext(
-            document_id=document_id,
-            passage_id=str(row["id"]),
-            page_start=int(row["page_start"]),
-            page_end=int(row["page_end"]),
-            text=str(row["text"]),
-        )
-        for row in passage_rows
-        if str(row["text"]).strip()
-    )
     if not contexts:
         raise EnrichmentError(f"Document {document_id} has no text available for enrichment")
 
@@ -264,6 +281,21 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
         title=_optional_string(document_row["title"]),
         metadata=_load_metadata(document_row["metadata_json"]),
         evidence_contexts=tuple(contexts),
+    )
+
+
+def _resolved_to_evidence_context(resolved: ResolvedSourceRange) -> EvidenceContext:
+    return EvidenceContext(
+        document_id=resolved.document_id,
+        source_unit_start_id=resolved.source_unit_start_id,
+        source_unit_end_id=resolved.source_unit_end_id,
+        location_type=resolved.location_type,
+        location_label=resolved.location_label,
+        text=resolved.text,
+        page_start=resolved.page_start,
+        page_end=resolved.page_end,
+        page_id=resolved.page_id,
+        passage_id=resolved.passage_id,
     )
 
 
@@ -336,16 +368,16 @@ def _validate_evidence_object(
 ) -> DiscoveryEvidenceDraft:
     if not isinstance(value, dict):
         raise EnrichmentError(f"{field_name} evidence entries must be objects")
-    page_start = _required_int(value, "page_start")
-    page_end = _optional_int(value, "page_end") or page_start
-    if page_start < 1 or page_end < page_start:
-        raise EnrichmentError(f"{field_name} evidence page range is invalid")
+    source_unit_start_id = _optional_string(value.get("source_unit_start_id"))
+    source_unit_end_id = _optional_string(value.get("source_unit_end_id")) or source_unit_start_id
     quote = _required_string(value, "quote")
     passage_id = _optional_string(value.get("passage_id"))
+    if source_unit_start_id is None and passage_id is None:
+        raise EnrichmentError(f"{field_name} evidence requires source_unit_start_id or passage_id")
     context = _find_supporting_context(
         request.evidence_contexts,
-        page_start=page_start,
-        page_end=page_end,
+        source_unit_start_id=source_unit_start_id,
+        source_unit_end_id=source_unit_end_id,
         quote=quote,
         passage_id=passage_id,
     )
@@ -356,10 +388,9 @@ def _validate_evidence_object(
 
     return DiscoveryEvidenceDraft(
         document_id=request.document_id,
-        page_id=context.page_id,
+        source_unit_start_id=context.source_unit_start_id,
+        source_unit_end_id=context.source_unit_end_id,
         passage_id=context.passage_id,
-        page_start=page_start,
-        page_end=page_end,
         quote=quote,
         validation_status=VALIDATION_STATUS_VALIDATED,
     )
@@ -368,8 +399,8 @@ def _validate_evidence_object(
 def _find_supporting_context(
     contexts: Sequence[EvidenceContext],
     *,
-    page_start: int,
-    page_end: int,
+    source_unit_start_id: str | None,
+    source_unit_end_id: str | None,
     quote: str,
     passage_id: str | None,
 ) -> EvidenceContext | None:
@@ -377,7 +408,12 @@ def _find_supporting_context(
     for context in contexts:
         if passage_id is not None and context.passage_id != passage_id:
             continue
-        if context.page_start > page_end or context.page_end < page_start:
+        if (
+            source_unit_start_id is not None
+            and context.source_unit_start_id != source_unit_start_id
+        ):
+            continue
+        if source_unit_end_id is not None and context.source_unit_end_id != source_unit_end_id:
             continue
         if normalized_quote in _normalize_for_match(context.text):
             return context
@@ -408,22 +444,6 @@ def _required_string(payload: Mapping[str, object], key: str) -> str:
     if resolved is None:
         raise EnrichmentError(f"Provider response field '{key}' must be a non-empty string")
     return resolved
-
-
-def _required_int(payload: Mapping[str, object], key: str) -> int:
-    value = payload.get(key)
-    if not isinstance(value, int):
-        raise EnrichmentError(f"Provider response field '{key}' must be an integer")
-    return value
-
-
-def _optional_int(payload: Mapping[str, object], key: str) -> int | None:
-    value = payload.get(key)
-    if value is None:
-        return None
-    if not isinstance(value, int):
-        raise EnrichmentError(f"Provider response field '{key}' must be an integer")
-    return value
 
 
 def _validate_string_list_item(value: object, *, field_name: str) -> str:

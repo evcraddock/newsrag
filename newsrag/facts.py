@@ -14,6 +14,11 @@ from newsrag.discovery import (
     create_discovery_item,
     list_discovery_items,
 )
+from newsrag.source_locations import (
+    SourceLocationError,
+    format_evidence_location,
+    resolve_source_range,
+)
 
 DETERMINISTIC_FACT_EXTRACTOR = "deterministic-civic-facts"
 DETERMINISTIC_FACT_PROVIDER = "rules"
@@ -136,9 +141,8 @@ class FactSource:
 
     document_id: str
     text: str
-    page_start: int
-    page_end: int
-    page_id: str | None = None
+    source_unit_start_id: str
+    source_unit_end_id: str
     passage_id: str | None = None
 
 
@@ -174,7 +178,7 @@ def extract_facts_from_sources(sources: Sequence[FactSource]) -> list[FactDraft]
     """Extract high-confidence civic fact drafts from source text."""
 
     drafts: list[FactDraft] = []
-    seen: set[tuple[str, str, int, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     for source in sources:
         source_text = _normalize_space(source.text)
         if not source_text:
@@ -265,7 +269,13 @@ def format_fact_extraction_result(result: FactExtractionResult) -> str:
         citation = ""
         if item.evidence:
             evidence = item.evidence[0]
-            citation = f" p.{evidence.page_start}"
+            citation = " " + format_evidence_location(
+                location_type=evidence.location_type,
+                location_label=evidence.location_label,
+                page_start=evidence.page_start,
+                page_end=evidence.page_end,
+                compact_pdf=True,
+            )
         lines.append(f"- {item.item_type}: {item.label} confidence={item.confidence:.2f}{citation}")
     return "\n".join(lines)
 
@@ -281,24 +291,35 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
             raise FactExtractionError(f"Unknown document: {document_id}")
         rows = connection.execute(
             """
-            SELECT id, document_id, page_number, text
-            FROM pages
+            SELECT id
+            FROM source_units
             WHERE document_id = ?
-            ORDER BY page_number ASC, id ASC
+            ORDER BY ordinal ASC, id ASC
             """,
             (document_id,),
         ).fetchall()
+        sources: list[FactSource] = []
+        try:
+            for row in rows:
+                source_unit_id = str(row["id"])
+                resolved = resolve_source_range(
+                    connection,
+                    document_id=document_id,
+                    source_unit_start_id=source_unit_id,
+                    source_unit_end_id=source_unit_id,
+                )
+                sources.append(
+                    FactSource(
+                        document_id=document_id,
+                        text=resolved.text,
+                        source_unit_start_id=resolved.source_unit_start_id,
+                        source_unit_end_id=resolved.source_unit_end_id,
+                    )
+                )
+        except SourceLocationError as exc:
+            raise FactExtractionError(str(exc)) from exc
 
-    return tuple(
-        FactSource(
-            document_id=str(row["document_id"]),
-            text=str(row["text"]),
-            page_start=int(row["page_number"]),
-            page_end=int(row["page_number"]),
-            page_id=str(row["id"]),
-        )
-        for row in rows
-    )
+    return tuple(sources)
 
 
 def _extract_regex_facts(source: FactSource) -> Iterable[FactDraft]:
@@ -459,10 +480,9 @@ def _fact_draft(
         confidence=confidence,
         evidence=DiscoveryEvidenceDraft(
             document_id=source.document_id,
-            page_id=source.page_id,
+            source_unit_start_id=source.source_unit_start_id,
+            source_unit_end_id=source.source_unit_end_id,
             passage_id=source.passage_id,
-            page_start=source.page_start,
-            page_end=source.page_end,
             quote=_normalize_space(quote),
             validation_status=VALIDATION_STATUS_VALIDATED,
         ),
@@ -478,7 +498,7 @@ def _iter_sentences(source: FactSource) -> Iterable[str]:
 
 def _append_unique(
     drafts: list[FactDraft],
-    seen: set[tuple[str, str, int, str]],
+    seen: set[tuple[str, str, str, str]],
     draft: FactDraft,
 ) -> None:
     key = _fact_key(draft)
@@ -488,18 +508,18 @@ def _append_unique(
     drafts.append(draft)
 
 
-def _fact_key(draft: FactDraft) -> tuple[str, str, int, str]:
+def _fact_key(draft: FactDraft) -> tuple[str, str, str, str]:
     if draft.item_type in {"entity", "topic"}:
-        return (draft.item_type, draft.label.casefold(), 0, "")
+        return (draft.item_type, draft.label.casefold(), "", "")
     return (
         draft.item_type,
         draft.label.casefold(),
-        draft.evidence.page_start,
+        draft.evidence.source_unit_start_id,
         draft.evidence.quote.casefold(),
     )
 
 
-def _existing_fact_keys(database_path: Path, document_id: str) -> set[tuple[str, str, int, str]]:
+def _existing_fact_keys(database_path: Path, document_id: str) -> set[tuple[str, str, str, str]]:
     existing = list_discovery_items(database_path, document_id=document_id)
     keys = set()
     for item in existing:
@@ -507,13 +527,13 @@ def _existing_fact_keys(database_path: Path, document_id: str) -> set[tuple[str,
             continue
         for evidence in item.evidence:
             if item.item_type in {"entity", "topic"}:
-                keys.add((item.item_type, item.label.casefold(), 0, ""))
+                keys.add((item.item_type, item.label.casefold(), "", ""))
             else:
                 keys.add(
                     (
                         item.item_type,
                         item.label.casefold(),
-                        evidence.page_start,
+                        evidence.source_unit_start_id,
                         evidence.quote.casefold(),
                     )
                 )

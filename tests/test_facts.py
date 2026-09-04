@@ -22,10 +22,9 @@ def test_deterministic_extractors_create_evidence_backed_fact_drafts() -> None:
         [
             FactSource(
                 document_id="document-a",
-                page_id="page-a-1",
-                passage_id="passage-a-1",
-                page_start=4,
-                page_end=4,
+                source_unit_start_id="unit-a-4",
+                source_unit_end_id="unit-a-4",
+                passage_id="passage-a-4",
                 text=(
                     "Council approved a $250,000 stormwater contract with ABC Construction. "
                     "Work must begin by June 1, 2026 and is 95% funded. "
@@ -51,9 +50,9 @@ def test_deterministic_extractors_create_evidence_backed_fact_drafts() -> None:
     assert money.value == {"amount_text": "$250,000"}
     assert money.confidence == 0.95
     assert money.evidence.document_id == "document-a"
-    assert money.evidence.page_id == "page-a-1"
-    assert money.evidence.passage_id == "passage-a-1"
-    assert money.evidence.page_start == 4
+    assert money.evidence.source_unit_start_id == "unit-a-4"
+    assert money.evidence.source_unit_end_id == "unit-a-4"
+    assert money.evidence.passage_id == "passage-a-4"
     assert money.evidence.validation_status == "validated"
     assert "$250,000 stormwater contract" in money.evidence.quote
 
@@ -66,8 +65,8 @@ def test_false_positive_dates_and_entities_are_filtered_or_low_confidence() -> N
         [
             FactSource(
                 document_id="document-a",
-                page_start=1,
-                page_end=1,
+                source_unit_start_id="unit-a-1",
+                source_unit_end_id="unit-a-1",
                 text=(
                     "Page 1 of 2\nCity Manager Report\nInvalid date 2026-99-99. "
                     "Planning Commission reviewed the zoning request."
@@ -110,9 +109,29 @@ def test_extract_document_facts_persists_discovery_items_with_evidence(
     assert money_items[0].provider == "rules"
     assert money_items[0].model == "rules-v1"
     assert money_items[0].confidence == 0.95
+    assert money_items[0].evidence[0].source_unit_start_id == "unit-a-1"
+    assert money_items[0].evidence[0].source_unit_end_id == "unit-a-1"
     assert money_items[0].evidence[0].page_id == "page-a-1"
     assert money_items[0].evidence[0].page_start == 1
     assert "$1.2 million" in money_items[0].evidence[0].quote
+
+
+def test_html_document_facts_use_heading_and_block_evidence(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_html_fact_document(data_dir)
+
+    result = extract_document_facts(database_path, "document-html")
+    items = list_discovery_items(database_path, document_id="document-html")
+
+    assert result.total > 0
+    assert {item.item_type for item in items} >= {"action", "money", "topic"}
+    money = next(item for item in items if item.item_type == "money")
+    evidence = money.evidence[0]
+    assert evidence.source_unit_start_id == "unit-html-3"
+    assert evidence.location_type == "html_block"
+    assert evidence.location_label == "Council Update — Parks — block 3"
+    assert evidence.page_id is None
+    assert evidence.page_start is None
 
 
 def test_discover_document_command_outputs_extraction_status(tmp_path: Path) -> None:
@@ -146,11 +165,36 @@ def test_discover_document_command_reports_missing_document(tmp_path: Path) -> N
 
 def _seed_fact_document(data_dir: Path) -> Path:
     database_path = initialize_storage(data_dir).database
+    page_one_text = (
+        "Council awarded a $1.2 million sewer infrastructure contract "
+        "to ABC Construction. Work must be completed by 2026-06-30."
+    )
+    page_two_text = "Ordinance 2026-10 sets a public hearing for July 1, 2026."
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
-            INSERT INTO documents(id, source_path, source_url, title, source_hash, normalized_path, metadata_json)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-a', 'local_path', '/tmp/council.pdf', '/tmp/council.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-a', 'source-a', 'application/pdf', 10, 'hash-a',
+                '/tmp/council.pdf', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, source_path, source_url, title, source_hash, normalized_path,
+                metadata_json, artifact_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "document-a",
@@ -160,32 +204,79 @@ def _seed_fact_document(data_dir: Path) -> Path:
                 "hash-a",
                 "/tmp/council-ocr.pdf",
                 '{"body": "City Council", "meeting_date": "2026-05-01"}',
+                "artifact-a",
             ),
         )
         connection.executemany(
             """
-            INSERT INTO pages(id, document_id, page_number, text, extractor)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(?, 'artifact-a', 'document-a', ?, 'page', ?, ?, ?, '{}', 'pymupdf')
             """,
             [
-                (
-                    "page-a-1",
-                    "document-a",
-                    1,
-                    (
-                        "Council awarded a $1.2 million sewer infrastructure contract "
-                        "to ABC Construction. Work must be completed by 2026-06-30."
-                    ),
-                    "pymupdf",
-                ),
-                (
-                    "page-a-2",
-                    "document-a",
-                    2,
-                    "Ordinance 2026-10 sets a public hearing for July 1, 2026.",
-                    "pymupdf",
-                ),
+                ("unit-a-1", 1, '{"page_number": 1}', "p. 1", page_one_text),
+                ("unit-a-2", 2, '{"page_number": 2}', "p. 2", page_two_text),
             ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+            VALUES(?, 'document-a', ?, ?, ?, 'pymupdf')
+            """,
+            [
+                ("page-a-1", 1, "unit-a-1", page_one_text),
+                ("page-a-2", 2, "unit-a-2", page_two_text),
+            ],
+        )
+        connection.commit()
+    return database_path
+
+
+def _seed_html_fact_document(data_dir: Path) -> Path:
+    database_path = initialize_storage(data_dir).database
+    text = "Council approved a $2 million parks contract by 2026-07-01."
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-html', 'local_path', '/tmp/update.html', '/tmp/update.html')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-html', 'source-html', 'text/html', 10, 'hash-html',
+                '/tmp/update.html', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(id, source_path, title, source_hash, metadata_json, artifact_id)
+            VALUES(
+                'document-html', '/tmp/update.html', 'Council Update', 'hash-html',
+                '{"body": "City Council"}', 'artifact-html'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(
+                'unit-html-3', 'artifact-html', 'document-html', 3, 'html_block',
+                '{"block_number": 3}', 'block 3', ?,
+                '{"heading_path": ["Council Update", "Parks"]}', 'static-html'
+            )
+            """,
+            (text,),
         )
         connection.commit()
     return database_path
