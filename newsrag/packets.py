@@ -1,13 +1,113 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+import sqlite3
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from newsrag.search import SearchFilters, SearchResult
+from newsrag.sources import SOURCE_TYPE_HTML, source_type_for_media_type
 
 
 class PacketError(Exception):
     """Raised when a source packet cannot be generated or written."""
+
+
+@dataclass(frozen=True)
+class PacketSourceProvenance:
+    """Durable source and immutable artifact identity for one packet document."""
+
+    document_id: str
+    source_type: str
+    source_kind: str
+    submitted_reference: str
+    resolved_reference: str
+    retrieved_at: str | None
+    artifact_hash: str
+
+
+def load_packet_source_provenance(
+    database_path: Path,
+    results: Sequence[SearchResult],
+) -> dict[str, PacketSourceProvenance]:
+    """Load authoritative source and artifact provenance for packet results."""
+
+    document_ids = sorted({result.document_id for result in results})
+    if not document_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in document_ids)
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"""
+            SELECT
+                documents.id AS document_id,
+                sources.kind AS source_kind,
+                sources.submitted_reference AS submitted_reference,
+                sources.resolved_reference AS resolved_reference,
+                source_artifacts.media_type AS media_type,
+                source_artifacts.content_hash AS artifact_hash,
+                source_artifacts.acquired_at AS acquired_at,
+                source_artifacts.provenance_json AS provenance_json
+            FROM documents
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN sources ON sources.id = source_artifacts.source_id
+            WHERE documents.id IN ({placeholders})
+                AND source_artifacts.state = 'published'
+            """,
+            tuple(document_ids),
+        ).fetchall()
+
+    provenance: dict[str, PacketSourceProvenance] = {}
+    for row in rows:
+        document_id = str(row["document_id"])
+        source_kind = str(row["source_kind"])
+        source_type = source_type_for_media_type(str(row["media_type"]))
+        if source_type is None or source_kind not in {"local_path", "url"}:
+            raise PacketError(f"Unsupported source provenance for document: {document_id}")
+        artifact_provenance = _load_json_object(row["provenance_json"])
+        submitted_reference = str(row["submitted_reference"])
+        if source_kind == "url":
+            submitted_reference = (
+                _optional_string(artifact_provenance.get("submitted_url")) or submitted_reference
+            )
+            resolved_reference = (
+                _optional_string(artifact_provenance.get("resolved_url"))
+                or _optional_string(row["resolved_reference"])
+                or submitted_reference
+            )
+            retrieved_at = _optional_string(artifact_provenance.get("retrieved_at")) or str(
+                row["acquired_at"]
+            )
+        else:
+            submitted_reference = (
+                _optional_string(artifact_provenance.get("submitted_path")) or submitted_reference
+            )
+            resolved_reference = (
+                _optional_string(artifact_provenance.get("resolved_path"))
+                or _optional_string(row["resolved_reference"])
+                or submitted_reference
+            )
+            retrieved_at = None
+        provenance[document_id] = PacketSourceProvenance(
+            document_id=document_id,
+            source_type=source_type,
+            source_kind=source_kind,
+            submitted_reference=submitted_reference,
+            resolved_reference=resolved_reference,
+            retrieved_at=retrieved_at,
+            artifact_hash=str(row["artifact_hash"]),
+        )
+
+    missing_document_ids = sorted(set(document_ids) - provenance.keys())
+    if missing_document_ids:
+        raise PacketError(
+            "Cannot load immutable source provenance for document(s): "
+            + ", ".join(missing_document_ids)
+        )
+    return provenance
 
 
 def format_source_packet(
@@ -15,6 +115,7 @@ def format_source_packet(
     query: str,
     results: Sequence[SearchResult],
     filters: SearchFilters | None = None,
+    source_provenance: Mapping[str, PacketSourceProvenance] | None = None,
 ) -> str:
     """Format retrieved evidence as a fixed Markdown source packet."""
 
@@ -59,7 +160,14 @@ def format_source_packet(
     lines.extend(["## Source List", ""])
     if results:
         for result in results:
-            lines.append(f"- {format_source_list_entry(result)}")
+            provenance = None
+            if source_provenance is not None:
+                provenance = source_provenance.get(result.document_id)
+                if provenance is None:
+                    raise PacketError(
+                        "Missing source provenance for packet document: " + result.document_id
+                    )
+            lines.append(f"- {format_source_list_entry(result, provenance=provenance)}")
     else:
         lines.append("- No sources found.")
     lines.append("")
@@ -75,10 +183,17 @@ def write_source_packet(path: Path, content: str, *, overwrite: bool = False) ->
     path.write_text(content, encoding="utf-8")
 
 
-def format_source_list_entry(result: SearchResult) -> str:
-    """Format one source-list entry with available metadata."""
+def format_source_list_entry(
+    result: SearchResult,
+    *,
+    provenance: PacketSourceProvenance | None = None,
+) -> str:
+    """Format one source-list entry with available metadata and provenance."""
 
-    details = [f"page {result.page_start}"]
+    source_type = provenance.source_type if provenance is not None else result.source_type
+    details = []
+    if source_type != SOURCE_TYPE_HTML:
+        details.append(f"page {result.page_start}")
     for label, value in (
         ("title", result.title),
         ("body", result.body),
@@ -90,7 +205,38 @@ def format_source_list_entry(result: SearchResult) -> str:
     ):
         if value is not None and value.strip():
             details.append(f"{label}: {value.strip()}")
+
+    if provenance is not None:
+        details.append(f"source type: {provenance.source_type}")
+        if provenance.source_kind == "url":
+            details.append(f"supplied URL: {provenance.submitted_reference}")
+            if provenance.resolved_reference != provenance.submitted_reference:
+                details.append(f"final URL: {provenance.resolved_reference}")
+            if provenance.retrieved_at is not None:
+                details.append(f"retrieved at: {provenance.retrieved_at}")
+        else:
+            details.append(f"supplied path: {provenance.submitted_reference}")
+        details.append(f"artifact SHA-256: {provenance.artifact_hash}")
+
+    if not details:
+        return result.citation
     return f"{result.citation} ({'; '.join(details)})"
+
+
+def _load_json_object(raw_value: object) -> dict[str, object]:
+    try:
+        value = json.loads(str(raw_value))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return value
+
+
+def _optional_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _normalize_text(value: str) -> str:

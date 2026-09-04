@@ -174,7 +174,7 @@ Default packet structure:
 ## Source List
 ```
 
-The MVP packet is templated and evidence-based. It should quote or summarize retrieved passages only enough to organize the evidence, and it should preserve citations to document titles, dates, bodies, pages, and source files.
+The MVP packet is templated and evidence-based. It quotes retrieved passages without generating new claims and preserves each search result's typed citation, so one packet can contain PDF page evidence and HTML heading/block evidence without inventing HTML pages. Source-list entries retain the existing descriptive metadata and add authoritative provenance from the published source artifact: source type, submitted URL or path, a differing final URL, remote retrieval time, and exact-byte SHA-256. This ties packet evidence to the immutable ingested artifact.
 
 ## Implementation guidance
 
