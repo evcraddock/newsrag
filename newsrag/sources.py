@@ -10,6 +10,7 @@ SOURCE_KIND_LOCAL_PATH = "local_path"
 SOURCE_KIND_URL = "url"
 PDF_MEDIA_TYPE = "application/pdf"
 HTML_MEDIA_TYPES = ("text/html", "application/xhtml+xml")
+HTML_MAX_SOURCE_BYTES = 10 * 1024 * 1024
 PAGE_LOCATION_TYPE = "page"
 HTML_BLOCK_LOCATION_TYPE = "html_block"
 

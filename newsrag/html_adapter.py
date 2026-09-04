@@ -16,9 +16,9 @@ from newsrag.adapters import (
     CanonicalSourceUnit,
     ExtractorIdentity,
 )
-from newsrag.sources import HTML_BLOCK_LOCATION_TYPE, HTML_MEDIA_TYPES
+from newsrag.sources import HTML_BLOCK_LOCATION_TYPE, HTML_MAX_SOURCE_BYTES, HTML_MEDIA_TYPES
 
-MAX_HTML_BYTES = 10 * 1024 * 1024
+MAX_HTML_BYTES = HTML_MAX_SOURCE_BYTES
 MAX_HTML_ELEMENTS = 100_000
 MAX_HTML_NESTING_DEPTH = 256
 MAX_EXTRACTED_TEXT_CHARS = 10 * 1024 * 1024

@@ -19,6 +19,7 @@ from newsrag.embeddings import (
     build_embedding_provider,
     create_embedding_record,
 )
+from newsrag.sources import HTML_BLOCK_LOCATION_TYPE
 
 DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_SEARCH_CANDIDATE_LIMIT = 20
@@ -137,6 +138,12 @@ class SearchResult:
     source_path: str | None = None
     source_unit_start_id: str | None = None
     source_unit_end_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _HtmlCitationDetails:
+    heading_path: tuple[str, ...]
+    location_label: str
 
 
 class Reranker(Protocol):
@@ -442,9 +449,14 @@ def merge_search_candidates(
         }
     )
 
+    source_citations = _load_html_citation_details(
+        database_path,
+        tuple(passage_context.values()),
+    )
     merged: dict[str, SearchResult] = {}
     for passage_id in sorted(set(passage_context)):
         context = passage_context[passage_id]
+        source_citation = source_citations.get(passage_id)
         score = keyword_weight * keyword_normalized.get(
             passage_id, 0.0
         ) + vector_weight * vector_normalized.get(passage_id, 0.0)
@@ -458,6 +470,10 @@ def merge_search_candidates(
                 title=context.title,
                 meeting_date=context.meeting_date,
                 page_number=context.page_start,
+                heading_path=(source_citation.heading_path if source_citation is not None else ()),
+                location_label=(
+                    source_citation.location_label if source_citation is not None else None
+                ),
             ),
             score=score,
             keyword_score=context.keyword_score,
@@ -479,16 +495,114 @@ def merge_search_candidates(
     )[:limit]
 
 
-def format_citation(*, title: str | None, meeting_date: str | None, page_number: int) -> str:
-    """Format one concise terminal citation."""
+def format_citation(
+    *,
+    title: str | None,
+    meeting_date: str | None,
+    page_number: int,
+    heading_path: Sequence[str] = (),
+    location_label: str | None = None,
+) -> str:
+    """Format one concise page or structured-source terminal citation."""
 
     parts = []
-    if title:
-        parts.append(title)
-    if meeting_date:
-        parts.append(meeting_date)
-    parts.append(f"p. {page_number}")
+    resolved_title = _optional_string(title)
+    if resolved_title is not None:
+        parts.append(resolved_title)
+    resolved_meeting_date = _optional_string(meeting_date)
+    if resolved_meeting_date is not None:
+        parts.append(resolved_meeting_date)
+    for index, heading in enumerate(heading_path):
+        resolved_heading = _optional_string(heading)
+        if resolved_heading is None:
+            continue
+        if (
+            index == 0
+            and resolved_title is not None
+            and resolved_heading.casefold() == resolved_title.casefold()
+        ):
+            continue
+        parts.append(resolved_heading)
+    parts.append(location_label or f"p. {page_number}")
     return " — ".join(parts)
+
+
+def _load_html_citation_details(
+    database_path: Path,
+    candidates: Sequence[SearchCandidate],
+) -> dict[str, _HtmlCitationDetails]:
+    source_unit_ids = {
+        source_unit_id
+        for candidate in candidates
+        for source_unit_id in (
+            candidate.source_unit_start_id,
+            candidate.source_unit_end_id,
+        )
+        if source_unit_id is not None
+    }
+    if not source_unit_ids:
+        return {}
+
+    placeholders = ", ".join("?" for _ in source_unit_ids)
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            f"""
+            SELECT id, location_type, location_json, structure_json
+            FROM source_units
+            WHERE id IN ({placeholders})
+            """,
+            tuple(sorted(source_unit_ids)),
+        ).fetchall()
+    units = {str(row["id"]): row for row in rows}
+
+    citations: dict[str, _HtmlCitationDetails] = {}
+    for candidate in candidates:
+        if candidate.source_unit_start_id is None:
+            continue
+        start_unit = units.get(candidate.source_unit_start_id)
+        end_unit = units.get(candidate.source_unit_end_id or candidate.source_unit_start_id)
+        if start_unit is None or end_unit is None:
+            continue
+        if (
+            str(start_unit["location_type"]) != HTML_BLOCK_LOCATION_TYPE
+            or str(end_unit["location_type"]) != HTML_BLOCK_LOCATION_TYPE
+        ):
+            continue
+        start_location = _load_metadata(start_unit["location_json"])
+        end_location = _load_metadata(end_unit["location_json"])
+        start_block = start_location.get("block_number")
+        end_block = end_location.get("block_number")
+        if (
+            isinstance(start_block, bool)
+            or not isinstance(start_block, int)
+            or isinstance(end_block, bool)
+            or not isinstance(end_block, int)
+            or start_block < 1
+            or end_block < start_block
+        ):
+            continue
+        structure = _load_metadata(start_unit["structure_json"])
+        raw_heading_path = structure.get("heading_path")
+        heading_path = (
+            tuple(
+                heading.strip()
+                for heading in raw_heading_path
+                if isinstance(heading, str) and heading.strip()
+            )
+            if isinstance(raw_heading_path, list)
+            else ()
+        )
+        location_label = (
+            f"block {start_block}"
+            if start_block == end_block
+            else f"blocks {start_block}–{end_block}"
+        )
+        citations[candidate.passage_id] = _HtmlCitationDetails(
+            heading_path=heading_path,
+            location_label=location_label,
+        )
+    return citations
 
 
 def format_search_results(
