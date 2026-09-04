@@ -462,7 +462,12 @@ def packet_command(
 ) -> None:
     """Generate an extractive Markdown source packet from retrieved evidence."""
 
-    from newsrag.packets import PacketError, format_source_packet, write_source_packet
+    from newsrag.packets import (
+        PacketError,
+        format_source_packet,
+        load_packet_source_provenance,
+        write_source_packet,
+    )
     from newsrag.search import SearchError, build_search_engine
     from newsrag.storage import initialize_storage
 
@@ -486,9 +491,15 @@ def packet_command(
             embedding_config=settings.config.embedding,
         )
         results = engine.search(query, filters=filters)
+        source_provenance = load_packet_source_provenance(storage_paths.database, results)
         write_source_packet(
             out,
-            format_source_packet(query=query, results=results, filters=filters),
+            format_source_packet(
+                query=query,
+                results=results,
+                filters=filters,
+                source_provenance=source_provenance,
+            ),
             overwrite=overwrite,
         )
     except (SearchError, PacketError) as exc:
