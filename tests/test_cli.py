@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from newsrag import __version__
@@ -41,9 +42,10 @@ def test_help_shows_cli_commands() -> None:
 def test_ingest_help_describes_unified_source_input() -> None:
     result = runner.invoke(app, ["ingest", "--help"])
 
+    output = unstyle(result.stdout)
     assert result.exit_code == 0
-    assert "URL, local file, or local directory" in result.stdout
-    assert "--type" in result.stdout
+    assert "URL, local file, or local directory" in output
+    assert "--type" in output
 
 
 def test_version_option_shows_project_version() -> None:
