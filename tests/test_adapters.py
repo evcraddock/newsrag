@@ -117,6 +117,7 @@ def test_adapter_registry_uses_hint_media_signature_and_extension_without_extrac
         extensions=(".pdf",),
         signatures=(b"%PDF-",),
         adapter=adapter,
+        media_type_aliases=("application/x-pdf",),
     )
     registry = SourceAdapterRegistry((registration,))
 
@@ -134,6 +135,15 @@ def test_adapter_registry_uses_hint_media_signature_and_extension_without_extrac
             artifact_path=artifact_path,
             source_type_hint=None,
             reported_media_type="application/pdf",
+            filename="wrong.txt",
+        )
+        is registration
+    )
+    assert (
+        registry.select(
+            artifact_path=artifact_path,
+            source_type_hint=None,
+            reported_media_type="application/x-pdf",
             filename="wrong.txt",
         )
         is registration

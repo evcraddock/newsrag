@@ -74,9 +74,9 @@ When a known source returns different bytes, NewsRAG preserves the new artifact 
 
 Raw bytes are retained as immutable, content-addressed source artifacts. Acquisition runs in the daemon before format extraction. One acquisition accepts either an explicitly submitted local regular file or a public HTTP(S) URL, stages bytes while hashing, applies the duplicate decision, and durably promotes bytes that must be retained before invoking an adapter.
 
-Remote acquisition resolves and pins a validated public address for each request, revalidates every redirect destination, follows at most five redirects, and applies a 30-second request timeout. URL credentials, localhost, non-public addresses, unsafe redirects, ambient proxy or cookie state, and unsupported content encodings are rejected. HTTP bodies are streamed with separate 250 MiB compressed and decompressed limits. Only the submitted resource and required HTTP redirects are fetched; linked and embedded resources are not retrieved.
+Remote acquisition resolves and pins a validated public address for each request, revalidates every redirect destination, follows at most five redirects, and applies a 30-second request timeout. URL credentials, localhost, non-public addresses, unsafe redirects, ambient proxy or cookie state, and unsupported content encodings are rejected. HTTP bodies are streamed with separate 250 MiB compressed and decompressed limits, reduced to 10 MiB when an HTML hint, extension, or response media type identifies static HTML. Only the submitted resource and required HTTP redirects are fetched; linked and embedded resources are not retrieved.
 
-Local acquisition has a 250 MiB limit and accepts only regular files. An explicitly submitted symlink is allowed only when its resolved regular-file target remains stable. Directory scans skip symlinks. Device/inode, size, modification time, resolved target, and bytes read are checked around the read so missing, special, changed, or oversized inputs fail without preserving a partial artifact.
+Local acquisition has a 250 MiB limit, reduced to 10 MiB for recognized HTML input, and accepts only regular files. An explicitly submitted symlink is allowed only when its resolved regular-file target remains stable. Directory scans skip symlinks. Device/inode, size, modification time, resolved target, and bytes read are checked around the read so missing, special, changed, or oversized inputs fail without preserving a partial artifact.
 
 Acquisition provenance stores submitted and resolved references, redirects, retrieval or file-read timestamps, reported media type, exact byte size and SHA-256, and the durable artifact path. Diagnostics use stage-specific errors and omit URL credentials, query data, response bodies, and ambient secrets.
 
@@ -84,26 +84,27 @@ Each PDF is normalized through OCR, then text is extracted from the normalized P
 
 ## Source adapter contract
 
-A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, and any derived artifact used for extraction. The adapter registry selects a supported adapter from an optional `--type` hint, reported media type, conservative content signature, and filename extension, in that order. A hint selects an adapter but never bypasses that adapter's validation. PDF is the only currently registered source type.
+A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, metadata candidates, and any derived artifact used for extraction. The adapter registry selects a supported adapter from an optional `--type` hint, reported media type, conservative content signature, and filename extension, in that order. A hint selects an adapter but never bypasses that adapter's validation. PDF and static HTML are currently registered.
 
 Each canonical source unit has a contiguous one-based ordinal, typed machine location, human-readable location label, normalized text, structure metadata, and extractor name/version. Adapters do not chunk, embed, index, publish documents, or modify source identity. Those stages belong to the shared ingestion pipeline.
 
 PDF is the first implementation of this contract. The PDF adapter validates the raw PDF, runs the existing OCR and extraction fallback behavior, and emits one page source unit per PDF page. The shared pipeline then performs page-compatible chunking, passage generation, embeddings, FTS/vector indexing, and publication. SQLite publication is transactional; failed vector publication rolls back the document bundle and removes staged vectors so incomplete documents cannot appear in search.
 
-The standalone static HTML adapter accepts `text/html` and `application/xhtml+xml` artifacts with conservative document signatures and a restricted encoding set. It parses with network access, entity resolution, recovery, and oversized parser trees disabled; it never executes JavaScript or retrieves linked resources. The adapter selects one unambiguous `article`, then one `main` or `role=main`, then the document body, and emits deterministic `html_block` units for retained headings, paragraphs, list items, quotations, preformatted text, captions, and table rows. Units carry block numbers, heading paths, element kinds, normalized text, and `static-html` extractor identity. Safe title, language, author, and publication-time values are returned only as metadata candidates. The independent adapter is not registered with ingestion until the static HTML end-to-end task adds non-page chunking and publication support.
+The static HTML adapter accepts `text/html` and `application/xhtml+xml` artifacts with conservative document signatures and a restricted encoding set. It parses with network access, entity resolution, recovery, and oversized parser trees disabled; it never executes JavaScript or retrieves linked resources. The adapter selects one unambiguous `article`, then one `main` or `role=main`, then the document body, and emits deterministic `html_block` units for retained headings, paragraphs, list items, quotations, preformatted text, captions, and table rows. Units carry block numbers, heading paths, element kinds, normalized text, and `static-html` extractor identity. Safe title, language, author, and publication-time metadata candidates fill missing user metadata. HTML files and public URLs use the same background acquisition, exact-byte identity, chunking, embedding, indexing, and atomic publication path as PDFs.
 
 Static HTML extraction fails rather than truncating when input exceeds 10 MiB, the parsed tree exceeds 100,000 elements or 256 levels, or retained text exceeds 10 MiB. It also rejects unsupported or conflicting encodings, unsafe external declarations, malformed input, ambiguous content roots, and empty evidentiary output.
 
 ## Chunking and citations
 
-The MVP uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. This keeps citations simple and reliable for city hall PDFs, where page numbers are often the most important reference.
+PDF uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. HTML uses block-first chunking, keeping each source unit tied to its stable block ordinal and heading path. Shared chunks and passages retain authoritative source-unit start/end IDs for either format.
 
-The data model should allow structure-aware chunking later without changing the retrieval contract. Optional chunk metadata can include section title, heading path, agenda item, table marker, and bounding box.
+The data model allows further structure-aware chunking without changing the retrieval contract. Optional chunk metadata can include section title, heading path, agenda item, table marker, and bounding box.
 
 Terminal citations use a concise format:
 
 ```text
 City Council Packet — 2026-04-12 — p. 27
+Council Update — Budget — block 12
 ```
 
 Markdown packet/source-list citations can include richer context:

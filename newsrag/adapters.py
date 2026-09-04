@@ -77,6 +77,13 @@ class RegisteredSourceAdapter:
     extensions: tuple[str, ...]
     signatures: tuple[bytes, ...]
     adapter: SourceAdapter
+    media_type_aliases: tuple[str, ...] = ()
+
+    @property
+    def accepted_media_types(self) -> tuple[str, ...]:
+        """Return canonical and alias media types accepted for selection."""
+
+        return (self.media_type, *self.media_type_aliases)
 
 
 class SourceAdapterRegistry:
@@ -120,7 +127,7 @@ class SourceAdapterRegistry:
         media_matches = tuple(
             registration
             for registration in self._registrations
-            if normalized_media_type == registration.media_type
+            if normalized_media_type in registration.accepted_media_types
         )
         selected = _one_adapter_match(media_matches, evidence="reported media type")
         if selected is not None:
@@ -136,7 +143,7 @@ class SourceAdapterRegistry:
         )
         try:
             with artifact_path.open("rb") as artifact_file:
-                header = artifact_file.read(maximum_signature_bytes)
+                header = artifact_file.read(maximum_signature_bytes + 256)
         except OSError as exc:
             raise AdapterSelectionError(
                 f"Could not inspect acquired artifact ({type(exc).__name__})"
@@ -144,7 +151,7 @@ class SourceAdapterRegistry:
         signature_matches = tuple(
             registration
             for registration in self._registrations
-            if any(header.startswith(signature) for signature in registration.signatures)
+            if any(_matches_signature(header, signature) for signature in registration.signatures)
         )
         selected = _one_adapter_match(signature_matches, evidence="content signature")
         if selected is not None:
@@ -163,6 +170,10 @@ class SourceAdapterRegistry:
         raise AdapterSelectionError(
             "Unsupported source type; provide --type with one of: " + ", ".join(self.source_types)
         )
+
+
+def _matches_signature(header: bytes, signature: bytes) -> bool:
+    return header.startswith(signature) or header.lstrip().lower().startswith(signature.lower())
 
 
 def _one_adapter_match(

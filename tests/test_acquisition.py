@@ -19,6 +19,7 @@ from newsrag.acquisition import (
     SafeSourceArtifactAcquirer,
     preserve_staged_artifact,
 )
+from newsrag.sources import HTML_MAX_SOURCE_BYTES
 
 PUBLIC_IP = "93.184.216.34"
 
@@ -31,6 +32,41 @@ def test_default_acquisition_limits_match_approved_policy() -> None:
     assert limits.max_decompressed_bytes == 250 * 1024 * 1024
     assert limits.max_redirects == 5
     assert limits.timeout_seconds == 30.0
+
+
+def test_html_acquisition_applies_ten_mib_limit_to_local_and_remote_sources(
+    tmp_path: Path,
+) -> None:
+    assert HTML_MAX_SOURCE_BYTES == 10 * 1024 * 1024
+    local_html = tmp_path / "oversized.html"
+    with local_html.open("wb") as file_handle:
+        file_handle.truncate(HTML_MAX_SOURCE_BYTES + 1)
+
+    acquirer = SafeSourceArtifactAcquirer()
+    with pytest.raises(AcquisitionError, match="local_size_limit"):
+        acquirer.acquire(
+            AcquisitionRequest(kind=SOURCE_KIND_LOCAL_PATH, reference=str(local_html)),
+            tmp_path / "local-staging",
+        )
+
+    url = "https://example.gov/oversized"
+    response = FakeHttpResponse(
+        status_code=200,
+        headers={
+            "content-type": "text/html",
+            "content-length": str(HTML_MAX_SOURCE_BYTES + 1),
+        },
+    )
+    remote_acquirer = SafeSourceArtifactAcquirer(
+        resolver=RecordingResolver(addresses={"example.gov": (PUBLIC_IP,)}),
+        transport=FakeHttpTransport(responses={url: [response]}),
+    )
+    with pytest.raises(AcquisitionError, match="remote_compressed_size_limit"):
+        remote_acquirer.acquire(
+            AcquisitionRequest(kind=SOURCE_KIND_URL, reference=url),
+            tmp_path / "remote-staging",
+        )
+    assert response.closed is True
 
 
 def test_local_acquisition_stages_exact_bytes_and_provenance(tmp_path: Path) -> None:

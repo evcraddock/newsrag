@@ -45,6 +45,7 @@ from newsrag.embeddings import (
     EmbeddingProvider,
     build_embedding_provider,
 )
+from newsrag.html_adapter import StaticHtmlSourceAdapter
 from newsrag.ingestion_identity import (
     OUTCOME_CREATED,
     OUTCOME_DUPLICATE_IGNORED,
@@ -78,6 +79,8 @@ from newsrag.pdf_adapter import (
 )
 from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
+    HTML_MAX_SOURCE_BYTES,
+    HTML_MEDIA_TYPES,
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
     artifact_id_for_hash,
@@ -109,9 +112,12 @@ DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 VECTOR_TABLE_NAME = "chunk_embeddings"
 SOURCE_TYPE_PDF = "pdf"
-SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_PDF})
+SOURCE_TYPE_HTML = "html"
+SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF})
 _PDF_EXTENSIONS = (".pdf",)
 _PDF_SIGNATURES = (b"%PDF-",)
+_HTML_EXTENSIONS = (".html", ".htm", ".xhtml")
+_HTML_SIGNATURES = (b"<!doctype html", b"<html", b"<?xml")
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
 LOGGER = logging.getLogger(__name__)
 
@@ -315,6 +321,45 @@ class PageChunker:
 
 
 @dataclass(frozen=True)
+class SourceUnitChunker:
+    """Chunk page units compatibly and non-page units by stable source ordinal."""
+
+    page_chunker: PageChunker = PageChunker()
+    max_chars: int = DEFAULT_CHUNK_MAX_CHARS
+    overlap_chars: int = DEFAULT_CHUNK_OVERLAP_CHARS
+
+    def chunk_units(self, units: Sequence[CanonicalSourceUnit]) -> list[ChunkDraft]:
+        if all(unit.location_type == PAGE_LOCATION_TYPE for unit in units):
+            return self.page_chunker.chunk_units(units)
+        if any(unit.location_type == PAGE_LOCATION_TYPE for unit in units):
+            raise IngestError("Cannot chunk mixed page and non-page source units")
+
+        chunks: list[ChunkDraft] = []
+        for unit in units:
+            text = unit.normalized_text.strip()
+            if not text:
+                continue
+            start = 0
+            while start < len(text):
+                end = min(start + self.max_chars, len(text))
+                chunk_text = text[start:end].strip()
+                if chunk_text:
+                    chunks.append(
+                        ChunkDraft(
+                            text=chunk_text,
+                            page_start=unit.ordinal,
+                            page_end=unit.ordinal,
+                            source_unit_start_ordinal=unit.ordinal,
+                            source_unit_end_ordinal=unit.ordinal,
+                        )
+                    )
+                if end >= len(text):
+                    break
+                start = max(0, end - self.overlap_chars)
+        return chunks
+
+
+@dataclass(frozen=True)
 class LanceDbVectorStore:
     """Vector persistence backed by LanceDB."""
 
@@ -434,8 +479,10 @@ class SourceProcessingPipeline:
 
         document_id = f"document-{uuid.uuid4().hex[:8]}"
         artifact_id = artifact_id_for_hash(artifact.content_hash)
+        resolved_metadata = dict(adapter_result.metadata_candidates)
+        resolved_metadata.update(artifact.metadata)
         document_metadata = _build_document_metadata(
-            artifact.metadata,
+            resolved_metadata,
             artifact.source_path,
             artifact.artifact_path,
         )
@@ -473,7 +520,7 @@ class SourceProcessingPipeline:
                 media_type=adapter_result.media_type,
                 source_path=artifact.source_path,
                 source_url=artifact.source_url,
-                title=_resolve_document_title(artifact.metadata, artifact.source_path),
+                title=_resolve_document_title(resolved_metadata, artifact.source_path),
                 source_hash=artifact.content_hash,
                 normalized_path=adapter_result.derived_artifact_path,
                 metadata=document_metadata,
@@ -522,7 +569,7 @@ class SourceProcessingPipeline:
 
 
 class IngestionPipeline:
-    """Current PDF job front end for the shared source-processing pipeline."""
+    """Job front end for the shared source-processing pipeline."""
 
     def __init__(
         self,
@@ -554,12 +601,20 @@ class IngestionPipeline:
                     signatures=_PDF_SIGNATURES,
                     adapter=resolved_adapter,
                 ),
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_HTML,
+                    media_type=HTML_MEDIA_TYPES[0],
+                    media_type_aliases=HTML_MEDIA_TYPES[1:],
+                    extensions=_HTML_EXTENSIONS,
+                    signatures=_HTML_SIGNATURES,
+                    adapter=StaticHtmlSourceAdapter(),
+                ),
             )
         )
         self.processor = SourceProcessingPipeline(
             storage_paths=storage_paths,
             adapter=resolved_adapter,
-            chunker=chunker or PageChunker(),
+            chunker=chunker or SourceUnitChunker(),
             embedding_provider=embedding_provider or build_embedding_provider(embedding_config),
             vector_store=vector_store or LanceDbVectorStore(storage_paths.lancedb),
             passage_vector_store=passage_vector_store
@@ -665,7 +720,10 @@ class IngestionPipeline:
                         source_path=decision.document_source_path,
                         artifact_path=decision.artifact_path,
                         content_hash=staged_artifact.content_hash,
-                        media_type=selected_adapter.media_type,
+                        media_type=_adapter_input_media_type(
+                            selected_adapter,
+                            staged_artifact.reported_media_type,
+                        ),
                         source_url=decision.document_source_url,
                         acquired_at=decision.acquired_at,
                         work_dir=self.storage_paths.ocr_pdfs,
@@ -862,7 +920,7 @@ def build_ingest_handler(
     vector_store: VectorStore | None = None,
     passage_vector_store: PassageVectorStore | None = None,
 ) -> Callable[[Job], Awaitable[dict[str, object]]]:
-    """Build an async handler for safely acquired PDF ingest jobs."""
+    """Build an async handler for safely acquired source-ingest jobs."""
 
     pipeline = IngestionPipeline(
         storage_paths=initialize_storage(data_dir),
@@ -1074,8 +1132,11 @@ def _scan_ingest_directory(
 
 
 def _source_type_for_extension(path: Path) -> str | None:
-    if path.suffix.lower() in _PDF_EXTENSIONS:
+    extension = path.suffix.lower()
+    if extension in _PDF_EXTENSIONS:
         return SOURCE_TYPE_PDF
+    if extension in _HTML_EXTENSIONS:
+        return SOURCE_TYPE_HTML
     return None
 
 
@@ -1100,9 +1161,20 @@ def _payload_acquisition_request(payload: dict[str, Any]) -> AcquisitionRequest:
     if isinstance(raw_url, str) and raw_url.strip():
         if isinstance(raw_path, str) and raw_path.strip():
             raise IngestError("Ingest job payload cannot contain both a URL and path")
-        return AcquisitionRequest(kind=SOURCE_KIND_URL, reference=raw_url.strip())
+        reference = raw_url.strip()
+        return AcquisitionRequest(
+            kind=SOURCE_KIND_URL,
+            reference=reference,
+            max_bytes=_payload_source_max_bytes(payload, Path(urlsplit(reference).path)),
+            apply_reported_media_limit=_payload_source_type_hint(payload) is None,
+        )
     if isinstance(raw_path, str) and raw_path.strip():
-        return AcquisitionRequest(kind="local_path", reference=raw_path)
+        return AcquisitionRequest(
+            kind="local_path",
+            reference=raw_path,
+            max_bytes=_payload_source_max_bytes(payload, Path(raw_path)),
+            apply_reported_media_limit=_payload_source_type_hint(payload) is None,
+        )
     raise IngestError("Ingest job payload is missing a valid URL or path")
 
 
@@ -1113,6 +1185,21 @@ def _payload_source_type_hint(payload: dict[str, Any]) -> str | None:
     if not isinstance(value, str):
         raise IngestError("Ingest job payload source_type must be a string")
     return normalize_source_type_hint(value)
+
+
+def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None:
+    source_type = _payload_source_type_hint(payload) or _source_type_for_extension(path)
+    return HTML_MAX_SOURCE_BYTES if source_type == SOURCE_TYPE_HTML else None
+
+
+def _adapter_input_media_type(
+    registration: RegisteredSourceAdapter,
+    reported_media_type: str | None,
+) -> str:
+    normalized_reported_type = (reported_media_type or "").partition(";")[0].strip().lower()
+    if normalized_reported_type in registration.accepted_media_types:
+        return str(reported_media_type)
+    return registration.media_type
 
 
 def _source_filename(reference: str) -> str:

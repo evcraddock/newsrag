@@ -286,7 +286,7 @@ def ingest_command(
     source_type: str | None = typer.Option(
         None,
         "--type",
-        help="Explicit source type hint; currently supported: pdf.",
+        help="Explicit source type hint; currently supported: html, pdf.",
     ),
     pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
-from newsrag.sources import normalize_url_reference
+from newsrag.sources import HTML_MAX_SOURCE_BYTES, HTML_MEDIA_TYPES, normalize_url_reference
 
 SOURCE_KIND_LOCAL_PATH: Literal["local_path"] = "local_path"
 SOURCE_KIND_URL: Literal["url"] = "url"
@@ -59,6 +59,8 @@ class AcquisitionRequest:
 
     kind: SourceKind
     reference: str
+    max_bytes: int | None = None
+    apply_reported_media_limit: bool = True
 
 
 @dataclass(frozen=True)
@@ -262,14 +264,27 @@ class SafeSourceArtifactAcquirer:
     def acquire(self, request: AcquisitionRequest, staging_dir: Path) -> StagedSourceArtifact:
         """Acquire one source into a staged exact-byte artifact."""
 
+        if request.max_bytes is not None and request.max_bytes < 1:
+            raise AcquisitionError("validation", "Source byte limit must be positive")
         if request.kind == SOURCE_KIND_LOCAL_PATH:
-            return self._acquire_local(request.reference, staging_dir)
+            return self._acquire_local(request, staging_dir)
         if request.kind == SOURCE_KIND_URL:
-            return self._acquire_url(request.reference, staging_dir)
+            return self._acquire_url(request, staging_dir)
         raise AcquisitionError("validation", f"Unsupported source kind: {request.kind}")
 
-    def _acquire_local(self, reference: str, staging_dir: Path) -> StagedSourceArtifact:
-        submitted_path = _absolute_path(reference)
+    def _acquire_local(
+        self,
+        request: AcquisitionRequest,
+        staging_dir: Path,
+    ) -> StagedSourceArtifact:
+        submitted_path = _absolute_path(request.reference)
+        reported_media_type, _ = mimetypes.guess_type(submitted_path.name)
+        max_local_bytes = _effective_source_limit(
+            self.limits.max_local_bytes,
+            request.max_bytes,
+            reported_media_type,
+            apply_reported_media_limit=request.apply_reported_media_limit,
+        )
         try:
             supplied_state = os.lstat(submitted_path)
             resolved_path = submitted_path.resolve(strict=True)
@@ -285,10 +300,10 @@ class SafeSourceArtifactAcquirer:
                 "local_validation",
                 f"Local source is not a regular file: {submitted_path}",
             )
-        if target_state.size > self.limits.max_local_bytes:
+        if target_state.size > max_local_bytes:
             raise AcquisitionError(
                 "local_size_limit",
-                f"Local source exceeds {self.limits.max_local_bytes} bytes: {submitted_path}",
+                f"Local source exceeds {max_local_bytes} bytes: {submitted_path}",
             )
 
         staged_path = _new_staging_path(staging_dir)
@@ -319,11 +334,10 @@ class SafeSourceArtifactAcquirer:
                         if not chunk:
                             break
                         byte_size += len(chunk)
-                        if byte_size > self.limits.max_local_bytes:
+                        if byte_size > max_local_bytes:
                             raise AcquisitionError(
                                 "local_size_limit",
-                                f"Local source exceeds {self.limits.max_local_bytes} bytes: "
-                                f"{submitted_path}",
+                                f"Local source exceeds {max_local_bytes} bytes: {submitted_path}",
                             )
                         output.write(chunk)
                         digest.update(chunk)
@@ -358,7 +372,6 @@ class SafeSourceArtifactAcquirer:
             ) from exc
 
         acquired_at = _current_timestamp()
-        reported_media_type, _ = mimetypes.guess_type(submitted_path.name)
         return StagedSourceArtifact(
             source_kind=SOURCE_KIND_LOCAL_PATH,
             submitted_reference=str(submitted_path),
@@ -378,8 +391,12 @@ class SafeSourceArtifactAcquirer:
             },
         )
 
-    def _acquire_url(self, reference: str, staging_dir: Path) -> StagedSourceArtifact:
-        submitted_url = reference.strip()
+    def _acquire_url(
+        self,
+        request: AcquisitionRequest,
+        staging_dir: Path,
+    ) -> StagedSourceArtifact:
+        submitted_url = request.reference.strip()
         current_url = _without_fragment(submitted_url)
         redirects: list[str] = []
 
@@ -437,11 +454,29 @@ class SafeSourceArtifactAcquirer:
                         f"HTTP status {response.status_code} for {safe_reference}",
                     )
 
+                reported_media_type = _reported_media_type(response.headers)
+                max_compressed_bytes = _effective_source_limit(
+                    self.limits.max_compressed_bytes,
+                    request.max_bytes,
+                    reported_media_type,
+                    apply_reported_media_limit=request.apply_reported_media_limit,
+                )
+                max_decompressed_bytes = _effective_source_limit(
+                    self.limits.max_decompressed_bytes,
+                    request.max_bytes,
+                    reported_media_type,
+                    apply_reported_media_limit=request.apply_reported_media_limit,
+                )
                 staged_path, content_hash, byte_size, compressed_byte_size = (
-                    self._stage_response_body(response, staging_dir, safe_reference)
+                    self._stage_response_body(
+                        response,
+                        staging_dir,
+                        safe_reference,
+                        max_compressed_bytes=max_compressed_bytes,
+                        max_decompressed_bytes=max_decompressed_bytes,
+                    )
                 )
                 acquired_at = _current_timestamp()
-                reported_media_type = _reported_media_type(response.headers)
                 return StagedSourceArtifact(
                     source_kind=SOURCE_KIND_URL,
                     submitted_reference=submitted_url,
@@ -470,13 +505,15 @@ class SafeSourceArtifactAcquirer:
         response: HttpResponseStream,
         staging_dir: Path,
         safe_reference: str,
+        *,
+        max_compressed_bytes: int,
+        max_decompressed_bytes: int,
     ) -> tuple[Path, str, int, int]:
         content_length = _content_length(response.headers)
-        if content_length is not None and content_length > self.limits.max_compressed_bytes:
+        if content_length is not None and content_length > max_compressed_bytes:
             raise AcquisitionError(
                 "remote_compressed_size_limit",
-                f"Response exceeds {self.limits.max_compressed_bytes} compressed bytes for "
-                f"{safe_reference}",
+                f"Response exceeds {max_compressed_bytes} compressed bytes for {safe_reference}",
             )
 
         encoding = _content_encoding(response.headers)
@@ -494,40 +531,40 @@ class SafeSourceArtifactAcquirer:
             with staged_path.open("wb") as output:
                 for chunk in response.iter_raw():
                     compressed_byte_size += len(chunk)
-                    if compressed_byte_size > self.limits.max_compressed_bytes:
+                    if compressed_byte_size > max_compressed_bytes:
                         raise AcquisitionError(
                             "remote_compressed_size_limit",
-                            f"Response exceeds {self.limits.max_compressed_bytes} compressed "
-                            f"bytes for {safe_reference}",
+                            f"Response exceeds {max_compressed_bytes} compressed bytes for "
+                            f"{safe_reference}",
                         )
                     decoded = _decode_chunk(
                         decompressor,
                         chunk,
-                        remaining=self.limits.max_decompressed_bytes - byte_size,
+                        remaining=max_decompressed_bytes - byte_size,
                         safe_reference=safe_reference,
-                        limit=self.limits.max_decompressed_bytes,
+                        limit=max_decompressed_bytes,
                     )
                     byte_size = _write_decoded_chunk(
                         output,
                         digest,
                         decoded,
                         byte_size=byte_size,
-                        limit=self.limits.max_decompressed_bytes,
+                        limit=max_decompressed_bytes,
                         safe_reference=safe_reference,
                     )
                 if decompressor is not None:
                     decoded = _flush_decoder(
                         decompressor,
-                        remaining=self.limits.max_decompressed_bytes - byte_size,
+                        remaining=max_decompressed_bytes - byte_size,
                         safe_reference=safe_reference,
-                        limit=self.limits.max_decompressed_bytes,
+                        limit=max_decompressed_bytes,
                     )
                     byte_size = _write_decoded_chunk(
                         output,
                         digest,
                         decoded,
                         byte_size=byte_size,
-                        limit=self.limits.max_decompressed_bytes,
+                        limit=max_decompressed_bytes,
                         safe_reference=safe_reference,
                     )
                 if content_length is not None and compressed_byte_size != content_length:
@@ -832,6 +869,22 @@ def _content_length(headers: Mapping[str, str]) -> int | None:
     if value < 0:
         raise AcquisitionError("remote_headers", "Content-Length is invalid")
     return value
+
+
+def _effective_source_limit(
+    configured_limit: int,
+    requested_limit: int | None,
+    reported_media_type: str | None,
+    *,
+    apply_reported_media_limit: bool,
+) -> int:
+    limits = [configured_limit]
+    if requested_limit is not None:
+        limits.append(requested_limit)
+    normalized_media_type = (reported_media_type or "").partition(";")[0].strip().lower()
+    if apply_reported_media_limit and normalized_media_type in HTML_MEDIA_TYPES:
+        limits.append(HTML_MAX_SOURCE_BYTES)
+    return min(limits)
 
 
 def _reported_media_type(headers: Mapping[str, str]) -> str | None:

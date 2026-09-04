@@ -68,18 +68,23 @@ from newsrag.jobs import (
     set_job_status,
 )
 from newsrag.manifests import ManifestError, load_manifest
+from newsrag.search import SearchResult, merge_search_candidates, search_keyword_candidates
 from newsrag.sources import normalize_url_reference
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
 
 
-def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
+def test_ingest_command_enqueues_supported_local_source_jobs(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
-    source_dir = tmp_path / "pdfs"
+    source_dir = tmp_path / "sources"
     source_dir.mkdir()
     (source_dir / "packet-a.pdf").write_bytes(b"%PDF-1.4\nA")
     (source_dir / "packet-b.PDF").write_bytes(b"%PDF-1.4\nB")
+    (source_dir / "notice.html").write_text(
+        "<!doctype html><html><body><p>Notice</p></body></html>",
+        encoding="utf-8",
+    )
     (source_dir / "alias.pdf").symlink_to(source_dir / "packet-a.pdf")
     (source_dir / "notes.txt").write_text("ignore me", encoding="utf-8")
     os.mkfifo(source_dir / "special.pdf")
@@ -106,14 +111,13 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     jobs = list_jobs(paths.database)
 
     assert result.exit_code == 0, result.stdout
-    assert "Enqueued 2 ingest job(s)" in result.stdout
-    assert "Queued by type: pdf=2" in result.stdout
+    assert "Enqueued 3 ingest job(s)" in result.stdout
+    assert "Queued by type: html=1, pdf=2" in result.stdout
     assert "Skipped by type: special=1, symlink=2, txt=1" in result.stdout
-    assert len(jobs) == 2
+    assert len(jobs) == 3
     assert all(job.kind == INGEST_JOB_KIND for job in jobs)
-    assert jobs[0].payload["metadata"]["body"] == "City Council"
-    assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
-    assert jobs[1].payload["metadata"]["body"] == "City Council"
+    assert all(job.payload["metadata"]["body"] == "City Council" for job in jobs)
+    assert all(job.payload["metadata"]["document_type"] == "agenda_packet" for job in jobs)
 
 
 def test_ingest_command_records_pdf_extractor_mode(tmp_path: Path) -> None:
@@ -183,12 +187,12 @@ def test_ingest_rejects_unsupported_source_type_hint_before_enqueue(tmp_path: Pa
 
     result = runner.invoke(
         app,
-        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "html"],
+        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "docx"],
     )
 
     paths = initialize_storage(data_dir)
     assert result.exit_code == 1
-    assert "Unsupported source type 'html'" in result.stdout
+    assert "Unsupported source type 'docx'" in result.stdout
     assert list_jobs(paths.database) == []
 
 
@@ -370,7 +374,131 @@ def test_safe_url_acquisition_runs_inside_daemon(tmp_path: Path) -> None:
     assert len(list(paths.source_artifacts.iterdir())) == 1
 
 
-def test_ingest_url_reports_non_pdf_validation_failure_from_background_job(
+def test_local_html_ingests_and_searches_with_block_citation(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    source_path = tmp_path / "river-notice.html"
+    content = (
+        b'<!doctype html><html lang="en"><head><title>River Notice</title>'
+        b'<meta name="author" content="City Clerk"></head><body><article>'
+        b"<h1>River Notice</h1><h2>Stormwater</h2>"
+        b"<p>Downtown stormwater construction begins Monday near the public library.</p>"
+        b"</article></body></html>"
+    )
+    source_path.write_bytes(content)
+
+    cli_result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "ingest", str(source_path)],
+    )
+    paths = initialize_storage(data_dir)
+    jobs = list_jobs(paths.database)
+    assert cli_result.exit_code == 0, cli_result.stdout
+    assert "Queued by type: html=1" in cli_result.stdout
+
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    assert get_job(paths.database, jobs[0].id).status == "done"
+    documents = list_documents(paths.database)
+    assert len(documents) == 1
+    assert documents[0].title == "River Notice"
+    assert documents[0].metadata["language"] == "en"
+    assert documents[0].metadata["author"] == "City Clerk"
+    assert list_pages(paths.database) == []
+    assert [chunk.page_start for chunk in list_chunks(paths.database)] == [1, 2, 3]
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        artifact = connection.execute("SELECT * FROM source_artifacts").fetchone()
+        units = connection.execute(
+            "SELECT location_type, location_json, structure_json FROM source_units ORDER BY ordinal"
+        ).fetchall()
+    assert artifact is not None
+    assert artifact["media_type"] == "text/html"
+    assert Path(artifact["stored_path"]).read_bytes() == content
+    assert [unit["location_type"] for unit in units] == ["html_block"] * 3
+
+    results = _keyword_search_results(paths.database, "construction")
+    assert len(results) == 1
+    assert results[0].citation == "River Notice — Stormwater — block 3"
+    assert results[0].source_path == str(source_path)
+    assert results[0].source_unit_start_id == results[0].source_unit_end_id
+
+
+def test_public_html_url_ingests_and_searches_with_provenance(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    url = "https://example.gov/notices/current"
+    content = (
+        b"<!doctype html><html><head><title>Housing Notice</title></head>"
+        b"<body><main><h1>Housing Notice</h1><h2>Public Hearing</h2>"
+        b"<p>The housing hearing accepts public comment through Friday afternoon.</p>"
+        b"</main></body></html>"
+    )
+    response = PipelineHttpResponse(
+        status_code=200,
+        headers={"content-type": "text/html", "content-length": str(len(content))},
+        chunks=(content,),
+    )
+    transport = PipelineHttpTransport(response=response)
+
+    cli_result = runner.invoke(app, ["--data-dir", str(data_dir), "ingest", url])
+    jobs = list_jobs(paths.database)
+    assert cli_result.exit_code == 0, cli_result.stdout
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        acquirer=SafeSourceArtifactAcquirer(
+            resolver=PublicResolver(),
+            transport=transport,
+        ),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    assert get_job(paths.database, jobs[0].id).status == "done"
+    assert transport.requests == [(url, "93.184.216.34")]
+    assert transport.timeouts == [30.0]
+    documents = list_documents(paths.database)
+    assert documents[0].source_url == url
+    assert documents[0].title == "Housing Notice"
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        artifact = connection.execute("SELECT * FROM source_artifacts").fetchone()
+    assert artifact is not None
+    assert artifact["reported_media_type"] == "text/html"
+    assert Path(artifact["stored_path"]).read_bytes() == content
+    provenance = json.loads(artifact["provenance_json"])
+    assert provenance["submitted_url"] == url
+    assert provenance["resolved_url"] == url
+
+    results = _keyword_search_results(paths.database, "Friday")
+    assert results[0].citation == "Housing Notice — Public Hearing — block 3"
+    assert results[0].source_url == url
+
+
+def test_ingest_url_reports_html_validation_failure_from_background_job(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / ".newsrag"
@@ -400,14 +528,18 @@ def test_ingest_url_reports_non_pdf_validation_failure_from_background_job(
 
     updated_job = get_job(paths.database, job.id)
     assert updated_job.status == FAILED
-    assert "Unsupported source type" in (updated_job.error or "")
+    assert "no evidentiary content" in (updated_job.error or "")
     with sqlite3.connect(paths.database) as connection:
         assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM documents").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM source_units").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM chunks").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM passages").fetchone() == (0,)
         assert connection.execute("SELECT media_type FROM source_artifacts").fetchone() == (
-            "application/octet-stream",
+            "text/html",
         )
+    assert list_chunk_vectors(paths.lancedb) == []
 
     hinted_job = enqueue_ingest_source(paths.database, source=url, source_type="pdf").jobs[0]
     asyncio.run(
@@ -466,16 +598,19 @@ def test_manifest_accepts_url_and_relative_local_path_with_type_hint(tmp_path: P
     data_dir = tmp_path / ".newsrag"
     manifest_dir = tmp_path / "manifest"
     manifest_dir.mkdir()
-    local_pdf = manifest_dir / "packet.pdf"
-    local_pdf.write_bytes(b"%PDF-1.4\nlocal")
+    local_html = manifest_dir / "notice.html"
+    local_html.write_text(
+        "<!doctype html><html><body><p>Local notice</p></body></html>",
+        encoding="utf-8",
+    )
     manifest_path = manifest_dir / "sources.yaml"
     manifest_path.write_text(
         """
         documents:
-          - source: https://example.gov/remote.pdf
-            type: pdf
-          - source: ./packet.pdf
-            type: pdf
+          - source: https://example.gov/remote.html
+            type: html
+          - source: ./notice.html
+            type: html
         """.strip(),
         encoding="utf-8",
     )
@@ -487,14 +622,14 @@ def test_manifest_accepts_url_and_relative_local_path_with_type_hint(tmp_path: P
     paths = initialize_storage(data_dir)
     jobs = list_jobs(paths.database)
     assert result.exit_code == 0, result.stdout
-    assert "Queued by type: pdf=2" in result.stdout
+    assert "Queued by type: html=2" in result.stdout
     assert len(jobs) == 2
     payloads_by_reference = {
         str(job.payload.get("url") or job.payload.get("path")): job.payload for job in jobs
     }
-    assert "https://example.gov/remote.pdf" in payloads_by_reference
-    assert str(local_pdf) in payloads_by_reference
-    assert all(job.payload["source_type"] == "pdf" for job in jobs)
+    assert "https://example.gov/remote.html" in payloads_by_reference
+    assert str(local_html) in payloads_by_reference
+    assert all(job.payload["source_type"] == "html" for job in jobs)
 
 
 def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> None:
@@ -505,7 +640,7 @@ def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> N
         documents:
           - source: https://example.gov/packet.pdf
           - source: https://example.gov/page.html
-            type: html
+            type: docx
         """.strip(),
         encoding="utf-8",
     )
@@ -516,7 +651,7 @@ def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> N
 
     paths = initialize_storage(data_dir)
     assert result.exit_code == 1
-    assert "Unsupported source type 'html'" in result.stdout
+    assert "Unsupported source type 'docx'" in result.stdout
     assert list_jobs(paths.database) == []
 
 
@@ -1566,6 +1701,18 @@ def test_ingest_failures_are_recorded_with_context(tmp_path: Path) -> None:
     assert list_chunk_vectors(paths.lancedb) == []
 
 
+def _keyword_search_results(database_path: Path, query: str) -> list[SearchResult]:
+    candidates = search_keyword_candidates(database_path, query, limit=10)
+    return merge_search_candidates(
+        candidates,
+        (),
+        database_path=database_path,
+        limit=10,
+        keyword_weight=1.0,
+        vector_weight=0.0,
+    )
+
+
 @dataclass
 class FakeSourceAdapter:
     inputs: list[AdapterInput] = field(default_factory=list)
@@ -1728,6 +1875,7 @@ class PipelineHttpResponse:
 class PipelineHttpTransport:
     response: PipelineHttpResponse
     requests: list[tuple[str, str]] = field(default_factory=list)
+    timeouts: list[float] = field(default_factory=list)
 
     def get(
         self,
@@ -1736,8 +1884,8 @@ class PipelineHttpTransport:
         connect_ip: str,
         timeout_seconds: float,
     ) -> HttpResponseStream:
-        del timeout_seconds
         self.requests.append((url, connect_ip))
+        self.timeouts.append(timeout_seconds)
         return self.response
 
 
