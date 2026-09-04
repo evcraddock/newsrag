@@ -90,6 +90,10 @@ Each canonical source unit has a contiguous one-based ordinal, typed machine loc
 
 PDF is the first implementation of this contract. The PDF adapter validates the raw PDF, runs the existing OCR and extraction fallback behavior, and emits one page source unit per PDF page. The shared pipeline then performs page-compatible chunking, passage generation, embeddings, FTS/vector indexing, and publication. SQLite publication is transactional; failed vector publication rolls back the document bundle and removes staged vectors so incomplete documents cannot appear in search.
 
+The standalone static HTML adapter accepts `text/html` and `application/xhtml+xml` artifacts with conservative document signatures and a restricted encoding set. It parses with network access, entity resolution, recovery, and oversized parser trees disabled; it never executes JavaScript or retrieves linked resources. The adapter selects one unambiguous `article`, then one `main` or `role=main`, then the document body, and emits deterministic `html_block` units for retained headings, paragraphs, list items, quotations, preformatted text, captions, and table rows. Units carry block numbers, heading paths, element kinds, normalized text, and `static-html` extractor identity. Safe title, language, author, and publication-time values are returned only as metadata candidates. The independent adapter is not registered with ingestion until the static HTML end-to-end task adds non-page chunking and publication support.
+
+Static HTML extraction fails rather than truncating when input exceeds 10 MiB, the parsed tree exceeds 100,000 elements or 256 levels, or retained text exceeds 10 MiB. It also rejects unsupported or conflicting encodings, unsafe external declarations, malformed input, ambiguous content roots, and empty evidentiary output.
+
 ## Chunking and citations
 
 The MVP uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. This keeps citations simple and reliable for city hall PDFs, where page numbers are often the most important reference.
