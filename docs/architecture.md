@@ -28,7 +28,7 @@ newsrag jobs retry <job-id>
 
 ## Storage and configuration
 
-NewsRAG uses configurable local storage with a data directory defaulting to the user data directory (`$XDG_DATA_HOME/newsrag`, or `~/.local/share/newsrag` when `XDG_DATA_HOME` is unset). A user can override the active data directory with a CLI flag or configured default for a separate corpus. The data directory contains the corpus-local SQLite database, LanceDB vector index directory, downloaded source PDFs, OCR-normalized PDFs, processing artifacts, and local logs relevant to that corpus.
+NewsRAG uses configurable local storage with a data directory defaulting to the user data directory (`$XDG_DATA_HOME/newsrag`, or `~/.local/share/newsrag` when `XDG_DATA_HOME` is unset). A user can override the active data directory with a CLI flag or configured default for a separate corpus. The data directory contains the corpus-local SQLite database, LanceDB vector index directory, immutable content-addressed source artifacts, OCR-normalized PDFs, processing artifacts, and local logs relevant to that corpus.
 
 Configuration is user-global, for example `~/.config/newsrag/config.yaml`. The global config stores daemon settings, embedding provider/model defaults, watched folder registrations, and user-level defaults. CLI flags can override config values for a specific command.
 
@@ -71,9 +71,15 @@ Processing uses exact raw-byte SHA-256 identity within one corpus. It does not c
 
 When a known source returns different bytes, NewsRAG preserves the new artifact with `change_detected_artifact_saved` but does not replace the source's current document. Repeating those changed bytes reports `change_already_detected`. New publications report `created`. A unique document-to-artifact constraint and transactional cleanup make concurrent duplicate processing converge without exposing partial document records or vectors. The complete policy is recorded in [Source identity and repeated ingestion](research/source-identity-and-repeated-ingestion.md).
 
-Raw bytes are retained as immutable, content-addressed source artifacts. Each PDF is normalized through OCR, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path.
+Raw bytes are retained as immutable, content-addressed source artifacts. Acquisition runs in the daemon before format extraction. One acquisition accepts either an explicitly submitted local regular file or a public HTTP(S) URL, stages bytes while hashing, applies the duplicate decision, and durably promotes bytes that must be retained before invoking an adapter.
 
-The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Each extracted page is stored as an ordered page source unit before chunking, and source-unit ranges propagate through chunks, passages, embeddings, and search results while existing page citations remain stable.
+Remote acquisition resolves and pins a validated public address for each request, revalidates every redirect destination, follows at most five redirects, and applies a 30-second request timeout. URL credentials, localhost, non-public addresses, unsafe redirects, ambient proxy or cookie state, and unsupported content encodings are rejected. HTTP bodies are streamed with separate 250 MiB compressed and decompressed limits. Only the submitted resource and required HTTP redirects are fetched; linked and embedded resources are not retrieved.
+
+Local acquisition has a 250 MiB limit and accepts only regular files. An explicitly submitted symlink is allowed only when its resolved regular-file target remains stable. Directory scans skip symlinks. Device/inode, size, modification time, resolved target, and bytes read are checked around the read so missing, special, changed, or oversized inputs fail without preserving a partial artifact.
+
+Acquisition provenance stores submitted and resolved references, redirects, retrieval or file-read timestamps, reported media type, exact byte size and SHA-256, and the durable artifact path. Diagnostics use stage-specific errors and omit URL credentials, query data, response bodies, and ambient secrets.
+
+Each PDF is normalized through OCR, then text is extracted from the normalized PDF. This makes scanned and born-digital PDFs follow the same downstream path. The OCR stage uses `ocrmypdf` with Tesseract and its required supporting tools. Text extraction uses PyMuPDF as the primary extractor and pdfplumber as a fallback or table-oriented extraction path. Each extracted page is stored as an ordered page source unit before chunking, and source-unit ranges propagate through chunks, passages, embeddings, and search results while existing page citations remain stable.
 
 ## Source adapter contract
 

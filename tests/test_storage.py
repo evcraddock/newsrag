@@ -34,6 +34,8 @@ def test_initialize_storage_creates_layout_and_schema(tmp_path: Path) -> None:
     assert paths.lancedb.is_dir()
     assert paths.logs.is_dir()
     assert paths.artifacts.is_dir()
+    assert paths.source_artifacts.is_dir()
+    assert paths.artifact_staging.is_dir()
     assert paths.database.is_file()
     assert REQUIRED_TABLES.issubset(_existing_tables(paths.database))
 
@@ -296,6 +298,8 @@ def test_initialize_storage_migrates_pdf_records_to_source_units(tmp_path: Path)
     assert artifact["content_hash"] == source_hash
     assert artifact["stored_path"] == str(source_pdf)
     assert artifact["state"] == "published"
+    assert artifact["reported_media_type"] is None
+    assert artifact["provenance_json"] == "{}"
     assert document is not None
     assert document["artifact_id"] == artifact["id"]
     assert unit is not None

@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Barrier
 
-import httpx
 import lancedb  # type: ignore[import-untyped]
 import pytest
 from typer.testing import CliRunner
 
+from newsrag.acquisition import (
+    SOURCE_KIND_URL,
+    AcquisitionError,
+    AcquisitionRequest,
+    HttpResponseStream,
+    SafeSourceArtifactAcquirer,
+    StagedSourceArtifact,
+)
 from newsrag.adapters import (
     AdapterError,
     AdapterInput,
@@ -39,12 +47,12 @@ from newsrag.ingest import (
     PDF_EXTRACTOR_TABLE,
     ExtractedPage,
     FallbackTextExtractor,
-    IngestError,
     LanceDbVectorStore,
     PdfPlumberTextExtractor,
     PyMuPdfTextExtractor,
     build_ingest_handler,
     build_pdf_text_extractor,
+    enqueue_ingest_jobs,
     enqueue_ingest_url_job,
     list_chunk_vectors,
     list_chunks,
@@ -60,6 +68,7 @@ from newsrag.jobs import (
     set_job_status,
 )
 from newsrag.manifests import ManifestError, load_manifest
+from newsrag.sources import normalize_url_reference
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
@@ -71,6 +80,7 @@ def test_ingest_command_enqueues_local_pdf_jobs(tmp_path: Path) -> None:
     source_dir.mkdir()
     (source_dir / "packet-a.pdf").write_bytes(b"%PDF-1.4\nA")
     (source_dir / "packet-b.PDF").write_bytes(b"%PDF-1.4\nB")
+    (source_dir / "alias.pdf").symlink_to(source_dir / "packet-a.pdf")
     (source_dir / "notes.txt").write_text("ignore me", encoding="utf-8")
 
     result = runner.invoke(
@@ -124,14 +134,9 @@ def test_ingest_command_records_pdf_extractor_mode(tmp_path: Path) -> None:
     assert jobs[0].payload["pdf_extractor"] == PDF_EXTRACTOR_TABLE
 
 
-def test_ingest_url_command_downloads_pdf_and_enqueues_job(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ingest_url_command_enqueues_background_acquisition(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
-    url = "https://example.gov/packet.pdf"
-
-    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nurl-pdf"))
+    url = "https://example.gov/packet.pdf?token=secret"
 
     result = runner.invoke(
         app,
@@ -152,48 +157,68 @@ def test_ingest_url_command_downloads_pdf_and_enqueues_job(
 
     assert result.exit_code == 0
     assert "Enqueued 1 ingest job(s)" in result.stdout
+    assert "token=secret" not in result.stdout
     assert len(jobs) == 1
     assert jobs[0].kind == INGEST_JOB_KIND
-    assert Path(jobs[0].payload["path"]).parent == paths.downloaded_pdfs
-    assert Path(jobs[0].payload["path"]).is_file()
+    assert jobs[0].payload["url"] == url
+    assert "path" not in jobs[0].payload
     assert jobs[0].payload["metadata"]["body"] == "City Council"
     assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
-    assert jobs[0].payload["metadata"]["source_url"] == url
-    assert "retrieved_at" in jobs[0].payload["metadata"]
+    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert list(paths.source_artifacts.iterdir()) == []
 
 
-def test_enqueue_ingest_url_job_reuses_hash_named_download_for_unchanged_content(
+def test_ingest_url_rejects_credentials_without_persisting_or_displaying_them(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    data_dir = tmp_path / ".newsrag"
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "ingest-url",
+            "https://user:secret@example.gov/packet.pdf",
+        ],
+    )
+
+    paths = initialize_storage(data_dir)
+    assert result.exit_code == 1
+    assert "URL credentials are not allowed" in result.stdout
+    assert "user:secret" not in result.stdout
+    assert list_jobs(paths.database) == []
+
+
+def test_enqueue_ingest_url_job_does_not_fetch_before_daemon_processing(tmp_path: Path) -> None:
     paths = initialize_storage(tmp_path / ".newsrag")
     url = "https://example.gov/packet.pdf"
-
-    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nunchanged"))
 
     first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
     second_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
-    assert first_job.payload["path"] == second_job.payload["path"]
-    assert Path(first_job.payload["path"]).is_file()
+    assert first_job.payload["url"] == url
+    assert second_job.payload["url"] == url
+    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert list(paths.source_artifacts.iterdir()) == []
 
 
-def test_url_ingest_stores_source_url_and_retrieved_at(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_url_ingest_stores_source_url_and_acquisition_provenance(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     url = "https://example.gov/packet.pdf"
+    resolved_url = "https://cdn.example.gov/packet.pdf"
+    acquirer = FakeUrlAcquirer(
+        content_by_url={url: b"%PDF-1.4\nurl-pdf"},
+        resolved_url_by_url={url: resolved_url},
+    )
 
-    monkeypatch.setattr("newsrag.ingest.httpx.get", _fake_pdf_getter(url, b"%PDF-1.4\nurl-pdf"))
-
-    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
-    retrieved_at = str(job.payload["metadata"]["retrieved_at"])
+    enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
+        acquirer=acquirer,
         ocr_runner=FakeOcrRunner(),
         text_extractor=FakeTextExtractor(pages=[ExtractedPage(page_number=1, text="Agenda")]),
         embedding_provider=FakeEmbeddingProvider(),
@@ -216,43 +241,101 @@ def test_url_ingest_stores_source_url_and_retrieved_at(
 
     assert len(documents) == 1
     assert documents[0].source_url == url
-    assert documents[0].metadata["retrieved_at"] == retrieved_at
+    assert documents[0].metadata["retrieved_at"] == FakeUrlAcquirer.ACQUIRED_AT
     assert source is not None
     assert source["kind"] == "url"
     assert source["submitted_reference"] == url
     assert source["normalized_reference"] == url
+    assert source["resolved_reference"] == resolved_url
     assert artifact is not None
     assert artifact["source_id"] == source["id"]
-    assert artifact["acquired_at"] == retrieved_at
+    assert artifact["acquired_at"] == FakeUrlAcquirer.ACQUIRED_AT
+    assert artifact["reported_media_type"] == "application/pdf"
+    assert json.loads(artifact["provenance_json"]) == {
+        "redirects": [resolved_url],
+        "resolved_url": resolved_url,
+        "retrieved_at": FakeUrlAcquirer.ACQUIRED_AT,
+        "submitted_url": url,
+    }
+    assert Path(artifact["stored_path"]).parent == paths.source_artifacts
+    assert Path(artifact["stored_path"]).read_bytes() == b"%PDF-1.4\nurl-pdf"
 
 
-def test_ingest_url_rejects_non_pdf_responses(
+def test_safe_url_acquisition_runs_inside_daemon(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    url = "https://example.gov/packet.pdf"
+    response = PipelineHttpResponse(
+        status_code=200,
+        headers={"content-type": "application/pdf"},
+        chunks=(b"%PDF-1.4\nbackground",),
+    )
+    transport = PipelineHttpTransport(response=response)
+    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        acquirer=SafeSourceArtifactAcquirer(
+            resolver=PublicResolver(),
+            transport=transport,
+        ),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    assert get_job(paths.database, job.id).status == "done"
+    assert transport.requests == [(url, "93.184.216.34")]
+    assert response.closed is True
+    assert len(list(paths.source_artifacts.iterdir())) == 1
+
+
+def test_ingest_url_reports_non_pdf_validation_failure_from_background_job(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
     url = "https://example.gov/not-a-pdf"
+    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        acquirer=FakeUrlAcquirer(
+            content_by_url={url: b"<html>nope</html>"},
+            media_type_by_url={url: "text/html"},
+        ),
+        ocr_runner=FakeOcrRunner(),
+        text_extractor=FakeTextExtractor(pages=[]),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
 
-    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
-        del follow_redirects, timeout
-        request = httpx.Request("GET", target_url)
-        return httpx.Response(
-            200,
-            request=request,
-            headers={"Content-Type": "text/html"},
-            content=b"<html>nope</html>",
-        )
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
 
-    monkeypatch.setattr("newsrag.ingest.httpx.get", fake_get)
+    updated_job = get_job(paths.database, job.id)
+    assert updated_job.status == FAILED
+    assert "invalid signature" in (updated_job.error or "")
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone() == (0,)
 
-    with pytest.raises(IngestError, match="PDF-like response"):
-        enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
-
-def test_ingest_manifest_enqueues_one_job_per_document(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_ingest_manifest_enqueues_one_job_per_document(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     manifest_path = tmp_path / "sources.yaml"
     manifest_path.write_text(
@@ -269,16 +352,6 @@ def test_ingest_manifest_enqueues_one_job_per_document(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(
-        "newsrag.ingest.httpx.get",
-        _fake_pdf_url_map_getter(
-            {
-                "https://example.gov/packet-1.pdf": b"%PDF-1.4\npacket-1",
-                "https://example.gov/packet-2.pdf": b"%PDF-1.4\npacket-2",
-            }
-        ),
-    )
-
     result = runner.invoke(
         app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
     )
@@ -290,13 +363,14 @@ def test_ingest_manifest_enqueues_one_job_per_document(
     assert "Enqueued 2 ingest job(s)" in result.stdout
     assert len(jobs) == 2
 
-    jobs_by_url = {str(job.payload["metadata"]["source_url"]): job for job in jobs}
+    jobs_by_url = {str(job.payload["url"]): job for job in jobs}
     first_job = jobs_by_url["https://example.gov/packet-1.pdf"]
     second_job = jobs_by_url["https://example.gov/packet-2.pdf"]
 
     assert first_job.payload["metadata"]["title"] == "Packet One"
     assert first_job.payload["metadata"]["meeting_date"] == "2026-05-01"
     assert second_job.payload["metadata"]["jurisdiction"] == "Example City"
+    assert list(paths.source_artifacts.iterdir()) == []
 
 
 def test_invalid_manifest_missing_url_fails_without_enqueuing(tmp_path: Path) -> None:
@@ -379,10 +453,7 @@ def test_invalid_manifest_unsupported_fields_fail(tmp_path: Path) -> None:
         load_manifest(manifest_path)
 
 
-def test_manifest_metadata_is_preserved_on_created_documents(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_manifest_metadata_is_preserved_on_created_documents(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     manifest_path = tmp_path / "sources.yaml"
     manifest_path.write_text(
@@ -398,11 +469,6 @@ def test_manifest_metadata_is_preserved_on_created_documents(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(
-        "newsrag.ingest.httpx.get",
-        _fake_pdf_getter("https://example.gov/packet.pdf", b"%PDF-1.4\nmanifest"),
-    )
-
     result = runner.invoke(
         app, ["--data-dir", str(data_dir), "ingest-manifest", str(manifest_path)]
     )
@@ -412,6 +478,9 @@ def test_manifest_metadata_is_preserved_on_created_documents(
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
+        acquirer=FakeUrlAcquirer(
+            content_by_url={"https://example.gov/packet.pdf": b"%PDF-1.4\nmanifest"}
+        ),
         ocr_runner=FakeOcrRunner(),
         text_extractor=FakeTextExtractor(pages=[ExtractedPage(page_number=1, text="Agenda")]),
         embedding_provider=FakeEmbeddingProvider(),
@@ -435,22 +504,43 @@ def test_manifest_metadata_is_preserved_on_created_documents(
     assert documents[0].metadata["jurisdiction"] == "Example City"
 
 
-def test_ingest_url_download_failures_fail_clearly(
+def test_ingest_url_acquisition_failures_are_recorded_by_background_job(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    paths = initialize_storage(tmp_path / ".newsrag")
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
     url = "https://example.gov/packet.pdf"
+    job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        acquirer=FakeUrlAcquirer(
+            content_by_url={},
+            error=AcquisitionError("remote_request", "Request failed safely"),
+        ),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
 
-    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
-        del follow_redirects, timeout
-        request = httpx.Request("GET", target_url)
-        raise httpx.ConnectError("boom", request=request)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(
+            DaemonRunner(
+                database_path=paths.database,
+                handlers={INGEST_JOB_KIND: handler},
+                poll_interval=0,
+            ).run_cycle()
+        )
 
-    monkeypatch.setattr("newsrag.ingest.httpx.get", fake_get)
-
-    with pytest.raises(IngestError, match="Failed downloading"):
-        enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
+    updated_job = get_job(paths.database, job.id)
+    assert updated_job.status == FAILED
+    assert "Acquisition remote_request failed" in (updated_job.error or "")
+    assert "stage=artifact_acquisition" in caplog.text
+    assert "ingest_stage_failed" in caplog.text
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (0,)
 
 
 def test_ingestion_pipeline_processes_an_injected_source_adapter(
@@ -487,6 +577,7 @@ def test_ingestion_pipeline_processes_an_injected_source_adapter(
 
     assert get_job(paths.database, job.id).status == "done"
     for stage in (
+        "artifact_acquisition",
         "artifact_preparation",
         "adapter_extraction",
         "chunking",
@@ -497,7 +588,7 @@ def test_ingestion_pipeline_processes_an_injected_source_adapter(
         assert f"stage={stage}" in caplog.text
     assert "Adapter agenda" not in caplog.text
     assert len(adapter.inputs) == 1
-    assert adapter.inputs[0].artifact_path.parent == paths.source_pdfs
+    assert adapter.inputs[0].artifact_path.parent == paths.source_artifacts
     assert adapter.inputs[0].media_type == "application/pdf"
     with sqlite3.connect(paths.database) as connection:
         unit = connection.execute(
@@ -648,10 +739,17 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert source is not None
     assert source["kind"] == "local_path"
     assert source["submitted_reference"] == str(source_pdf.resolve())
+    assert source["resolved_reference"] == str(source_pdf.resolve())
     assert artifact is not None
     assert artifact["source_id"] == source["id"]
     assert artifact["content_hash"] == documents[0].source_hash
     assert artifact["byte_size"] == source_pdf.stat().st_size
+    assert artifact["reported_media_type"] == "application/pdf"
+    assert Path(artifact["stored_path"]).parent == paths.source_artifacts
+    local_provenance = json.loads(artifact["provenance_json"])
+    assert local_provenance["submitted_path"] == str(source_pdf.resolve())
+    assert local_provenance["resolved_path"] == str(source_pdf.resolve())
+    assert local_provenance["file_mtime_ns"] == source_pdf.stat().st_mtime_ns
     assert len(source_units) == 2
     assert [unit["ordinal"] for unit in source_units] == [1, 2]
     assert [json.loads(unit["location_json"]) for unit in source_units] == [
@@ -675,6 +773,48 @@ def test_mocked_local_pdf_job_creates_document_pages_chunks_and_vector_records(
     assert {vector["source_unit_end_id"] for vector in passage_vectors} == set(unit_ids)
     assert {record.source_unit_start_id for record in embedding_records} == set(unit_ids)
     assert {record.source_unit_end_id for record in embedding_records} == set(unit_ids)
+
+
+def test_explicit_symlink_is_acquired_in_background_with_both_paths(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    target_path = tmp_path / "target.pdf"
+    target_path.write_bytes(b"%PDF-1.4\nsymlink")
+    submitted_path = tmp_path / "submitted.pdf"
+    submitted_path.symlink_to(target_path)
+    paths = initialize_storage(data_dir)
+    jobs = enqueue_ingest_jobs(paths.database, source_path=submitted_path)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    assert len(jobs) == 1
+    assert get_job(paths.database, jobs[0].id).status == "done"
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        source = connection.execute("SELECT * FROM sources").fetchone()
+        artifact = connection.execute("SELECT * FROM source_artifacts").fetchone()
+    assert source is not None
+    assert source["submitted_reference"] == str(submitted_path)
+    assert source["normalized_reference"] == str(submitted_path)
+    assert source["resolved_reference"] == str(target_path.resolve())
+    assert artifact is not None
+    provenance = json.loads(artifact["provenance_json"])
+    assert provenance["submitted_path"] == str(submitted_path)
+    assert provenance["resolved_path"] == str(target_path.resolve())
 
 
 def test_build_pdf_text_extractor_can_choose_extraction_path_under_test() -> None:
@@ -878,24 +1018,19 @@ def test_same_bytes_from_different_local_paths_ignore_the_second_source(
     assert len(adapter.inputs) == 1
 
 
-def test_same_bytes_from_different_urls_ignore_the_second_source(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_same_bytes_from_different_urls_ignore_the_second_source(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     first_url = "https://one.example.gov/packet.pdf"
     second_url = "https://two.example.gov/renamed.pdf"
     content = b"%PDF-1.4\nidentical-url"
-    monkeypatch.setattr(
-        "newsrag.ingest.httpx.get",
-        _fake_pdf_url_map_getter({first_url: content, second_url: content}),
-    )
+    acquirer = FakeUrlAcquirer(content_by_url={first_url: content, second_url: content})
     first_job = enqueue_ingest_url_job(paths.database, storage_paths=paths, url=first_url)
     adapter = FakeSourceAdapter()
     handler = build_ingest_handler(
         data_dir=data_dir,
         embedding_config=EmbeddingConfig(),
+        acquirer=acquirer,
         adapter=adapter,
         embedding_provider=FakeEmbeddingProvider(),
         vector_store=LanceDbVectorStore(paths.lancedb),
@@ -920,8 +1055,8 @@ def test_same_bytes_from_different_urls_ignore_the_second_source(
     assert second_result is not None and second_result["outcome"] == "duplicate_ignored"
     assert get_job(paths.database, second_job.id).payload == {}
     assert sources == [(first_url,)]
-    assert len(list(paths.downloaded_pdfs.iterdir())) == 1
-    assert len(list(paths.source_pdfs.iterdir())) == 1
+    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert len(list(paths.source_artifacts.iterdir())) == 1
     assert len(adapter.inputs) == 1
 
 
@@ -1134,7 +1269,7 @@ def test_concurrent_exact_duplicates_converge_on_one_document(tmp_path: Path) ->
     assert len(list_pages(paths.database)) == 1
     assert len(list_chunks(paths.database)) == 1
     assert len(list_chunk_vectors(paths.lancedb)) == 1
-    assert len(list(paths.source_pdfs.iterdir())) == 1
+    assert len(list(paths.source_artifacts.iterdir())) == 1
     with sqlite3.connect(paths.database) as connection:
         assert connection.execute("SELECT COUNT(*) FROM sources").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (1,)
@@ -1190,6 +1325,37 @@ def test_retried_ingest_job_keeps_duplicate_detection_idempotent(tmp_path: Path)
     assert len(list_chunks(paths.database)) == 1
     assert len(list_chunk_vectors(paths.lancedb)) == 1
     assert len(list_embedding_records(paths.database)) == 2
+
+
+def test_missing_local_source_failure_is_recorded_by_background_job(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+    missing_path = tmp_path / "missing.pdf"
+    jobs = enqueue_ingest_jobs(paths.database, source_path=missing_path)
+    handler = build_ingest_handler(
+        data_dir=data_dir,
+        embedding_config=EmbeddingConfig(),
+        adapter=FakeSourceAdapter(),
+        embedding_provider=FakeEmbeddingProvider(),
+        vector_store=LanceDbVectorStore(paths.lancedb),
+    )
+
+    asyncio.run(
+        DaemonRunner(
+            database_path=paths.database,
+            handlers={INGEST_JOB_KIND: handler},
+            poll_interval=0,
+        ).run_cycle()
+    )
+
+    updated_job = get_job(paths.database, jobs[0].id)
+    assert updated_job.status == FAILED
+    assert "Acquisition local_validation failed" in (updated_job.error or "")
+    assert str(missing_path) in (updated_job.error or "")
+    with sqlite3.connect(paths.database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM source_artifacts").fetchone() == (0,)
 
 
 def test_ingest_failures_are_recorded_with_context(tmp_path: Path) -> None:
@@ -1374,36 +1540,84 @@ class FakeEmbeddingProvider:
         ]
 
 
-def _fake_pdf_getter(
-    url: str,
-    content: bytes,
-) -> Callable[..., httpx.Response]:
-    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
-        del follow_redirects, timeout
-        assert target_url == url
-        request = httpx.Request("GET", target_url)
-        return httpx.Response(
-            200,
-            request=request,
-            headers={"Content-Type": "application/pdf"},
-            content=content,
+@dataclass
+class PipelineHttpResponse:
+    status_code: int
+    headers: Mapping[str, str]
+    chunks: tuple[bytes, ...]
+    closed: bool = False
+
+    def iter_raw(self) -> Iterator[bytes]:
+        yield from self.chunks
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@dataclass
+class PipelineHttpTransport:
+    response: PipelineHttpResponse
+    requests: list[tuple[str, str]] = field(default_factory=list)
+
+    def get(
+        self,
+        *,
+        url: str,
+        connect_ip: str,
+        timeout_seconds: float,
+    ) -> HttpResponseStream:
+        del timeout_seconds
+        self.requests.append((url, connect_ip))
+        return self.response
+
+
+@dataclass
+class PublicResolver:
+    def __call__(self, host: str, port: int) -> tuple[str, ...]:
+        del host, port
+        return ("93.184.216.34",)
+
+
+@dataclass
+class FakeUrlAcquirer:
+    content_by_url: dict[str, bytes]
+    resolved_url_by_url: dict[str, str] = field(default_factory=dict)
+    media_type_by_url: dict[str, str] = field(default_factory=dict)
+    error: AcquisitionError | None = None
+
+    ACQUIRED_AT = "2026-09-04T00:00:00+00:00"
+
+    def acquire(
+        self,
+        request: AcquisitionRequest,
+        staging_dir: Path,
+    ) -> StagedSourceArtifact:
+        if self.error is not None:
+            raise self.error
+        assert request.kind == SOURCE_KIND_URL
+        content = self.content_by_url[request.reference]
+        resolved_url = self.resolved_url_by_url.get(request.reference, request.reference)
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_path = staging_dir / f"fake-{len(list(staging_dir.iterdir()))}.artifact"
+        staged_path.write_bytes(content)
+        redirects = [resolved_url] if resolved_url != request.reference else []
+        return StagedSourceArtifact(
+            source_kind=SOURCE_KIND_URL,
+            submitted_reference=request.reference,
+            normalized_reference=normalize_url_reference(request.reference),
+            resolved_reference=resolved_url,
+            staged_path=staged_path,
+            content_hash=hashlib.sha256(content).hexdigest(),
+            byte_size=len(content),
+            acquired_at=self.ACQUIRED_AT,
+            reported_media_type=self.media_type_by_url.get(
+                request.reference,
+                "application/pdf",
+            ),
+            provenance={
+                "redirects": redirects,
+                "resolved_url": resolved_url,
+                "retrieved_at": self.ACQUIRED_AT,
+                "submitted_url": request.reference,
+            },
         )
-
-    return fake_get
-
-
-def _fake_pdf_url_map_getter(
-    url_map: dict[str, bytes],
-) -> Callable[..., httpx.Response]:
-    def fake_get(target_url: str, *, follow_redirects: bool, timeout: float) -> httpx.Response:
-        del follow_redirects, timeout
-        assert target_url in url_map
-        request = httpx.Request("GET", target_url)
-        return httpx.Response(
-            200,
-            request=request,
-            headers={"Content-Type": "application/pdf"},
-            content=url_map[target_url],
-        )
-
-    return fake_get

@@ -37,6 +37,25 @@ def test_build_source_identity_distinguishes_urls_and_local_paths(tmp_path: Path
     assert local_identity.id != url_identity.id
 
 
+def test_local_source_identity_keeps_symlink_path_separate_from_resolved_target(
+    tmp_path: Path,
+) -> None:
+    target_path = tmp_path / "target.pdf"
+    target_path.write_bytes(b"pdf")
+    submitted_path = tmp_path / "submitted.pdf"
+    submitted_path.symlink_to(target_path)
+
+    identity = build_source_identity(
+        source_path=submitted_path,
+        source_url=None,
+        resolved_reference=str(target_path.resolve()),
+    )
+
+    assert identity.submitted_reference == str(submitted_path)
+    assert identity.normalized_reference == str(submitted_path)
+    assert identity.resolved_reference == str(target_path.resolve())
+
+
 def test_derived_artifact_and_source_unit_ids_are_stable() -> None:
     assert artifact_id_for_hash("hash-a") == artifact_id_for_hash("hash-a")
     assert artifact_id_for_hash("hash-a") != artifact_id_for_hash("hash-b")

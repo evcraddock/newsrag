@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,8 @@ def register_acquired_artifact(
     byte_size: int,
     stored_path: Path,
     acquired_at: str,
+    reported_media_type: str | None,
+    provenance: dict[str, object],
 ) -> IngestionIdentityDecision:
     """Register exact bytes and decide whether ordinary processing may continue."""
 
@@ -111,9 +114,11 @@ def register_acquired_artifact(
                 content_hash,
                 stored_path,
                 acquired_at,
-                state
+                state,
+                reported_media_type,
+                provenance_json
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 artifact_id,
@@ -124,6 +129,8 @@ def register_acquired_artifact(
                 str(stored_path),
                 acquired_at,
                 state,
+                reported_media_type,
+                json.dumps(provenance, sort_keys=True),
             ),
         )
         connection.commit()
@@ -147,6 +154,17 @@ def register_acquired_artifact(
         outcome=outcome,
         document_id=current_document_id,
     )
+
+
+def find_stored_artifact_path(database_path: Path, content_hash: str) -> Path | None:
+    """Return the durable path for previously registered exact bytes."""
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT stored_path FROM source_artifacts WHERE content_hash = ?",
+            (content_hash,),
+        ).fetchone()
+    return Path(str(row[0])) if row is not None else None
 
 
 def find_document_for_artifact(database_path: Path, artifact_id: str) -> str | None:

@@ -35,6 +35,8 @@ class StoragePaths:
     lancedb: Path
     logs: Path
     artifacts: Path
+    source_artifacts: Path
+    artifact_staging: Path
     database: Path
 
 
@@ -77,9 +79,11 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("lancedb", "lancedb"),
     ("logs", "logs"),
     ("artifacts", "artifacts"),
+    ("source_artifacts", "artifacts/sources"),
+    ("artifact_staging", "artifacts/staging"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
@@ -130,6 +134,8 @@ SCHEMA_STATEMENTS = (
         stored_path TEXT NOT NULL,
         acquired_at TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'processing',
+        reported_media_type TEXT,
+        provenance_json TEXT NOT NULL DEFAULT '{}',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(source_id) REFERENCES sources(id)
     )
@@ -365,6 +371,8 @@ def build_storage_paths(data_dir: Path) -> StoragePaths:
         lancedb=directory_paths["lancedb"],
         logs=directory_paths["logs"],
         artifacts=directory_paths["artifacts"],
+        source_artifacts=directory_paths["source_artifacts"],
+        artifact_staging=directory_paths["artifact_staging"],
         database=data_dir / DATABASE_FILENAME,
     )
 
@@ -528,6 +536,8 @@ def _directory_checks(paths: StoragePaths) -> tuple[tuple[str, Path], ...]:
         ("lancedb", paths.lancedb),
         ("logs", paths.logs),
         ("artifacts", paths.artifacts),
+        ("source_artifacts", paths.source_artifacts),
+        ("artifact_staging", paths.artifact_staging),
     )
 
 
@@ -559,6 +569,13 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             "TEXT NOT NULL DEFAULT 'processing'",
         )
         _ensure_column(connection, "jobs", "result_json", "TEXT")
+        _ensure_column(connection, "source_artifacts", "reported_media_type", "TEXT")
+        _ensure_column(
+            connection,
+            "source_artifacts",
+            "provenance_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
         _ensure_column(connection, "pages", "extractor", "TEXT NOT NULL DEFAULT 'unknown'")
         _ensure_column(
             connection,
