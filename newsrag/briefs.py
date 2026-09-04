@@ -7,12 +7,18 @@ from pathlib import Path
 from typing import Any
 
 from newsrag.discovery import (
+    DiscoveryEvidenceRecord,
     DiscoveryItemRecord,
     DocumentBriefRecord,
     create_document_brief,
     list_discovery_items,
 )
 from newsrag.facts import extract_document_facts
+from newsrag.source_locations import (
+    SourceLocationError,
+    format_evidence_location,
+    load_document_extent,
+)
 
 BRIEF_EXTRACTOR = "deterministic-document-brief"
 BRIEF_PROVIDER = "rules"
@@ -44,7 +50,9 @@ class BriefDocumentContext:
     id: str
     title: str | None
     metadata: dict[str, Any]
-    page_count: int
+    source_type: str
+    extent_type: str
+    extent_count: int
     text_length: int
 
 
@@ -55,8 +63,10 @@ class BriefEvidenceLine:
     item_type: str
     label: str
     summary: str
-    page_start: int
-    page_end: int
+    location_type: str
+    location_label: str
+    page_start: int | None
+    page_end: int | None
     quote: str
 
 
@@ -122,7 +132,8 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
         f"title: {_display_value(document.title)}",
         f"meeting_date: {_display_value(_metadata_string(metadata, 'meeting_date'))}",
         f"body: {_display_value(_metadata_string(metadata, 'body'))}",
-        f"pages: {document.page_count}",
+        f"source_type: {document.source_type}",
+        f"{document.extent_type}: {document.extent_count}",
         "",
         "Summary:",
         brief.record.summary,
@@ -134,10 +145,13 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
     ]
 
     for line in brief.evidence_lines:
-        page_label = f"p. {line.page_start}"
-        if line.page_end != line.page_start:
-            page_label = f"pp. {line.page_start}-{line.page_end}"
-        lines.append(f"- {line.item_type}: {line.label} — {page_label} — {line.quote}")
+        location_label = format_evidence_location(
+            location_type=line.location_type,
+            location_label=line.location_label,
+            page_start=line.page_start,
+            page_end=line.page_end,
+        )
+        lines.append(f"- {line.item_type}: {line.label} — {location_label} — {line.quote}")
 
     lines.extend(["", "Open Questions:"])
     if brief.record.open_questions:
@@ -163,29 +177,27 @@ def _load_document_context(database_path: Path, document_id: str) -> BriefDocume
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT
-                documents.id,
-                documents.title,
-                documents.metadata_json,
-                COUNT(pages.id) AS page_count,
-                COALESCE(SUM(LENGTH(pages.text)), 0) AS text_length
+            SELECT id, title, metadata_json
             FROM documents
-            LEFT JOIN pages ON pages.document_id = documents.id
-            WHERE documents.id = ?
-            GROUP BY documents.id
+            WHERE id = ?
             """,
             (document_id,),
         ).fetchone()
-
-    if row is None:
-        raise BriefError(f"Unknown document: {document_id}")
+        if row is None:
+            raise BriefError(f"Unknown document: {document_id}")
+        try:
+            extent = load_document_extent(connection, document_id)
+        except SourceLocationError as exc:
+            raise BriefError(str(exc)) from exc
 
     return BriefDocumentContext(
         id=str(row["id"]),
         title=_optional_string(row["title"]),
         metadata=_load_metadata(row["metadata_json"]),
-        page_count=int(row["page_count"]),
-        text_length=int(row["text_length"]),
+        source_type=extent.source_type,
+        extent_type=extent.extent_type,
+        extent_count=extent.extent_count,
+        text_length=extent.text_length,
     )
 
 
@@ -203,7 +215,7 @@ def _select_notable_items(items: list[DiscoveryItemRecord]) -> tuple[DiscoveryIt
         key=lambda item: (
             _ITEM_PRIORITY.get(item.item_type, 99),
             -(item.confidence or 0.0),
-            item.evidence[0].page_start,
+            _evidence_order(item.evidence[0]),
             item.label.casefold(),
         )
     )
@@ -301,12 +313,23 @@ def _labels_by_type(items: tuple[DiscoveryItemRecord, ...]) -> dict[str, tuple[s
     return {key: tuple(value) for key, value in labels.items()}
 
 
+def _evidence_order(evidence: DiscoveryEvidenceRecord) -> tuple[int, int, str]:
+    if evidence.page_start is not None:
+        return (0, evidence.page_start, evidence.source_unit_start_id)
+    block_suffix = evidence.location_label.rpartition("block ")[2]
+    if block_suffix.isdigit():
+        return (1, int(block_suffix), evidence.source_unit_start_id)
+    return (2, 0, evidence.source_unit_start_id)
+
+
 def _item_to_evidence_line(item: DiscoveryItemRecord) -> BriefEvidenceLine:
     evidence = item.evidence[0]
     return BriefEvidenceLine(
         item_type=item.item_type,
         label=item.label,
         summary=item.summary,
+        location_type=evidence.location_type,
+        location_label=evidence.location_label,
         page_start=evidence.page_start,
         page_end=evidence.page_end,
         quote=evidence.quote,

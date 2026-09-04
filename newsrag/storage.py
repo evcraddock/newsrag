@@ -83,7 +83,7 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifact_staging", "artifacts/staging"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
@@ -281,7 +281,9 @@ SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS document_profiles (
         id TEXT PRIMARY KEY,
         document_id TEXT NOT NULL UNIQUE,
-        page_count INTEGER NOT NULL,
+        source_type TEXT NOT NULL,
+        extent_type TEXT NOT NULL,
+        extent_count INTEGER NOT NULL,
         text_length INTEGER NOT NULL,
         extraction_quality_json TEXT NOT NULL DEFAULT '{}',
         extractor TEXT NOT NULL,
@@ -343,15 +345,21 @@ SCHEMA_STATEMENTS = (
         id TEXT PRIMARY KEY,
         item_id TEXT NOT NULL,
         document_id TEXT NOT NULL,
+        source_unit_start_id TEXT NOT NULL,
+        source_unit_end_id TEXT NOT NULL,
+        location_type TEXT NOT NULL,
+        location_label TEXT NOT NULL,
         page_id TEXT,
         passage_id TEXT,
-        page_start INTEGER NOT NULL,
-        page_end INTEGER NOT NULL,
+        page_start INTEGER,
+        page_end INTEGER,
         quote TEXT NOT NULL DEFAULT '',
         validation_status TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(item_id) REFERENCES discovery_items(id),
         FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
+        FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id),
         FOREIGN KEY(page_id) REFERENCES pages(id),
         FOREIGN KEY(passage_id) REFERENCES passages(id)
     )
@@ -548,11 +556,11 @@ def _iter_directories(paths: StoragePaths) -> tuple[Path, ...]:
 def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
+        previous_schema_version = _read_schema_version(connection)
+        if previous_schema_version in {"1", "2", "3", "4"}:
+            _reset_derived_discovery_schema(connection)
         for statement in SCHEMA_STATEMENTS:
             connection.execute(statement)
-        previous_schema_version = connection.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()
         _ensure_column(connection, "documents", "source_hash", "TEXT")
         _ensure_column(connection, "documents", "normalized_path", "TEXT")
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
@@ -648,10 +656,34 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         connection.commit()
 
-    migration_required = (
-        previous_schema_version is None or str(previous_schema_version[0]) != SCHEMA_VERSION
-    )
+    migration_required = previous_schema_version != SCHEMA_VERSION
     return migration_required, removed_document_ids
+
+
+def _read_schema_version(connection: sqlite3.Connection) -> str | None:
+    metadata_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'metadata'"
+    ).fetchone()
+    if metadata_exists is None:
+        return None
+    row = connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def _reset_derived_discovery_schema(connection: sqlite3.Connection) -> None:
+    """Reset regenerable discovery records when adopting a new discovery schema."""
+
+    for table_name in (
+        "discovery_evidence",
+        "discovery_items_fts",
+        "discovery_items",
+        "document_briefs_fts",
+        "document_briefs",
+        "document_profiles",
+    ):
+        connection.execute(f"DROP TABLE IF EXISTS {table_name}")
 
 
 def _set_schema_version(database_path: Path) -> None:

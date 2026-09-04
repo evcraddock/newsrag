@@ -148,6 +148,14 @@ The daemon uses filesystem notifications through `watchfiles` and an async worke
 
 `newsrag status` and `newsrag jobs list` should show queue health, failed jobs, and processing state. This matters because OCR and embedding jobs can be slow and failures should not be silent.
 
+## Discovery and enrichment
+
+Discovery evidence uses source-unit start/end IDs as its canonical location for every format. PDF evidence also records derived page IDs and page ranges so existing page-oriented output remains unchanged; HTML evidence records heading/block labels without inventing page values. Optional passage IDs provide narrower quote-validation context. Evidence is persisted only after the cited source-unit range belongs to the document and the quote is found in the canonical source text or cited passage.
+
+Deterministic fact extraction, document briefs, structured enrichment, topics, timelines, and story leads operate over canonical source units. Document profiles store `source_type`, `extent_type`, and `extent_count`; PDF profiles use pages and HTML profiles use blocks. Terminal discovery output formats each typed location as a PDF page citation or HTML heading/block citation.
+
+Schema version 5 replaces the previously unused page-only discovery schema. Upgrading from schema versions 1–4 resets only regenerable document profiles, briefs, discovery items/evidence, and their FTS tables rather than converting old derived records. Sources, artifacts, documents, source units, chunks, passages, embeddings, and search indexes are not reset.
+
 ## Packet generation
 
 `newsrag packet` uses the same retrieval pipeline as search and writes an extractive Markdown source packet. The initial packet template is fixed and research-oriented, with configurable templates left for later.

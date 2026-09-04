@@ -50,6 +50,183 @@ def test_initialize_storage_is_idempotent(tmp_path: Path) -> None:
     assert REQUIRED_TABLES == REQUIRED_TABLES.intersection(_existing_tables(second_paths.database))
 
 
+def test_schema_upgrade_resets_only_regenerable_discovery_data(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    paths = initialize_storage(data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 'hash-1',
+                '/tmp/report.pdf', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, source_path, title, source_hash, metadata_json, artifact_id
+            )
+            VALUES(
+                'document-1', '/tmp/report.pdf', 'Report', 'hash-1', '{}', 'artifact-1'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, human_label,
+                normalized_text, extractor
+            )
+            VALUES(
+                'unit-1', 'artifact-1', 'document-1', 1, 'page', 'p. 1',
+                'quote', 'pdf-text'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks(
+                id, document_id, page_start, page_end, source_unit_start_id,
+                source_unit_end_id, text
+            )
+            VALUES('chunk-1', 'document-1', 1, 1, 'unit-1', 'unit-1', 'quote')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO passages(
+                id, chunk_id, document_id, page_start, page_end, source_unit_start_id,
+                source_unit_end_id, ordinal, text
+            )
+            VALUES(
+                'passage-1', 'chunk-1', 'document-1', 1, 1,
+                'unit-1', 'unit-1', 1, 'quote'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO embedding_records(
+                id, source_kind, source_key, provider, model, version, dimensions,
+                source_unit_start_id, source_unit_end_id
+            )
+            VALUES(
+                'embedding-1', 'passage', 'passage-1', 'test', 'test', '1', 1,
+                'unit-1', 'unit-1'
+            )
+            """
+        )
+        connection.execute("INSERT INTO chunks_fts(chunk_id, text) VALUES('chunk-1', 'quote')")
+        connection.execute(
+            "INSERT INTO passages_fts(passage_id, text) VALUES('passage-1', 'quote')"
+        )
+        connection.execute(
+            """
+            INSERT INTO document_profiles(
+                id, document_id, source_type, extent_type, extent_count, text_length,
+                extraction_quality_json, extractor
+            )
+            VALUES('profile-1', 'document-1', 'pdf', 'pages', 1, 10, '{}', 'rules')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO document_briefs(id, document_id, summary, extractor)
+            VALUES('brief-1', 'document-1', 'summary', 'rules')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO discovery_items(id, document_id, item_type, label, extractor)
+            VALUES('item-1', 'document-1', 'topic', 'budget', 'rules')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO discovery_evidence(
+                id, item_id, document_id, source_unit_start_id, source_unit_end_id,
+                location_type, location_label, quote, validation_status
+            )
+            VALUES(
+                'evidence-1', 'item-1', 'document-1', 'unit-1', 'unit-1',
+                'page', 'p. 1', 'quote', 'validated'
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO document_briefs_fts(brief_id, summary) VALUES('brief-1', 'summary')"
+        )
+        connection.execute(
+            "INSERT INTO discovery_items_fts(item_id, label) VALUES('item-1', 'budget')"
+        )
+        connection.execute("UPDATE metadata SET value = '4' WHERE key = 'schema_version'")
+        connection.commit()
+
+    initialize_storage(data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        preserved_counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "sources",
+                "source_artifacts",
+                "documents",
+                "source_units",
+                "chunks",
+                "chunks_fts",
+                "passages",
+                "passages_fts",
+                "embedding_records",
+            )
+        }
+        derived_counts = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "document_profiles",
+                "document_briefs",
+                "discovery_items",
+                "discovery_evidence",
+                "document_briefs_fts",
+                "discovery_items_fts",
+            )
+        }
+        schema_version = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()[0]
+
+    assert preserved_counts == {
+        "sources": 1,
+        "source_artifacts": 1,
+        "documents": 1,
+        "source_units": 1,
+        "chunks": 1,
+        "chunks_fts": 1,
+        "passages": 1,
+        "passages_fts": 1,
+        "embedding_records": 1,
+    }
+    assert derived_counts == {
+        "document_profiles": 0,
+        "document_briefs": 0,
+        "discovery_items": 0,
+        "discovery_evidence": 0,
+        "document_briefs_fts": 0,
+        "discovery_items_fts": 0,
+    }
+    assert schema_version == "5"
+
+
 def test_initialize_storage_backfills_passages_from_existing_chunks(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
