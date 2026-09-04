@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from watchfiles import awatch
 
@@ -14,6 +16,7 @@ from newsrag.storage import initialize_storage
 from newsrag.watches import DEFAULT_WATCH_STABILITY_SECONDS, WatchDebouncer, list_watches
 
 JobHandler = Callable[[Job], Awaitable[None]]
+LOGGER = logging.getLogger(__name__)
 
 
 class UnknownJobKindError(Exception):
@@ -59,12 +62,26 @@ class DaemonRunner:
         if job is None:
             return False
 
+        started_at = perf_counter()
+        log_context = _job_log_context(job)
+        LOGGER.info("job_started %s", log_context)
         try:
             await self._handle_job(job)
         except Exception as exc:
             await asyncio.to_thread(mark_job_failed, self.database_path, job.id, error=str(exc))
+            LOGGER.error(
+                "job_failed %s elapsed_ms=%d error=%r",
+                log_context,
+                _elapsed_milliseconds(started_at),
+                str(exc),
+            )
         else:
             await asyncio.to_thread(mark_job_done, self.database_path, job.id)
+            LOGGER.info(
+                "job_completed %s elapsed_ms=%d",
+                log_context,
+                _elapsed_milliseconds(started_at),
+            )
         return True
 
     async def _handle_job(self, job: Job) -> None:
@@ -99,6 +116,12 @@ async def run_daemon(
         poll_interval=config.poll_interval,
     )
     watches = list_watches(storage_paths.database)
+    LOGGER.info(
+        "daemon_started data_dir=%r poll_interval_seconds=%s watches=%d",
+        str(config.data_dir),
+        config.poll_interval,
+        len(watches),
+    )
     if not watches:
         await runner.run(max_loops=config.max_loops)
         return
@@ -140,3 +163,15 @@ async def _run_watch_loop(
 async def _default_watch_stream(paths: tuple[str, ...]) -> AsyncIterator[set[tuple[object, str]]]:
     async for changes in awatch(*paths):
         yield {(change, str(path)) for change, path in changes}
+
+
+def _job_log_context(job: Job) -> str:
+    context = f"job_id={job.id} kind={job.kind}"
+    source_path = job.payload.get("path")
+    if isinstance(source_path, str):
+        context += f" source_path={source_path!r}"
+    return context
+
+
+def _elapsed_milliseconds(started_at: float) -> int:
+    return round((perf_counter() - started_at) * 1000)

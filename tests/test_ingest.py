@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -442,7 +443,10 @@ def test_ingest_url_download_failures_fail_clearly(
         enqueue_ingest_url_job(paths.database, storage_paths=paths, url=url)
 
 
-def test_ingestion_pipeline_processes_an_injected_source_adapter(tmp_path: Path) -> None:
+def test_ingestion_pipeline_processes_an_injected_source_adapter(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     data_dir = tmp_path / ".newsrag"
     source_pdf = tmp_path / "packet.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\nmock")
@@ -462,15 +466,26 @@ def test_ingestion_pipeline_processes_an_injected_source_adapter(tmp_path: Path)
         vector_store=LanceDbVectorStore(paths.lancedb),
     )
 
-    asyncio.run(
-        DaemonRunner(
-            database_path=paths.database,
-            handlers={INGEST_JOB_KIND: handler},
-            poll_interval=0,
-        ).run_cycle()
-    )
+    with caplog.at_level(logging.INFO):
+        asyncio.run(
+            DaemonRunner(
+                database_path=paths.database,
+                handlers={INGEST_JOB_KIND: handler},
+                poll_interval=0,
+            ).run_cycle()
+        )
 
     assert get_job(paths.database, job.id).status == "done"
+    for stage in (
+        "artifact_preparation",
+        "adapter_extraction",
+        "chunking",
+        "chunk_embeddings",
+        "passage_embeddings",
+        "publication",
+    ):
+        assert f"stage={stage}" in caplog.text
+    assert "Adapter agenda" not in caplog.text
     assert len(adapter.inputs) == 1
     assert adapter.inputs[0].artifact_path.parent == paths.source_pdfs
     assert adapter.inputs[0].media_type == "application/pdf"

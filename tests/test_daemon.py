@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from newsrag.cli import app
@@ -44,7 +46,43 @@ embedding:
     )
 
     assert result.exit_code == 0
-    assert "NewsRAG daemon running" in result.stdout
+    assert "daemon_started" in result.stderr
+    assert str(data_dir) in result.stderr
+
+
+def test_daemon_run_command_honors_error_log_level(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+embedding:
+  provider: openai_compatible
+  base_url: http://127.0.0.1:8080/v1
+  model: nomic-embed-text-v1.5
+""".strip(),
+        encoding="utf-8",
+    )
+    initialize_storage(data_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config-path",
+            str(config_path),
+            "--data-dir",
+            str(data_dir),
+            "daemon",
+            "run",
+            "--poll-interval",
+            "0",
+            "--max-loops",
+            "1",
+        ],
+        env={"NEWSRAG_LOG_LEVEL": "ERROR"},
+    )
+
+    assert result.exit_code == 0
+    assert "daemon_started" not in result.stderr
 
 
 def test_daemon_run_command_requires_embedding_configuration(tmp_path: Path) -> None:
@@ -73,12 +111,15 @@ def test_daemon_run_command_requires_embedding_configuration(tmp_path: Path) -> 
     assert "embedding.provider=openai_compatible" in result.stdout
 
 
-def test_mocked_job_moves_from_pending_to_running_to_done(tmp_path: Path) -> None:
+def test_mocked_job_moves_from_pending_to_running_to_done(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
     seen_running_statuses: list[str] = []
-
-    job = create_job(paths.database, kind="mock")
+    source_path = tmp_path / "packet.pdf"
+    job = create_job(paths.database, kind="mock", payload={"path": str(source_path)})
 
     async def handler(_: Job) -> None:
         current = get_job(paths.database, job.id)
@@ -90,17 +131,26 @@ def test_mocked_job_moves_from_pending_to_running_to_done(tmp_path: Path) -> Non
         poll_interval=0,
     )
 
-    processed = asyncio.run(runner_instance.run_cycle())
+    with caplog.at_level(logging.INFO, logger="newsrag.daemon"):
+        processed = asyncio.run(runner_instance.run_cycle())
 
     assert processed is True
     assert seen_running_statuses == [RUNNING]
     assert get_job(paths.database, job.id).status == DONE
+    assert f"job_started job_id={job.id} kind=mock" in caplog.text
+    assert f"job_completed job_id={job.id} kind=mock" in caplog.text
+    assert f"source_path='{source_path}'" in caplog.text
+    assert "elapsed_ms=" in caplog.text
 
 
-def test_failing_mocked_job_records_failed_state_and_error(tmp_path: Path) -> None:
+def test_failing_mocked_job_records_failed_state_and_error(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     data_dir = tmp_path / ".newsrag"
     paths = initialize_storage(data_dir)
-    job = create_job(paths.database, kind="mock")
+    source_path = tmp_path / "packet.pdf"
+    job = create_job(paths.database, kind="mock", payload={"path": str(source_path)})
 
     async def handler(_: Job) -> None:
         raise RuntimeError("boom")
@@ -111,12 +161,30 @@ def test_failing_mocked_job_records_failed_state_and_error(tmp_path: Path) -> No
         poll_interval=0,
     )
 
-    processed = asyncio.run(runner_instance.run_cycle())
+    with caplog.at_level(logging.INFO, logger="newsrag.daemon"):
+        processed = asyncio.run(runner_instance.run_cycle())
     updated_job = get_job(paths.database, job.id)
 
     assert processed is True
     assert updated_job.status == FAILED
     assert updated_job.error == "boom"
+    assert f"job_failed job_id={job.id} kind=mock" in caplog.text
+    assert f"source_path='{source_path}'" in caplog.text
+    assert "error='boom'" in caplog.text
+
+
+def test_idle_daemon_cycle_does_not_log(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    runner_instance = DaemonRunner(database_path=paths.database, poll_interval=0)
+
+    with caplog.at_level(logging.INFO, logger="newsrag.daemon"):
+        processed = asyncio.run(runner_instance.run_cycle())
+
+    assert processed is False
+    assert caplog.records == []
 
 
 def test_jobs_list_shows_all_job_statuses(tmp_path: Path) -> None:

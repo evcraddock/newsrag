@@ -96,6 +96,18 @@ Stop the development environment:
 make dev-stop
 ```
 
+## Runtime logs
+
+Stream daemon output through Overmind:
+
+```bash
+make dev-logs
+```
+
+Use `make dev-tail` for a non-streaming snapshot of recent output. At the default `INFO` level, the daemon logs startup, job start and completion, failures, elapsed time, and ingestion stages including artifact preparation, adapter extraction, chunking, embeddings, and publication. Idle polling cycles are not logged.
+
+Set `NEWSRAG_LOG_LEVEL` in `.env` to one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. The default is `INFO`. Logs include operational identifiers and source paths but not document text, embedding payloads, or credentials.
+
 Current behavior:
 - `Procfile.dev` is present and wired into `make dev`.
 - The long-running process is `uv run newsrag --data-dir "${NEWSRAG_DATA_DIR:-.newsrag}" daemon run` managed by Overmind.
