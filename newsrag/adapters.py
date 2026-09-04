@@ -54,6 +54,7 @@ class AdapterResult:
     units: tuple[CanonicalSourceUnit, ...]
     extractor: ExtractorIdentity
     derived_artifact_path: Path | None = None
+    metadata_candidates: dict[str, str] = field(default_factory=dict)
 
 
 class SourceAdapter(Protocol):
