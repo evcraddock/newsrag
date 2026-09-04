@@ -83,6 +83,9 @@ from newsrag.sources import (
     HTML_MEDIA_TYPES,
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
+    SOURCE_TYPE_HTML,
+    SOURCE_TYPE_PDF,
+    SUPPORTED_SOURCE_TYPES,
     artifact_id_for_hash,
     build_source_identity,
     normalize_url_reference,
@@ -111,9 +114,6 @@ INGEST_JOB_KIND = "ingest-file"
 DEFAULT_CHUNK_MAX_CHARS = 2000
 DEFAULT_CHUNK_OVERLAP_CHARS = 200
 VECTOR_TABLE_NAME = "chunk_embeddings"
-SOURCE_TYPE_PDF = "pdf"
-SOURCE_TYPE_HTML = "html"
-SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF})
 _PDF_EXTENSIONS = (".pdf",)
 _PDF_SIGNATURES = (b"%PDF-",)
 _HTML_EXTENSIONS = (".html", ".htm", ".xhtml")

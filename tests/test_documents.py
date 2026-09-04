@@ -264,6 +264,82 @@ def test_documents_list_rejects_invalid_limit_and_date(tmp_path: Path) -> None:
     assert "Invalid --since date" in date_result.stdout
 
 
+def test_mixed_source_inventory_shows_typed_extents_and_filters(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_mixed_document_inventory(data_dir)
+
+    result = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "documents",
+            "list",
+            "--source-type",
+            "html",
+            "--body",
+            "City Council",
+        ],
+    )
+    page = list_document_summaries(
+        database_path,
+        filters=DocumentFilters(source_type="html", body="City Council"),
+    )
+    detail_result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "documents", "show", "document-html"],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert "document-html | Web Notice" in result.stdout
+    assert "source_type=html" in result.stdout
+    assert "blocks=3" in result.stdout
+    assert "pages=" not in result.stdout
+    assert [document.id for document in page.documents] == ["document-html"]
+    assert page.documents[0].source_type == "html"
+    assert page.documents[0].extent_label == "blocks"
+    assert page.documents[0].extent_count == 3
+    assert page.documents[0].page_count is None
+    assert detail_result.exit_code == 0, detail_result.stdout
+    assert "source_type: html" in detail_result.stdout
+    assert "blocks: 3" in detail_result.stdout
+    assert "pages:" not in detail_result.stdout
+
+
+def test_mixed_source_inventory_preserves_pdf_page_extents(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    database_path = _seed_mixed_document_inventory(data_dir)
+
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "documents", "list", "--source-type", "pdf"],
+    )
+    detail = get_document_detail(database_path, "document-a")
+
+    assert result.exit_code == 0, result.stdout
+    assert "document-a | Stormwater Report" in result.stdout
+    assert "source_type=pdf" in result.stdout
+    assert "pages=2" in result.stdout
+    assert "document-html" not in result.stdout
+    assert detail.source_type == "pdf"
+    assert detail.extent_label == "pages"
+    assert detail.extent_count == 2
+    assert detail.page_count == 2
+
+
+def test_documents_list_rejects_unsupported_source_type(tmp_path: Path) -> None:
+    data_dir = tmp_path / ".newsrag"
+    initialize_storage(data_dir)
+
+    result = runner.invoke(
+        app,
+        ["--data-dir", str(data_dir), "documents", "list", "--source-type", "docx"],
+    )
+
+    assert result.exit_code == 1
+    assert "Unsupported --source-type 'docx'; expected one of: html, pdf" in result.stdout
+
+
 def test_documents_show_outputs_detail_and_page_count(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
     database_path = _seed_document_inventory(data_dir)
@@ -306,6 +382,30 @@ def _seed_document_inventory(data_dir: Path) -> Path:
     with sqlite3.connect(database_path) as connection:
         connection.executemany(
             """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES(?, 'local_path', ?, ?)
+            """,
+            [
+                ("source-a", "/tmp/stormwater.pdf", "/tmp/stormwater.pdf"),
+                ("source-b", "/tmp/budget.pdf", "/tmp/budget.pdf"),
+                ("source-c", "/tmp/zoning.pdf", "/tmp/zoning.pdf"),
+            ],
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(?, ?, 'application/pdf', 10, ?, ?, CURRENT_TIMESTAMP, 'published')
+            """,
+            [
+                ("artifact-a", "source-a", "hash-a", "/tmp/stormwater.pdf"),
+                ("artifact-b", "source-b", "hash-b", "/tmp/budget.pdf"),
+                ("artifact-c", "source-c", "hash-c", "/tmp/zoning.pdf"),
+            ],
+        )
+        connection.executemany(
+            """
             INSERT INTO documents(
                 id,
                 source_path,
@@ -314,9 +414,10 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                 source_hash,
                 normalized_path,
                 metadata_json,
+                artifact_id,
                 created_at
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -327,6 +428,7 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                     "hash-a",
                     "/tmp/stormwater-ocr.pdf",
                     '{"body": "Planning Commission", "document_type": "staff_report", "jurisdiction": "Example City", "meeting_date": "2026-03-15", "source_filename": "stormwater.pdf"}',
+                    "artifact-a",
                     "2026-04-01T00:00:00+00:00",
                 ),
                 (
@@ -337,6 +439,7 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                     "hash-b",
                     "/tmp/budget-ocr.pdf",
                     '{"body": "City Council", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-04-20", "source_filename": "budget.pdf"}',
+                    "artifact-b",
                     "2026-04-02T23:59:59+00:00",
                 ),
                 (
@@ -347,6 +450,7 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                     "hash-c",
                     "/tmp/zoning-ocr.pdf",
                     '{"body": "Planning Commission", "document_type": "agenda_packet", "jurisdiction": "Example City", "meeting_date": "2026-05-01", "source_filename": "zoning.pdf"}',
+                    "artifact-c",
                     "2026-04-03T00:00:00+00:00",
                 ),
             ],
@@ -360,6 +464,56 @@ def _seed_document_inventory(data_dir: Path) -> Path:
                 ("page-a-1", "document-a", 1, "Stormwater page one", "pymupdf"),
                 ("page-a-2", "document-a", 2, "Stormwater page two", "pymupdf"),
                 ("page-b-1", "document-b", 1, "Budget page", "pymupdf"),
+            ],
+        )
+        connection.commit()
+    return database_path
+
+
+def _seed_mixed_document_inventory(data_dir: Path) -> Path:
+    database_path = _seed_document_inventory(data_dir)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-html', 'local_path', '/tmp/notice.html', '/tmp/notice.html')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-html', 'source-html', 'application/xhtml+xml', 20, 'hash-html',
+                '/tmp/notice.html', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, source_path, title, source_hash, metadata_json, artifact_id, created_at
+            )
+            VALUES(
+                'document-html', '/tmp/notice.html', 'Web Notice', 'hash-html',
+                '{"body": "City Council", "document_type": "notice", "jurisdiction": "Example City"}',
+                'artifact-html', '2026-04-04T00:00:00+00:00'
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, location_json,
+                human_label, normalized_text, structure_json, extractor
+            )
+            VALUES(?, 'artifact-html', 'document-html', ?, 'html_block', ?, ?, ?, '{}', 'static-html')
+            """,
+            [
+                ("html-unit-1", 1, '{"block_number": 1}', "block 1", "Web Notice"),
+                ("html-unit-2", 2, '{"block_number": 2}', "block 2", "Budget"),
+                ("html-unit-3", 3, '{"block_number": 3}', "block 3", "Public update"),
             ],
         )
         connection.commit()

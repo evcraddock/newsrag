@@ -126,7 +126,9 @@ The MVP retrieval pipeline uses hybrid search:
 5. A reranker interface exists in the pipeline, but the MVP implementation is a no-op.
 6. Final results are returned as cited passages.
 
-Search filters should use user-supplied civic metadata, including body, document type, meeting date ranges, jurisdiction/source, and source URL where useful.
+Search filters should use user-supplied civic metadata, including body, document type, meeting date ranges, jurisdiction/source, and source URL where useful. Search spans every indexed source type by default; the optional `--source-type` filter on `newsrag search` and `newsrag documents list` narrows results to `pdf` or `html` while composing with the existing filters.
+
+Document inventory derives source type from the published artifact and reports typed extents rather than treating every document as paginated: PDFs show page counts and HTML documents show canonical block counts. Search citations likewise resolve persisted typed source-unit locations, preserving PDF page citations and HTML heading/block citations.
 
 ## Embeddings
 

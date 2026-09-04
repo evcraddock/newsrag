@@ -376,6 +376,11 @@ def search_command(
         "--source-url",
         help="Only search documents with this source URL.",
     ),
+    source_type: str | None = typer.Option(
+        None,
+        "--source-type",
+        help="Only search documents with this source type: html or pdf.",
+    ),
     since: str | None = typer.Option(
         None,
         "--since",
@@ -401,6 +406,7 @@ def search_command(
         source_url=source_url,
         since=since,
         until=until,
+        source_type=source_type,
     )
 
     try:
@@ -469,6 +475,7 @@ def packet_command(
         source_url=source_url,
         since=since,
         until=until,
+        source_type=None,
     )
 
     try:
@@ -508,6 +515,11 @@ def documents_list_command(
         None,
         "--source-url",
         help="Only list documents with this source URL.",
+    ),
+    source_type: str | None = typer.Option(
+        None,
+        "--source-type",
+        help="Only list documents with this source type: html or pdf.",
     ),
     since: str | None = typer.Option(
         None,
@@ -555,6 +567,7 @@ def documents_list_command(
         document_type=document_type,
         jurisdiction=jurisdiction,
         source_url=source_url,
+        source_type=source_type,
         since=since,
         until=until,
         ingested_since=ingested_since,
@@ -1092,6 +1105,7 @@ def _build_search_filters(
     source_url: str | None,
     since: str | None,
     until: str | None,
+    source_type: str | None,
 ) -> SearchFilters:
     from newsrag.search import SearchFilters
 
@@ -1102,6 +1116,7 @@ def _build_search_filters(
         source_url=source_url,
         since=since,
         until=until,
+        source_type=source_type,
     )
 
 

@@ -8,11 +8,37 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 SOURCE_KIND_LOCAL_PATH = "local_path"
 SOURCE_KIND_URL = "url"
+SOURCE_TYPE_PDF = "pdf"
+SOURCE_TYPE_HTML = "html"
+SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF})
 PDF_MEDIA_TYPE = "application/pdf"
 HTML_MEDIA_TYPES = ("text/html", "application/xhtml+xml")
 HTML_MAX_SOURCE_BYTES = 10 * 1024 * 1024
 PAGE_LOCATION_TYPE = "page"
 HTML_BLOCK_LOCATION_TYPE = "html_block"
+
+
+def source_type_for_media_type(media_type: str | None) -> str | None:
+    """Return the registered source type for one persisted artifact media type."""
+
+    if media_type is None:
+        return None
+    normalized_media_type = media_type.partition(";")[0].strip().lower()
+    if normalized_media_type == PDF_MEDIA_TYPE:
+        return SOURCE_TYPE_PDF
+    if normalized_media_type in HTML_MEDIA_TYPES:
+        return SOURCE_TYPE_HTML
+    return None
+
+
+def media_types_for_source_type(source_type: str) -> tuple[str, ...]:
+    """Return persisted media types represented by one registered source type."""
+
+    if source_type == SOURCE_TYPE_PDF:
+        return (PDF_MEDIA_TYPE,)
+    if source_type == SOURCE_TYPE_HTML:
+        return HTML_MEDIA_TYPES
+    return ()
 
 
 @dataclass(frozen=True)
