@@ -103,7 +103,7 @@ class DaemonRunner:
         )
         if job is None:
             return False
-        if job.kind != "refresh-source" and release_lock is not None:
+        if job.kind not in {"refresh-source", "reprocess-document"} and release_lock is not None:
             release_lock()
 
         started_at = perf_counter()
@@ -163,6 +163,14 @@ async def run_daemon(
 
     if REFRESH_JOB_KIND not in resolved_handlers:
         resolved_handlers[REFRESH_JOB_KIND] = build_refresh_handler(
+            data_dir=config.data_dir,
+            embedding_config=config.embedding_config,
+        )
+
+    from newsrag.reprocess import REPROCESS_JOB_KIND, build_reprocessing_handler
+
+    if REPROCESS_JOB_KIND not in resolved_handlers:
+        resolved_handlers[REPROCESS_JOB_KIND] = build_reprocessing_handler(
             data_dir=config.data_dir,
             embedding_config=config.embedding_config,
         )

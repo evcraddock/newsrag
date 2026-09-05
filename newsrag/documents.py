@@ -61,6 +61,7 @@ class DocumentSummary:
     revision_number: int
     published_at: str
     is_current: bool
+    processing_generation_id: str | None
 
     @property
     def page_count(self) -> int | None:
@@ -91,6 +92,7 @@ class DocumentDetail:
     revision_number: int
     published_at: str
     is_current: bool
+    processing_generation_id: str | None
 
     @property
     def page_count(self) -> int | None:
@@ -122,6 +124,28 @@ class DocumentVersionHistory:
     source_id: str
     requested_document_id: str
     versions: tuple[DocumentVersion, ...]
+
+
+@dataclass(frozen=True)
+class DocumentProcessingGeneration:
+    """One retained processing generation and its active state."""
+
+    id: str
+    document_id: str
+    fingerprint: str
+    configuration: dict[str, Any]
+    normalized_path: str | None
+    job_id: str | None
+    created_at: str
+    is_active: bool
+
+
+@dataclass(frozen=True)
+class DocumentProcessingHistory:
+    """Retained processing history for one document."""
+
+    document_id: str
+    generations: tuple[DocumentProcessingGeneration, ...]
 
 
 @dataclass(frozen=True)
@@ -182,18 +206,29 @@ def list_document_summaries(
                 source_revisions.source_id,
                 source_revisions.revision_number,
                 source_revisions.published_at,
+                documents.current_processing_generation_id,
                 CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current,
-                (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
+                (
+                    SELECT COUNT(*)
+                    FROM pages
+                    WHERE pages.document_id = documents.id
+                        AND pages.processing_generation_id
+                            IS documents.current_processing_generation_id
+                ) AS page_count,
                 (
                     SELECT COUNT(*)
                     FROM source_units
                     WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
                         AND source_units.location_type = 'html_block'
                 ) AS html_block_count,
                 (
                     SELECT COUNT(*)
                     FROM source_units
                     WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
                 ) AS source_unit_count
             FROM documents
             JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
@@ -237,18 +272,29 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
                 source_revisions.source_id,
                 source_revisions.revision_number,
                 source_revisions.published_at,
+                documents.current_processing_generation_id,
                 CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current,
-                (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
+                (
+                    SELECT COUNT(*)
+                    FROM pages
+                    WHERE pages.document_id = documents.id
+                        AND pages.processing_generation_id
+                            IS documents.current_processing_generation_id
+                ) AS page_count,
                 (
                     SELECT COUNT(*)
                     FROM source_units
                     WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
                         AND source_units.location_type = 'html_block'
                 ) AS html_block_count,
                 (
                     SELECT COUNT(*)
                     FROM source_units
                     WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
                 ) AS source_unit_count
             FROM documents
             JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
@@ -281,6 +327,7 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
         revision_number=int(row["revision_number"]),
         published_at=str(row["published_at"]),
         is_current=bool(row["is_current"]),
+        processing_generation_id=_optional_string(row["current_processing_generation_id"]),
     )
 
 
@@ -346,6 +393,86 @@ def get_document_versions(
     )
 
 
+def get_document_generations(
+    database_path: Path,
+    document_id: str,
+) -> DocumentProcessingHistory:
+    """Return every retained processing generation for one published document."""
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        document_row = connection.execute(
+            """
+            SELECT current_processing_generation_id
+            FROM documents
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            WHERE documents.id = ? AND source_artifacts.state = 'published'
+            """,
+            (document_id,),
+        ).fetchone()
+        if document_row is None:
+            raise DocumentNotFoundError(f"Unknown published document: {document_id}")
+        rows = connection.execute(
+            """
+            SELECT
+                id,
+                document_id,
+                fingerprint,
+                configuration_json,
+                normalized_path,
+                job_id,
+                created_at
+            FROM processing_generations
+            WHERE document_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (document_id,),
+        ).fetchall()
+
+    active_id = _optional_string(document_row["current_processing_generation_id"])
+    return DocumentProcessingHistory(
+        document_id=document_id,
+        generations=tuple(
+            DocumentProcessingGeneration(
+                id=str(row["id"]),
+                document_id=str(row["document_id"]),
+                fingerprint=str(row["fingerprint"]),
+                configuration=_load_metadata(row["configuration_json"]),
+                normalized_path=_optional_string(row["normalized_path"]),
+                job_id=_optional_string(row["job_id"]),
+                created_at=str(row["created_at"]),
+                is_active=str(row["id"]) == active_id,
+            )
+            for row in rows
+        ),
+    )
+
+
+def format_document_generations(history: DocumentProcessingHistory) -> str:
+    """Format retained processing generations in publication order."""
+
+    lines = [
+        "NewsRAG Document Processing Generations",
+        f"document_id: {history.document_id}",
+    ]
+    if not history.generations:
+        lines.append("generations: none")
+        return "\n".join(lines)
+    for generation in history.generations:
+        state = "active" if generation.is_active else "retained"
+        lines.extend(
+            (
+                f"generation {generation.id} ({state})",
+                f"  fingerprint: {generation.fingerprint}",
+                "  normalized_artifact: " + _display_value(generation.normalized_path),
+                "  job_id: " + _display_value(generation.job_id),
+                "  created_at: " + generation.created_at,
+                "  configuration: " + json.dumps(generation.configuration, sort_keys=True),
+            )
+        )
+    return "\n".join(lines)
+
+
 def format_document_versions(history: DocumentVersionHistory) -> str:
     """Format immutable revision history in first-publication order."""
 
@@ -404,6 +531,7 @@ def format_document_list(page: DocumentListPage) -> str:
             "current" if document.is_current else "historical",
             f"source_id={document.source_id}",
             f"revision_id={document.revision_id}",
+            "processing_generation_id=" + _display_value(document.processing_generation_id),
             f"{document.extent_label}={document.extent_count}",
             f"source={_display_value(_best_source(document.source_url, document.source_path, metadata))}",
             f"created_at={document.created_at}",
@@ -424,6 +552,7 @@ def format_document_detail(document: DocumentDetail) -> str:
         f"revision_number: {document.revision_number}",
         f"current: {'yes' if document.is_current else 'no'}",
         f"published_at: {document.published_at}",
+        "processing_generation_id: " + _display_value(document.processing_generation_id),
         f"title: {_display_value(document.title)}",
         f"created_at: {document.created_at}",
         f"source_type: {document.source_type}",
@@ -574,6 +703,7 @@ def _row_to_summary(row: sqlite3.Row) -> DocumentSummary:
         revision_number=int(row["revision_number"]),
         published_at=str(row["published_at"]),
         is_current=bool(row["is_current"]),
+        processing_generation_id=_optional_string(row["current_processing_generation_id"]),
     )
 
 

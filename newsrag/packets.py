@@ -31,6 +31,10 @@ class PacketSourceProvenance:
     is_current_snapshot: bool | None = None
     artifact_id: str | None = None
     acquired_at: str | None = None
+    processing_generation_id: str | None = None
+    processing_fingerprint: str | None = None
+    processing_configuration: dict[str, object] | None = None
+    normalized_path: str | None = None
 
 
 def load_packet_source_provenance(
@@ -43,11 +47,29 @@ def load_packet_source_provenance(
     if not document_ids:
         return {}
 
-    placeholders = ", ".join("?" for _ in document_ids)
+    generation_by_document_id: dict[str, str | None] = {}
+    for result in results:
+        previous = generation_by_document_id.setdefault(
+            result.document_id,
+            result.processing_generation_id,
+        )
+        if previous != result.processing_generation_id:
+            raise PacketError(
+                f"Results mix processing generations for packet document: {result.document_id}"
+            )
+    selected_values = ", ".join("(?, ?)" for _ in document_ids)
+    selected_parameters = tuple(
+        value
+        for document_id in document_ids
+        for value in (document_id, generation_by_document_id[document_id])
+    )
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
+            WITH selected(document_id, processing_generation_id) AS (
+                VALUES {selected_values}
+            )
             SELECT
                 documents.id AS document_id,
                 source_revisions.id AS revision_id,
@@ -60,15 +82,25 @@ def load_packet_source_provenance(
                 source_artifacts.media_type AS media_type,
                 source_artifacts.content_hash AS artifact_hash,
                 source_artifacts.acquired_at AS acquired_at,
-                source_artifacts.provenance_json AS provenance_json
-            FROM documents
+                source_artifacts.provenance_json AS provenance_json,
+                processing_generations.id AS processing_generation_id,
+                processing_generations.fingerprint AS processing_fingerprint,
+                processing_generations.configuration_json AS processing_configuration_json,
+                processing_generations.normalized_path AS generation_normalized_path
+            FROM selected
+            JOIN documents ON documents.id = selected.document_id
             JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             JOIN source_revisions ON source_revisions.document_id = documents.id
             JOIN sources ON sources.id = source_revisions.source_id
-            WHERE documents.id IN ({placeholders})
-                AND source_artifacts.state = 'published'
+            LEFT JOIN processing_generations
+                ON processing_generations.document_id = documents.id
+                AND processing_generations.id IS COALESCE(
+                    selected.processing_generation_id,
+                    documents.current_processing_generation_id
+                )
+            WHERE source_artifacts.state = 'published'
             """,
-            tuple(document_ids),
+            selected_parameters,
         ).fetchall()
 
     provenance: dict[str, PacketSourceProvenance] = {}
@@ -115,6 +147,13 @@ def load_packet_source_provenance(
             and matching_result.revision_number != revision_number
         ):
             raise PacketError(f"Revision number changed for packet document: {document_id}")
+        processing_generation_id = _optional_string(row["processing_generation_id"])
+        if (
+            matching_result.processing_generation_id is not None
+            and matching_result.processing_generation_id != processing_generation_id
+        ):
+            raise PacketError(f"Processing generation changed for packet document: {document_id}")
+        processing_configuration = _load_json_object(row["processing_configuration_json"])
         provenance[document_id] = PacketSourceProvenance(
             document_id=document_id,
             source_type=source_type,
@@ -129,6 +168,12 @@ def load_packet_source_provenance(
             is_current_snapshot=matching_result.is_current_snapshot,
             artifact_id=str(row["artifact_id"]),
             acquired_at=str(row["acquired_at"]),
+            processing_generation_id=processing_generation_id,
+            processing_fingerprint=_optional_string(row["processing_fingerprint"]),
+            processing_configuration=(
+                processing_configuration if processing_configuration else None
+            ),
+            normalized_path=_optional_string(row["generation_normalized_path"]),
         )
 
     missing_document_ids = sorted(set(document_ids) - provenance.keys())
@@ -247,6 +292,12 @@ def format_source_list_entry(
             state = _snapshot_state_label(provenance.is_current_snapshot)
             details.append(f"revision: {provenance.revision_number} ({state} at retrieval)")
         details.append(f"document ID: {provenance.document_id}")
+        if provenance.processing_generation_id is not None:
+            details.append(f"processing generation ID: {provenance.processing_generation_id}")
+        if provenance.processing_fingerprint is not None:
+            details.append(f"processing fingerprint: {provenance.processing_fingerprint}")
+        if provenance.normalized_path is not None:
+            details.append(f"normalized artifact: {provenance.normalized_path}")
         if provenance.artifact_id is not None:
             details.append(f"artifact ID: {provenance.artifact_id}")
         if provenance.acquired_at is not None:

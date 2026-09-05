@@ -49,6 +49,8 @@ class DiscoveryBrowseItem:
     revision_id: str
     revision_number: int
     is_current: bool
+    processing_generation_id: str | None
+    is_current_processing_generation: bool
 
     @property
     def meeting_date(self) -> str | None:
@@ -232,6 +234,9 @@ def format_browse_detail(
         f"revision_id: {item.revision_id}",
         f"revision_number: {item.revision_number}",
         f"current: {'yes' if item.is_current else 'no'}",
+        "processing_generation_id: " + _display_value(item.processing_generation_id),
+        "processing_generation: "
+        + ("current" if item.is_current_processing_generation else "historical"),
         f"document_title: {_display_value(item.document_title)}",
         f"meeting_date: {_display_value(item.meeting_date)}",
         f"source: {_display_value(_best_source(item))}",
@@ -293,10 +298,16 @@ def _format_browse_list(
         ]
         if page.include_history:
             state = "current" if browse_item.is_current else "historical"
+            processing_state = (
+                "current" if browse_item.is_current_processing_generation else "historical"
+            )
             parts.extend(
                 (
                     f"revision={browse_item.revision_number} ({state})",
                     f"revision_id={browse_item.revision_id}",
+                    "processing_generation="
+                    + _display_value(browse_item.processing_generation_id)
+                    + f" ({processing_state})",
                 )
             )
         if include_display_date:
@@ -317,7 +328,19 @@ def _build_filter_query(
 ) -> _QueryParts:
     clauses: list[str] = ["source_artifacts.state = 'published'"]
     if not include_history:
-        clauses.append("sources.current_revision_id = source_revisions.id")
+        clauses.extend(
+            (
+                "sources.current_revision_id = source_revisions.id",
+                "NOT EXISTS ("
+                "SELECT 1 FROM discovery_evidence AS generation_evidence "
+                "JOIN source_units AS generation_unit "
+                "ON generation_unit.id = generation_evidence.source_unit_start_id "
+                "WHERE generation_evidence.item_id = discovery_items.id "
+                "AND generation_unit.processing_generation_id "
+                "IS NOT documents.current_processing_generation_id"
+                ")",
+            )
+        )
     parameters: list[object] = []
 
     placeholders = ", ".join("?" for _ in item_types)
@@ -390,7 +413,28 @@ def _select_browse_columns() -> str:
             source_revisions.id AS revision_id,
             source_revisions.source_id,
             source_revisions.revision_number,
-            CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current
+            CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current,
+            COALESCE(
+                (
+                    SELECT generation_unit.processing_generation_id
+                    FROM discovery_evidence AS generation_evidence
+                    JOIN source_units AS generation_unit
+                        ON generation_unit.id = generation_evidence.source_unit_start_id
+                    WHERE generation_evidence.item_id = discovery_items.id
+                    ORDER BY generation_evidence.created_at ASC, generation_evidence.id ASC
+                    LIMIT 1
+                ),
+                documents.current_processing_generation_id
+            ) AS processing_generation_id,
+            CASE WHEN NOT EXISTS (
+                SELECT 1
+                FROM discovery_evidence AS generation_evidence
+                JOIN source_units AS generation_unit
+                    ON generation_unit.id = generation_evidence.source_unit_start_id
+                WHERE generation_evidence.item_id = discovery_items.id
+                    AND generation_unit.processing_generation_id
+                        IS NOT documents.current_processing_generation_id
+            ) THEN 1 ELSE 0 END AS is_current_processing_generation
         """
 
 
@@ -463,6 +507,8 @@ def _row_to_browse_item(
         revision_id=str(row["revision_id"]),
         revision_number=int(row["revision_number"]),
         is_current=bool(row["is_current"]),
+        processing_generation_id=_optional_string(row["processing_generation_id"]),
+        is_current_processing_generation=bool(row["is_current_processing_generation"]),
     )
 
 

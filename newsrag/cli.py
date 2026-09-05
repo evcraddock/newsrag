@@ -49,6 +49,15 @@ PDF_EXTRACTOR_OPTION = typer.Option(
     "--pdf-extractor",
     help="PDF text extractor mode: auto, pymupdf, pdfplumber, or table.",
 )
+REPROCESS_PDF_EXTRACTOR_OPTION = typer.Option(
+    None,
+    "--pdf-extractor",
+    help="Override the PDF extractor: auto, pymupdf, pdfplumber, or table.",
+)
+REPROCESS_DOCUMENT_IDS_ARGUMENT = typer.Argument(
+    ...,
+    help="One to twenty explicit document IDs.",
+)
 ENRICH_RESPONSE_JSON_OPTION = typer.Option(
     ...,
     "--response-json",
@@ -632,6 +641,28 @@ def documents_show_command(ctx: typer.Context, document_id: str) -> None:
     typer.echo(format_document_detail(document))
 
 
+@documents_app.command("generations")
+def documents_generations_command(ctx: typer.Context, document_id: str) -> None:
+    """List retained processing generations for one document."""
+
+    from newsrag.documents import (
+        DocumentError,
+        format_document_generations,
+        get_document_generations,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        history = get_document_generations(database_path, document_id)
+    except DocumentError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_document_generations(history))
+
+
 @documents_app.command("versions")
 def documents_versions_command(ctx: typer.Context, document_id: str) -> None:
     """List published revisions for the source containing one document."""
@@ -652,6 +683,41 @@ def documents_versions_command(ctx: typer.Context, document_id: str) -> None:
         raise typer.Exit(code=1) from exc
 
     typer.echo(format_document_versions(history))
+
+
+@app.command("reprocess")
+def reprocess_command(
+    ctx: typer.Context,
+    document_ids: list[str] = REPROCESS_DOCUMENT_IDS_ARGUMENT,
+    pdf_extractor: str | None = REPROCESS_PDF_EXTRACTOR_OPTION,
+) -> None:
+    """Enqueue manual rebuilding of retained document processing outputs."""
+
+    from newsrag.reprocess import ReprocessingError, enqueue_reprocessing
+    from newsrag.storage import initialize_storage
+
+    if not 1 <= len(document_ids) <= 20:
+        typer.echo("Specify between 1 and 20 explicit document IDs")
+        raise typer.Exit(code=1)
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        jobs = enqueue_reprocessing(
+            database_path,
+            document_ids,
+            pdf_extractor=pdf_extractor,
+        )
+    except ReprocessingError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Enqueued {len(jobs)} reprocessing job(s)")
+    for job in jobs:
+        document_id = job.payload.get("document_id", "unknown-document")
+        typer.echo(
+            f"{job.id} document_id={document_id} status={job.status} "
+            f"stage={job.payload.get('stage', 'pending')}"
+        )
 
 
 @app.command("refresh")
@@ -1059,6 +1125,12 @@ def jobs_retry_command(ctx: typer.Context, job_id: str) -> None:
             )
         else:
             typer.echo("No saved candidate yet; retry will reacquire the source.")
+    elif job.kind == "reprocess-document":
+        document_id = job.payload.get("document_id")
+        base_generation_id = job.payload.get("base_generation_id")
+        typer.echo(
+            f"Retrying document {document_id}; base_processing_generation_id={base_generation_id}"
+        )
 
 
 @watch_app.command("add")
@@ -1167,8 +1239,16 @@ def _format_job_line(job: Job) -> str:
     source_url = job.payload.get("url")
     if isinstance(source_url, str) and source_url.strip():
         parts.append(f"url={safe_url_reference(source_url)}")
+    stage = job.payload.get("stage")
+    if isinstance(stage, str) and stage:
+        parts.append(f"stage={stage}")
     if job.result is not None:
-        for key in ("outcome", "requested_source_id"):
+        for key in (
+            "outcome",
+            "requested_source_id",
+            "processing_generation_id",
+            "previous_processing_generation_id",
+        ):
             value = job.result.get(key)
             if isinstance(value, str) and value:
                 parts.append(f"{key}={value}")
@@ -1195,6 +1275,11 @@ def _format_job_line(job: Job) -> str:
     if job.status == FAILED and job.error is not None:
         parts.append(f"failed_at={job.updated_at}")
         parts.append(f"error={job.error}")
+        if job.kind == "reprocess-document":
+            document_id = job.payload.get("document_id")
+            if isinstance(document_id, str) and document_id:
+                parts.append(f"retry_target=document_id:{document_id}")
+            parts.append(f"retry_hint=newsrag jobs retry {job.id}")
     elif job.error is not None:
         parts.append(f"error={job.error}")
     return " ".join(parts)

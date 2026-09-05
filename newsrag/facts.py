@@ -284,19 +284,24 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
         document_row = connection.execute(
-            "SELECT id FROM documents WHERE id = ?",
+            """
+            SELECT id, current_processing_generation_id
+            FROM documents
+            WHERE id = ?
+            """,
             (document_id,),
         ).fetchone()
         if document_row is None:
             raise FactExtractionError(f"Unknown document: {document_id}")
         rows = connection.execute(
             """
-            SELECT id
+            SELECT id, processing_generation_id
             FROM source_units
             WHERE document_id = ?
+                AND processing_generation_id IS ?
             ORDER BY ordinal ASC, id ASC
             """,
-            (document_id,),
+            (document_id, document_row["current_processing_generation_id"]),
         ).fetchall()
         sources: list[FactSource] = []
         try:
@@ -307,6 +312,11 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
                     document_id=document_id,
                     source_unit_start_id=source_unit_id,
                     source_unit_end_id=source_unit_id,
+                    processing_generation_id=(
+                        str(row["processing_generation_id"])
+                        if row["processing_generation_id"] is not None
+                        else None
+                    ),
                 )
                 sources.append(
                     FactSource(
@@ -521,9 +531,31 @@ def _fact_key(draft: FactDraft) -> tuple[str, str, str, str]:
 
 def _existing_fact_keys(database_path: Path, document_id: str) -> set[tuple[str, str, str, str]]:
     existing = list_discovery_items(database_path, document_id=document_id)
+    with sqlite3.connect(database_path) as connection:
+        active_item_ids = {
+            str(row[0])
+            for row in connection.execute(
+                """
+                SELECT discovery_items.id
+                FROM discovery_items
+                JOIN documents ON documents.id = discovery_items.document_id
+                WHERE discovery_items.document_id = ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM discovery_evidence
+                        JOIN source_units
+                            ON source_units.id = discovery_evidence.source_unit_start_id
+                        WHERE discovery_evidence.item_id = discovery_items.id
+                            AND source_units.processing_generation_id
+                                IS NOT documents.current_processing_generation_id
+                    )
+                """,
+                (document_id,),
+            ).fetchall()
+        }
     keys = set()
     for item in existing:
-        if item.extractor != DETERMINISTIC_FACT_EXTRACTOR:
+        if item.extractor != DETERMINISTIC_FACT_EXTRACTOR or item.id not in active_item_ids:
             continue
         for evidence in item.evidence:
             if item.item_type in {"entity", "topic"}:

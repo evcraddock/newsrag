@@ -223,7 +223,7 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
         connection.row_factory = sqlite3.Row
         document_row = connection.execute(
             """
-            SELECT id, title, metadata_json
+            SELECT id, title, metadata_json, current_processing_generation_id
             FROM documents
             WHERE id = ?
             """,
@@ -237,18 +237,21 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
             SELECT id
             FROM source_units
             WHERE document_id = ?
+                AND processing_generation_id IS ?
             ORDER BY ordinal ASC, id ASC
             """,
-            (document_id,),
+            (document_id, document_row["current_processing_generation_id"]),
         ).fetchall()
         passage_rows = connection.execute(
             """
             SELECT id
             FROM passages
-            WHERE document_id = ? AND source_unit_start_id IS NOT NULL
+            WHERE document_id = ?
+                AND processing_generation_id IS ?
+                AND source_unit_start_id IS NOT NULL
             ORDER BY page_start ASC, ordinal ASC, id ASC
             """,
-            (document_id,),
+            (document_id, document_row["current_processing_generation_id"]),
         ).fetchall()
         contexts: list[EvidenceContext] = []
         try:
@@ -259,6 +262,11 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
                     document_id=document_id,
                     source_unit_start_id=source_unit_id,
                     source_unit_end_id=source_unit_id,
+                    processing_generation_id=(
+                        str(document_row["current_processing_generation_id"])
+                        if document_row["current_processing_generation_id"] is not None
+                        else None
+                    ),
                 )
                 contexts.append(_resolved_to_evidence_context(resolved))
             for row in passage_rows:
@@ -268,6 +276,11 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
                     document_id=document_id,
                     source_unit_start_id=None,
                     passage_id=passage_id,
+                    processing_generation_id=(
+                        str(document_row["current_processing_generation_id"])
+                        if document_row["current_processing_generation_id"] is not None
+                        else None
+                    ),
                 )
                 contexts.append(_resolved_to_evidence_context(resolved))
         except SourceLocationError as exc:

@@ -9,7 +9,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Protocol
@@ -367,7 +367,7 @@ class LanceDbVectorStore:
     table_name: str = VECTOR_TABLE_NAME
 
     def add_chunks(self, chunks: Sequence[ChunkVectorRecord]) -> None:
-        records = [
+        records: list[dict[str, object]] = [
             {
                 "chunk_id": chunk.chunk_id,
                 "document_id": chunk.document_id,
@@ -386,24 +386,21 @@ class LanceDbVectorStore:
         if not records:
             return
 
-        self.lancedb_path.mkdir(parents=True, exist_ok=True)
-        database = lancedb.connect(self.lancedb_path)
-        try:
-            table = database.open_table(self.table_name)
-        except ValueError:
-            database.create_table(self.table_name, data=records)
-            return
+        from newsrag.vector_tables import add_vector_records
 
-        table.add(records)
+        add_vector_records(self.lancedb_path, self.table_name, records)
+
+    def delete_chunks(self, chunk_ids: Sequence[str]) -> None:
+        """Compensate only this publication's newly generated vectors."""
+
+        from newsrag.vector_tables import delete_vector_records
+
+        delete_vector_records(self.lancedb_path, self.table_name, "chunk_id", chunk_ids)
 
     def delete_document(self, document_id: str) -> None:
-        database = lancedb.connect(self.lancedb_path)
-        try:
-            table = database.open_table(self.table_name)
-        except ValueError:
-            return
-        escaped_document_id = document_id.replace("'", "''")
-        table.delete(f"document_id = '{escaped_document_id}'")
+        from newsrag.vector_tables import delete_vector_records
+
+        delete_vector_records(self.lancedb_path, self.table_name, "document_id", [document_id])
 
 
 @dataclass(frozen=True)
@@ -451,8 +448,26 @@ class SourceProcessingPipeline:
         adapter: SourceAdapter | None = None,
         on_publish: Callable[[sqlite3.Connection, str], None] | None = None,
         on_stage: Callable[[str], None] | None = None,
+        document_id: str | None = None,
+        processing_generation_id: str | None = None,
+        expected_generation_id: str | None = None,
+        configuration: dict[str, Any] | None = None,
     ) -> str:
+        from newsrag.processing_configuration import (
+            configuration_fingerprint,
+            processing_configuration,
+        )
+
         resolved_adapter = adapter or self.adapter
+        generation_id = processing_generation_id or f"processing-{uuid.uuid4().hex}"
+        configuration = configuration or processing_configuration(
+            adapter=resolved_adapter,
+            chunker=self.chunker,
+            embedding_provider=self.embedding_provider,
+            options=artifact.adapter_options,
+        )
+        artifact = replace(artifact, work_dir=artifact.work_dir / generation_id)
+        artifact.work_dir.mkdir(parents=True, exist_ok=True)
         with _ingest_stage(job_id, "adapter_extraction", artifact.source_path, on_stage=on_stage):
             adapter_result = self._extract_source_units(artifact, adapter=resolved_adapter)
         LOGGER.info(
@@ -481,7 +496,7 @@ class SourceProcessingPipeline:
                     f"Embedded {len(chunk_embeddings)} chunks for {len(chunks)} chunk drafts"
                 )
 
-        document_id = f"document-{uuid.uuid4().hex[:8]}"
+        document_id = document_id or f"document-{uuid.uuid4().hex[:8]}"
         artifact_id = artifact_id_for_hash(artifact.content_hash)
         resolved_metadata = dict(adapter_result.metadata_candidates)
         resolved_metadata.update(artifact.metadata)
@@ -494,6 +509,7 @@ class SourceProcessingPipeline:
             document_id,
             artifact_id,
             adapter_result.units,
+            generation_id=generation_id if expected_generation_id is not None else None,
         )
         chunk_rows, vector_rows = _build_chunk_and_vector_rows(
             document_id,
@@ -543,6 +559,10 @@ class SourceProcessingPipeline:
                 user_metadata_origin=artifact.user_metadata_origin,
                 ingestion_options=artifact.adapter_options,
                 on_publish=on_publish,
+                processing_generation_id=generation_id,
+                expected_generation_id=expected_generation_id,
+                configuration=configuration,
+                fingerprint=configuration_fingerprint(configuration),
             )
         LOGGER.info(
             "ingest_published job_id=%s source_path=%r document_id=%s pages=%d chunks=%d "
@@ -1349,6 +1369,8 @@ def _build_source_unit_rows(
     document_id: str,
     artifact_id: str,
     units: Sequence[CanonicalSourceUnit],
+    *,
+    generation_id: str | None = None,
 ) -> tuple[
     list[tuple[str, str, int, str, str, str]],
     list[tuple[str, str, str, int, str, str, str, str, str, str, str | None]],
@@ -1374,7 +1396,8 @@ def _build_source_unit_rows(
                 )
             )
         else:
-            unit_id = source_unit_id_for_ordinal(document_id, unit.ordinal)
+            namespace = f"{document_id}:{generation_id}" if generation_id else document_id
+            unit_id = source_unit_id_for_ordinal(namespace, unit.ordinal)
 
         source_unit_ids[unit.ordinal] = unit_id
         source_unit_rows.append(
@@ -1538,7 +1561,12 @@ def _publish_document_bundle(
     user_metadata_origin: str,
     ingestion_options: dict[str, object],
     on_publish: Callable[[sqlite3.Connection, str], None] | None = None,
+    processing_generation_id: str,
+    expected_generation_id: str | None,
+    configuration: dict[str, Any],
+    fingerprint: str,
 ) -> None:
+    from newsrag.processing_generations import publish_processing_generation
     from newsrag.revisions import publish_revision
 
     metadata_json = json.dumps(metadata, sort_keys=True)
@@ -1548,9 +1576,13 @@ def _publish_document_bundle(
         document_id=document_id,
         vector_store=vector_store,
         passage_vector_store=passage_vector_store,
+        chunk_ids=[row[0] for row in chunks],
+        passage_ids=[row[0] for row in passages],
+        reprocessing=expected_generation_id is not None,
     ) as connection:
-        connection.execute(
-            """
+        if expected_generation_id is None:
+            connection.execute(
+                """
             INSERT INTO documents(
                 id,
                 source_path,
@@ -1566,23 +1598,40 @@ def _publish_document_bundle(
             )
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                document_id,
-                str(source_path),
-                source_url,
-                title,
-                source_hash,
-                str(normalized_path) if normalized_path is not None else None,
-                metadata_json,
-                artifact_id,
-                json.dumps(user_metadata, sort_keys=True),
-                user_metadata_origin,
-                json.dumps(ingestion_options, sort_keys=True),
-            ),
-        )
-        connection.execute(
-            "UPDATE source_artifacts SET state = 'published', media_type = ? WHERE id = ?",
-            (media_type, artifact_id),
+                (
+                    document_id,
+                    str(source_path),
+                    source_url,
+                    title,
+                    source_hash,
+                    str(normalized_path) if normalized_path is not None else None,
+                    metadata_json,
+                    artifact_id,
+                    json.dumps(user_metadata, sort_keys=True),
+                    user_metadata_origin,
+                    json.dumps(ingestion_options, sort_keys=True),
+                ),
+            )
+        if expected_generation_id is None:
+            connection.execute(
+                "UPDATE source_artifacts SET state = 'published', media_type = ? WHERE id = ?",
+                (media_type, artifact_id),
+            )
+        else:
+            existing = connection.execute(
+                "SELECT artifact_id FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
+            if existing is None or existing[0] != artifact_id:
+                raise IngestError("Reprocessing cannot change document artifact identity")
+        publish_processing_generation(
+            connection,
+            document_id=document_id,
+            generation_id=processing_generation_id,
+            fingerprint=fingerprint,
+            configuration=configuration,
+            normalized_path=str(normalized_path) if normalized_path is not None else None,
+            job_id=job_id,
+            expected_generation_id=expected_generation_id,
         )
         connection.executemany(
             """
@@ -1674,6 +1723,16 @@ def _publish_document_bundle(
             source_unit_start_index=5,
             source_unit_end_index=6,
         )
+        for table, rows in (
+            ("source_units", source_units),
+            ("pages", pages),
+            ("chunks", chunks),
+            ("passages", passages),
+        ):
+            connection.executemany(
+                f"UPDATE {table} SET processing_generation_id = ? WHERE id = ?",
+                [(processing_generation_id, row[0]) for row in rows],
+            )
         vector_store.add_chunks(chunk_vectors)
         passage_vector_store.add_passages(passage_vectors)
         if on_publish is None:
@@ -1689,6 +1748,9 @@ def _publication_transaction(
     document_id: str,
     vector_store: VectorStore,
     passage_vector_store: PassageVectorStore,
+    chunk_ids: Sequence[str],
+    passage_ids: Sequence[str],
+    reprocessing: bool,
 ) -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(database_path, timeout=30)
     connection.execute("PRAGMA foreign_keys = ON")
@@ -1699,12 +1761,15 @@ def _publication_transaction(
     except Exception as exc:
         connection.rollback()
         cleanup_errors: list[str] = []
-        for name, store in (
-            ("chunk vectors", vector_store),
-            ("passage vectors", passage_vector_store),
+        for name, store, method, ids in (
+            ("chunk vectors", vector_store, "delete_chunks", chunk_ids),
+            ("passage vectors", passage_vector_store, "delete_passages", passage_ids),
         ):
             try:
-                store.delete_document(document_id)
+                if reprocessing:
+                    getattr(store, method)(ids)
+                else:
+                    store.delete_document(document_id)
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"{name}: {cleanup_exc}")
         if cleanup_errors:
