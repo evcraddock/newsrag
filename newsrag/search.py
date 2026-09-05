@@ -369,7 +369,13 @@ def search_keyword_candidates(
     *,
     limit: int,
 ) -> list[SearchCandidate]:
-    """Search keyword candidates from SQLite FTS5."""
+    """Search SQLite FTS5 using literal terms, not user-supplied query syntax."""
+
+    # SQL parameters do not escape FTS syntax. Quote each term separately to
+    # preserve implicit AND matching, leaving tokenization and stemming to FTS5.
+    fts_query = " ".join('"' + term.replace('"', '""') + '"' for term in query.split())
+    if not fts_query:
+        return []
 
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -397,7 +403,7 @@ def search_keyword_candidates(
             ORDER BY bm25(passages_fts) ASC, passages.id ASC
             LIMIT ?
             """,
-            (query, limit),
+            (fts_query, limit),
         ).fetchall()
 
     candidates: list[SearchCandidate] = []

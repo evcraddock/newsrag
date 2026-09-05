@@ -590,6 +590,110 @@ def test_keyword_search_uses_stemmed_passages(tmp_path: Path) -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "query",
+    ["low-pressure", "stay-at-home", '"low-pressure"', 'low-pressure"', "(low-pressure)"],
+)
+def test_keyword_search_treats_punctuation_as_literal_text(tmp_path: Path, query: str) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    candidates = search_keyword_candidates(database_path, query, limit=10)
+
+    assert [candidate.passage_id for candidate in candidates] == ["passage-g"]
+
+
+@pytest.mark.parametrize("query", ["AND", "OR", "NOT", "text:budget", "budget*", "NEAR(budget)"])
+def test_keyword_search_does_not_interpret_fts_operators(tmp_path: Path, query: str) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    literal_query = '"' + query + '"'
+    with sqlite3.connect(database_path) as connection:
+        expected = connection.execute(
+            "SELECT passage_id, bm25(passages_fts) FROM passages_fts "
+            "WHERE passages_fts MATCH ? ORDER BY bm25(passages_fts), passage_id",
+            (literal_query,),
+        ).fetchall()
+
+    candidates = search_keyword_candidates(database_path, query, limit=10)
+
+    assert [(candidate.passage_id, candidate.keyword_score) for candidate in candidates] == expected
+
+
+@pytest.mark.parametrize("query", ["books", "stormwater downtown", "Belt filter Press", "budget"])
+def test_keyword_search_preserves_plain_query_matching_and_ranking(
+    tmp_path: Path, query: str
+) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    with sqlite3.connect(database_path) as connection:
+        expected = connection.execute(
+            "SELECT passage_id, bm25(passages_fts) FROM passages_fts "
+            "WHERE passages_fts MATCH ? ORDER BY bm25(passages_fts), passage_id",
+            (query,),
+        ).fetchall()
+
+    candidates = search_keyword_candidates(database_path, query, limit=10)
+
+    assert expected
+    assert [(candidate.passage_id, candidate.keyword_score) for candidate in candidates] == expected
+
+
+@pytest.mark.parametrize("query", ["", "  \t\n", "-", '"', "()", "*"])
+def test_keyword_search_without_searchable_terms_returns_no_results(
+    tmp_path: Path, query: str
+) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+
+    assert search_keyword_candidates(database_path, query, limit=10) == []
+
+
+@pytest.mark.parametrize(
+    ("query", "has_match"),
+    [
+        ("SH-152", True),
+        ("Clear Springs Road resurfacing Meadow Lane SH-152 overlay asphalt patching", True),
+        ("SH-999", False),
+    ],
+)
+def test_search_command_handles_hyphenated_road_terms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, query: str, has_match: bool
+) -> None:
+    database_path = _seed_search_corpus(tmp_path)
+    road_text = "SH-152 overlay asphalt patching on Clear Springs Road resurfacing near Meadow Lane"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("UPDATE passages SET text = ? WHERE id = 'passage-a'", (road_text,))
+        connection.execute(
+            "UPDATE passages_fts SET text = ? WHERE passage_id = 'passage-a'", (road_text,)
+        )
+    engine = build_search_engine(
+        database_path=database_path,
+        lancedb_path=tmp_path / ".newsrag" / "lancedb",
+        embedding_config=EmbeddingConfig(),
+        embedding_provider=FakeQueryEmbeddingProvider(),
+        vector_searcher=FakeVectorSearcher(),
+        vector_store=FakeVectorStore(),
+    )
+    monkeypatch.setattr("newsrag.search.build_search_engine", lambda **_: engine)
+
+    result = runner.invoke(
+        app,
+        [
+            "--config-path",
+            str(tmp_path / "missing-config.yaml"),
+            "--data-dir",
+            str(tmp_path / ".newsrag"),
+            "search",
+            query,
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception
+    if has_match:
+        assert "NewsRAG Search" in result.stdout
+        assert road_text in result.stdout
+        assert "Stormwater Report — 2026-05-01 — p. 3" in result.stdout
+    else:
+        assert result.stdout == "No evidence found.\n"
+
+
 def test_citation_format_uses_concise_terminal_style() -> None:
     assert (
         format_citation(title="Stormwater Report", meeting_date="2026-05-01", page_number=3)
