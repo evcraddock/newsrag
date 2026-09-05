@@ -4,7 +4,7 @@ import asyncio
 import sqlite3
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -136,6 +136,47 @@ def _all_lance_rows(path: Path, base_name: str) -> list[dict[str, Any]]:
         if name == base_name or name.startswith(f"{base_name}__dim_")
     )
     return [row for name in names for row in database.open_table(name).to_arrow().to_pylist()]
+
+
+@pytest.mark.parametrize("collision", ["chunk", "passage"])
+def test_id_collision_never_compensates_retained_vectors(
+    corpus: Corpus,
+    monkeypatch: pytest.MonkeyPatch,
+    collision: str,
+) -> None:
+    import newsrag.ingest as ingest_module
+
+    before_generation = _generation(corpus)
+    before_chunks = _all_lance_rows(corpus.paths.lancedb, "chunk_embeddings")
+    before_passages = _all_lance_rows(corpus.paths.lancedb, "passage_embeddings")
+    corpus.embeddings.metadata = EmbeddingMetadata("fake", "model", "2")
+    if collision == "chunk":
+        original_chunks = ingest_module._build_chunk_and_vector_rows
+        existing_id = corpus.rows("SELECT id FROM chunks LIMIT 1")[0][0]
+
+        def colliding_chunks(*args: Any, **kwargs: Any) -> Any:
+            rows, vectors = original_chunks(*args, **kwargs)
+            rows[0] = (existing_id, *rows[0][1:])
+            vectors[0] = replace(vectors[0], chunk_id=existing_id)
+            return rows, vectors
+
+        monkeypatch.setattr(ingest_module, "_build_chunk_and_vector_rows", colliding_chunks)
+    else:
+        original_passages = ingest_module._build_passage_rows_from_chunks
+        existing_id = corpus.rows("SELECT id FROM passages LIMIT 1")[0][0]
+
+        def colliding_passages(*args: Any, **kwargs: Any) -> Any:
+            rows = original_passages(*args, **kwargs)
+            rows[0] = (existing_id, *rows[0][1:])
+            return rows
+
+        monkeypatch.setattr(ingest_module, "_build_passage_rows_from_chunks", colliding_passages)
+    failed = corpus.rebuild()
+    assert failed.status == "failed"
+    assert "UNIQUE constraint failed" in str(failed.error)
+    assert _generation(corpus) == before_generation
+    assert _all_lance_rows(corpus.paths.lancedb, "chunk_embeddings") == before_chunks
+    assert _all_lance_rows(corpus.paths.lancedb, "passage_embeddings") == before_passages
 
 
 def _generation(corpus: Corpus) -> str:

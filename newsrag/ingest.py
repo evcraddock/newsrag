@@ -1570,14 +1570,16 @@ def _publish_document_bundle(
     from newsrag.revisions import publish_revision
 
     metadata_json = json.dumps(metadata, sort_keys=True)
+    attempted_chunk_ids: list[str] = []
+    attempted_passage_ids: list[str] = []
 
     with _publication_transaction(
         database_path,
         document_id=document_id,
         vector_store=vector_store,
         passage_vector_store=passage_vector_store,
-        chunk_ids=[row[0] for row in chunks],
-        passage_ids=[row[0] for row in passages],
+        chunk_ids=attempted_chunk_ids,
+        passage_ids=attempted_passage_ids,
         reprocessing=expected_generation_id is not None,
     ) as connection:
         if expected_generation_id is None:
@@ -1733,7 +1735,12 @@ def _publish_document_bundle(
                 f"UPDATE {table} SET processing_generation_id = ? WHERE id = ?",
                 [(processing_generation_id, row[0]) for row in rows],
             )
+        # SQLite has now established that every ID belongs to this attempt.
+        # Track writes before calling each store, including partial failures,
+        # but never compensate an ID rejected by a SQLite uniqueness check.
+        attempted_chunk_ids.extend(row[0] for row in chunks)
         vector_store.add_chunks(chunk_vectors)
+        attempted_passage_ids.extend(row[0] for row in passages)
         passage_vector_store.add_passages(passage_vectors)
         if on_publish is None:
             publish_revision(connection, document_id=document_id, job_id=job_id)
@@ -1759,12 +1766,15 @@ def _publication_transaction(
         yield connection
         connection.commit()
     except Exception as exc:
-        connection.rollback()
+        # Retain the SQLite writer lock during compensation so another
+        # publication cannot claim these IDs between rollback and cleanup.
         cleanup_errors: list[str] = []
         for name, store, method, ids in (
             ("chunk vectors", vector_store, "delete_chunks", chunk_ids),
             ("passage vectors", passage_vector_store, "delete_passages", passage_ids),
         ):
+            if not ids:
+                continue
             try:
                 if reprocessing:
                     getattr(store, method)(ids)
@@ -1772,6 +1782,7 @@ def _publication_transaction(
                     store.delete_document(document_id)
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"{name}: {cleanup_exc}")
+        connection.rollback()
         if cleanup_errors:
             detail = "; ".join(cleanup_errors)
             raise IngestError(

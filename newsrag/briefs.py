@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ BRIEF_PROVIDER = "rules"
 BRIEF_MODEL = "rules-v1"
 MIN_BRIEF_TEXT_LENGTH = 40
 _MAX_NOTABLE_ITEMS = 8
+_MAX_GENERATION_SNAPSHOT_ATTEMPTS = 3
 
 _ITEM_PRIORITY = {
     "topic": 0,
@@ -83,14 +84,25 @@ class GeneratedBrief:
 def generate_document_brief(database_path: Path, document_id: str) -> GeneratedBrief:
     """Generate and persist an evidence-backed deterministic brief for one document."""
 
-    document = _load_document_context(database_path, document_id)
-    if document.text_length < MIN_BRIEF_TEXT_LENGTH:
+    for _attempt in range(_MAX_GENERATION_SNAPSHOT_ATTEMPTS):
+        generation_id = _load_active_processing_generation(database_path, document_id)
+        document = _load_document_context(database_path, document_id)
+        if document.text_length < MIN_BRIEF_TEXT_LENGTH:
+            if generation_id != _load_active_processing_generation(database_path, document_id):
+                continue
+            raise BriefError(
+                f"Document {document_id} has too little extracted text for a brief; "
+                "ingest/OCR may need review."
+            )
+        items = _ensure_discovery_items(database_path, document_id)
+        if generation_id == _load_active_processing_generation(database_path, document_id):
+            break
+    else:
         raise BriefError(
-            f"Document {document_id} has too little extracted text for a brief; "
-            "ingest/OCR may need review."
+            f"Document {document_id} processing generation changed while preparing brief context; "
+            "retry brief generation."
         )
 
-    items = _ensure_discovery_items(database_path, document_id)
     notable_items = _select_notable_items(items)
     if not notable_items:
         raise BriefError(
@@ -202,11 +214,79 @@ def _load_document_context(database_path: Path, document_id: str) -> BriefDocume
 
 
 def _ensure_discovery_items(database_path: Path, document_id: str) -> list[DiscoveryItemRecord]:
-    existing_items = list_discovery_items(database_path, document_id=document_id)
-    if existing_items:
-        return existing_items
-    extract_document_facts(database_path, document_id, persist=True)
-    return list_discovery_items(database_path, document_id=document_id)
+    for _attempt in range(_MAX_GENERATION_SNAPSHOT_ATTEMPTS):
+        generation_id = _load_active_processing_generation(database_path, document_id)
+        existing_items = _discovery_items_for_generation(
+            database_path,
+            document_id,
+            generation_id,
+        )
+        if generation_id != _load_active_processing_generation(database_path, document_id):
+            continue
+        if existing_items:
+            return existing_items
+
+        extract_document_facts(database_path, document_id, persist=True)
+        generated_items = _discovery_items_for_generation(
+            database_path,
+            document_id,
+            generation_id,
+        )
+        if generation_id == _load_active_processing_generation(database_path, document_id):
+            return generated_items
+
+    raise BriefError(
+        f"Document {document_id} processing generation changed while preparing brief evidence; "
+        "retry brief generation."
+    )
+
+
+def _load_active_processing_generation(database_path: Path, document_id: str) -> str | None:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT current_processing_generation_id
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+    if row is None:
+        raise BriefError(f"Unknown document: {document_id}")
+    return _optional_string(row[0])
+
+
+def _discovery_items_for_generation(
+    database_path: Path,
+    document_id: str,
+    generation_id: str | None,
+) -> list[DiscoveryItemRecord]:
+    items = list_discovery_items(database_path, document_id=document_id)
+    with sqlite3.connect(database_path) as connection:
+        evidence_rows = connection.execute(
+            """
+            SELECT discovery_evidence.id
+            FROM discovery_evidence
+            JOIN source_units AS start_unit
+                ON start_unit.id = discovery_evidence.source_unit_start_id
+            JOIN source_units AS end_unit
+                ON end_unit.id = discovery_evidence.source_unit_end_id
+            WHERE discovery_evidence.document_id = ?
+                AND start_unit.document_id = discovery_evidence.document_id
+                AND end_unit.document_id = discovery_evidence.document_id
+                AND start_unit.processing_generation_id IS ?
+                AND end_unit.processing_generation_id IS ?
+            """,
+            (document_id, generation_id, generation_id),
+        ).fetchall()
+    generation_evidence_ids = {str(row[0]) for row in evidence_rows}
+
+    generation_items = []
+    for item in items:
+        evidence = tuple(record for record in item.evidence if record.id in generation_evidence_ids)
+        if evidence:
+            generation_items.append(replace(item, evidence=evidence))
+    return generation_items
 
 
 def _select_notable_items(items: list[DiscoveryItemRecord]) -> tuple[DiscoveryItemRecord, ...]:

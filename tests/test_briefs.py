@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from newsrag.briefs import BriefError, format_generated_brief, generate_document_brief
 from newsrag.cli import app
-from newsrag.discovery import list_document_briefs
+from newsrag.discovery import list_discovery_items, list_document_briefs
+from newsrag.facts import FactExtractionResult, extract_document_facts
 from newsrag.storage import initialize_storage
 
 runner = CliRunner()
@@ -36,6 +38,92 @@ def test_generate_document_brief_persists_evidence_backed_summary(tmp_path: Path
     assert any(line.label == "$250,000" for line in brief.evidence_lines)
     assert "p. 1" in output
     assert "Council awarded a $250,000 stormwater contract" in output
+
+
+def test_document_brief_uses_only_active_generation_evidence(tmp_path: Path) -> None:
+    database_path = _seed_reprocessed_brief_document(tmp_path / ".newsrag")
+
+    brief = generate_document_brief(database_path, "document-a")
+    inventory = list_discovery_items(database_path, document_id="document-a")
+
+    assert any(item.label == "$250,000" for item in inventory)
+    assert any(item.label == "$500,000" for item in inventory)
+    assert {
+        line.source_unit_start_id for item in brief.notable_items for line in item.evidence
+    } == {"unit-new-1"}
+    assert any(line.label == "$500,000" for line in brief.evidence_lines)
+    assert all(line.label != "$250,000" for line in brief.evidence_lines)
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM source_units WHERE processing_generation_id = 'generation-old'"
+        ).fetchone() == (2,)
+        assert (
+            connection.execute(
+                """
+            SELECT COUNT(*)
+            FROM discovery_evidence
+            JOIN source_units ON source_units.id = discovery_evidence.source_unit_start_id
+            WHERE source_units.processing_generation_id = 'generation-old'
+            """
+            ).fetchone()[0]
+            > 0
+        )
+
+
+def test_document_brief_retries_generation_changed_during_fact_extraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = _seed_reprocessed_brief_document(tmp_path / ".newsrag")
+    _add_brief_generation(
+        database_path,
+        generation_id="generation-race",
+        unit_id="unit-race-1",
+        page_id="page-race-1",
+        text=(
+            "Council approved a $700,000 sewer contract with Clean Water LLC. "
+            "Work must begin by August 1, 2026."
+        ),
+    )
+    extraction_calls = 0
+
+    def extract_and_advance_generation(
+        database_path_arg: Path,
+        document_id: str,
+        *,
+        persist: bool = True,
+    ) -> FactExtractionResult:
+        nonlocal extraction_calls
+        extraction_calls += 1
+        result = extract_document_facts(database_path_arg, document_id, persist=persist)
+        if extraction_calls == 1:
+            with sqlite3.connect(database_path_arg) as connection:
+                connection.execute(
+                    """
+                    UPDATE documents
+                    SET current_processing_generation_id = 'generation-race'
+                    WHERE id = ?
+                    """,
+                    (document_id,),
+                )
+        return result
+
+    monkeypatch.setattr("newsrag.briefs.extract_document_facts", extract_and_advance_generation)
+
+    brief = generate_document_brief(database_path, "document-a")
+    inventory = list_discovery_items(database_path, document_id="document-a")
+
+    assert extraction_calls == 2
+    assert {
+        line.source_unit_start_id for item in brief.notable_items for line in item.evidence
+    } == {"unit-race-1"}
+    assert any(line.label == "$700,000" for line in brief.evidence_lines)
+    assert all(line.label not in {"$250,000", "$500,000"} for line in brief.evidence_lines)
+    assert {item.label for item in inventory if item.item_type == "money"} == {
+        "$250,000",
+        "$500,000",
+        "$700,000",
+    }
 
 
 def test_html_document_brief_uses_block_extent_and_citations(tmp_path: Path) -> None:
@@ -136,6 +224,109 @@ def _seed_brief_document(data_dir: Path) -> Path:
         )
         connection.commit()
     return database_path
+
+
+def _seed_reprocessed_brief_document(data_dir: Path) -> Path:
+    database_path = _seed_brief_document(data_dir)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO processing_generations(
+                id, document_id, fingerprint, configuration_json, normalized_path
+            )
+            VALUES('generation-old', 'document-a', 'fingerprint-old', '{}', ?)
+            """,
+            ("/tmp/old-normalized.pdf",),
+        )
+        connection.execute(
+            """
+            UPDATE source_units
+            SET processing_generation_id = 'generation-old'
+            WHERE document_id = 'document-a'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE pages
+            SET processing_generation_id = 'generation-old'
+            WHERE document_id = 'document-a'
+            """
+        )
+        connection.execute(
+            """
+            UPDATE documents
+            SET current_processing_generation_id = 'generation-old'
+            WHERE id = 'document-a'
+            """
+        )
+
+    extract_document_facts(database_path, "document-a", persist=True)
+    _add_brief_generation(
+        database_path,
+        generation_id="generation-new",
+        unit_id="unit-new-1",
+        page_id="page-new-1",
+        text=(
+            "Council awarded a $500,000 parks contract to Green Spaces LLC. "
+            "Work must be completed by July 1, 2026."
+        ),
+        activate=True,
+    )
+    return database_path
+
+
+def _add_brief_generation(
+    database_path: Path,
+    *,
+    generation_id: str,
+    unit_id: str,
+    page_id: str,
+    text: str,
+    activate: bool = False,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO processing_generations(
+                id, document_id, fingerprint, configuration_json, normalized_path
+            )
+            VALUES(?, 'document-a', ?, '{}', ?)
+            """,
+            (generation_id, f"fingerprint-{generation_id}", f"/tmp/{generation_id}.pdf"),
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, processing_generation_id, ordinal,
+                location_type, location_json, human_label, normalized_text,
+                structure_json, extractor
+            )
+            VALUES(
+                ?, 'artifact-a', 'document-a', ?, 1, 'page',
+                '{"page_number": 1}', 'p. 1', ?, '{}', 'pymupdf'
+            )
+            """,
+            (unit_id, generation_id, text),
+        )
+        connection.execute(
+            """
+            INSERT INTO pages(
+                id, document_id, page_number, source_unit_id,
+                processing_generation_id, text, extractor
+            )
+            VALUES(?, 'document-a', 1, ?, ?, ?, 'pymupdf')
+            """,
+            (page_id, unit_id, generation_id, text),
+        )
+        if activate:
+            connection.execute(
+                """
+                UPDATE documents
+                SET current_processing_generation_id = ?
+                WHERE id = 'document-a'
+                """,
+                (generation_id,),
+            )
 
 
 def _seed_html_brief_document(data_dir: Path) -> Path:
