@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -12,7 +13,13 @@ from watchfiles import awatch
 from newsrag.acquisition import safe_url_reference
 from newsrag.config import EmbeddingConfig
 from newsrag.ingest import INGEST_JOB_KIND, build_ingest_handler
-from newsrag.jobs import Job, claim_next_job, mark_job_done, mark_job_failed
+from newsrag.jobs import (
+    Job,
+    claim_next_job,
+    mark_job_done,
+    mark_job_failed,
+    recover_interrupted_refresh_jobs,
+)
 from newsrag.storage import initialize_storage
 from newsrag.watches import DEFAULT_WATCH_STABILITY_SECONDS, WatchDebouncer, list_watches
 
@@ -60,9 +67,44 @@ class DaemonRunner:
             await asyncio.sleep(self.poll_interval)
 
     async def run_cycle(self) -> bool:
-        job = await asyncio.to_thread(claim_next_job, self.database_path)
+        # A process-held lock covers claim, handling, and acknowledgement. A
+        # crashed process releases it; a slow/live worker never loses ownership.
+        with self.database_path.with_suffix(".worker.lock").open("a") as worker_lock:
+            try:
+                fcntl.flock(worker_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Ordinary ingestion retains its existing multi-worker behavior.
+                return await self._run_cycle_locked(include_refresh=False)
+            try:
+                await asyncio.to_thread(recover_interrupted_refresh_jobs, self.database_path)
+                work = asyncio.create_task(
+                    self._run_cycle_locked(
+                        release_lock=lambda: fcntl.flock(worker_lock, fcntl.LOCK_UN)
+                    )
+                )
+                try:
+                    return await asyncio.shield(work)
+                except asyncio.CancelledError:
+                    # to_thread work cannot be cancelled; keep the lock until
+                    # its transaction completes, then propagate cancellation.
+                    await work
+                    raise
+            finally:
+                fcntl.flock(worker_lock, fcntl.LOCK_UN)
+
+    async def _run_cycle_locked(
+        self,
+        *,
+        include_refresh: bool = True,
+        release_lock: Callable[[], None] | None = None,
+    ) -> bool:
+        job = await asyncio.to_thread(
+            claim_next_job, self.database_path, include_refresh=include_refresh
+        )
         if job is None:
             return False
+        if job.kind != "refresh-source" and release_lock is not None:
+            release_lock()
 
         started_at = perf_counter()
         log_context = _job_log_context(job)
@@ -113,6 +155,14 @@ async def run_daemon(
     resolved_handlers = dict(handlers or {})
     if INGEST_JOB_KIND not in resolved_handlers:
         resolved_handlers[INGEST_JOB_KIND] = build_ingest_handler(
+            data_dir=config.data_dir,
+            embedding_config=config.embedding_config,
+        )
+
+    from newsrag.refresh import REFRESH_JOB_KIND, build_refresh_handler
+
+    if REFRESH_JOB_KIND not in resolved_handlers:
+        resolved_handlers[REFRESH_JOB_KIND] = build_refresh_handler(
             data_dir=config.data_dir,
             embedding_config=config.embedding_config,
         )
