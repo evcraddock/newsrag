@@ -309,6 +309,13 @@ def _seed_discovery_browse_data(data_dir: Path) -> Path:
                 ),
             ],
         )
+        _publish_fixture_revisions(
+            connection,
+            (
+                ("source-council", "document-council"),
+                ("source-planning", "document-planning"),
+            ),
+        )
         connection.commit()
 
     _create_item(
@@ -443,6 +450,7 @@ def _seed_html_discovery_browse_data(data_dir: Path) -> Path:
             """,
             (quote,),
         )
+        _publish_fixture_revisions(connection, (("source-html", "document-html"),))
         connection.commit()
 
     for item_id, item_type, label in (
@@ -470,6 +478,31 @@ def _seed_html_discovery_browse_data(data_dir: Path) -> Path:
             ),
         )
     return database_path
+
+
+def _publish_fixture_revisions(
+    connection: sqlite3.Connection,
+    memberships: tuple[tuple[str, str], ...],
+) -> None:
+    for source_id, document_id in memberships:
+        revision_id = f"revision-{document_id}"
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at
+            )
+            VALUES(?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """,
+            (revision_id, source_id, document_id),
+        )
+        connection.execute(
+            """
+            UPDATE sources
+            SET current_revision_id = ?, publication_generation = 1
+            WHERE id = ?
+            """,
+            (revision_id, source_id),
+        )
 
 
 def _create_item(

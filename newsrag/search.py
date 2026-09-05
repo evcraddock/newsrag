@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -123,6 +123,10 @@ class SearchCandidate:
     source_unit_end_id: str | None = None
     keyword_score: float | None = None
     vector_score: float | None = None
+    source_id: str | None = None
+    revision_id: str | None = None
+    revision_number: int | None = None
+    is_current_snapshot: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,34 @@ class SearchResult:
     source_type: str | None = None
     source_unit_start_id: str | None = None
     source_unit_end_id: str | None = None
+    source_id: str | None = None
+    revision_id: str | None = None
+    revision_number: int | None = None
+    is_current_snapshot: bool | None = None
+
+
+@dataclass(frozen=True)
+class _EligibleRevision:
+    source_id: str
+    revision_id: str
+    document_id: str
+    revision_number: int
+    is_current_snapshot: bool
+    body: str | None
+    document_type: str | None
+    jurisdiction: str | None
+    source_url: str | None
+    source_type: str | None
+    meeting_date: str | None
+
+
+@dataclass(frozen=True)
+class _EligibleDocumentSnapshot:
+    revisions_by_document_id: Mapping[str, _EligibleRevision]
+    document_id_by_passage_id: Mapping[str, str]
+
+    def includes_candidate(self, candidate: SearchCandidate) -> bool:
+        return self.document_id_by_passage_id.get(candidate.passage_id) == candidate.document_id
 
 
 @dataclass(frozen=True)
@@ -290,37 +322,52 @@ class SearchEngine:
         *,
         limit: int = DEFAULT_SEARCH_LIMIT,
         filters: SearchFilters | None = None,
+        include_history: bool = False,
     ) -> list[SearchResult]:
         normalized_query = query.strip()
         if not normalized_query:
             raise SearchError("Search query must not be empty")
         resolved_filters = filters or SearchFilters()
         resolved_filters.validate()
-        if _count_passages(self.database_path) == 0:
+        snapshot = _load_eligible_document_snapshot(
+            self.database_path,
+            include_history=include_history,
+        )
+        if not snapshot.document_id_by_passage_id:
             return []
 
         _ensure_passage_embeddings(
             self.database_path,
             embedding_provider=self.embedding_provider,
             vector_store=self.vector_store,
+            eligible_passage_ids=set(snapshot.document_id_by_passage_id),
         )
         candidate_limit = max(limit * 4, DEFAULT_SEARCH_CANDIDATE_LIMIT)
         keyword_candidates = _filter_candidates_by_metadata(
             _expand_contextual_keyword_candidates(
                 self.database_path,
-                search_keyword_candidates(
+                _search_filtered_keyword_candidates(
                     self.database_path,
                     normalized_query,
                     limit=candidate_limit,
+                    snapshot=snapshot,
+                    filters=resolved_filters,
                 ),
                 limit=candidate_limit,
+                snapshot=snapshot,
             ),
             filters=resolved_filters,
         )
         query_embedding = self.embedding_provider.embed_query(normalized_query)
         vector_candidates = _filter_vector_candidates(
             keyword_candidates,
-            self.vector_searcher.search(query_embedding, limit=candidate_limit),
+            _search_eligible_vector_candidates(
+                self.vector_searcher,
+                query_embedding,
+                limit=candidate_limit,
+                snapshot=snapshot,
+                filters=resolved_filters,
+            ),
         )
         results = merge_search_candidates(
             keyword_candidates,
@@ -330,6 +377,7 @@ class SearchEngine:
             keyword_weight=self.keyword_weight,
             vector_weight=self.vector_weight,
             filters=resolved_filters,
+            _snapshot=snapshot,
         )
         return self.reranker.rerank(results)
 
@@ -368,6 +416,8 @@ def search_keyword_candidates(
     query: str,
     *,
     limit: int,
+    include_history: bool = False,
+    _snapshot: _EligibleDocumentSnapshot | None = None,
 ) -> list[SearchCandidate]:
     """Search SQLite FTS5 using literal terms, not user-supplied query syntax."""
 
@@ -377,10 +427,19 @@ def search_keyword_candidates(
     if not fts_query:
         return []
 
+    snapshot = _snapshot or _load_eligible_document_snapshot(
+        database_path,
+        include_history=include_history,
+    )
+    document_ids = tuple(sorted(snapshot.revisions_by_document_id))
+    if not document_ids:
+        return []
+    placeholders = ", ".join("?" for _ in document_ids)
+
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 passages.id AS passage_id,
                 passages.document_id AS document_id,
@@ -400,38 +459,39 @@ def search_keyword_candidates(
             JOIN documents ON documents.id = passages.document_id
             LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             WHERE passages_fts MATCH ?
+                AND passages.document_id IN ({placeholders})
             ORDER BY bm25(passages_fts) ASC, passages.id ASC
             LIMIT ?
             """,
-            (fts_query, limit),
+            (fts_query, *document_ids, limit),
         ).fetchall()
 
     candidates: list[SearchCandidate] = []
     for row in rows:
         metadata = _load_metadata(row["metadata_json"])
-        candidates.append(
-            SearchCandidate(
-                passage_id=str(row["passage_id"]),
-                document_id=str(row["document_id"]),
-                page_start=int(row["page_start"]),
-                page_end=int(row["page_end"]),
-                text=str(row["passage_text"]),
-                title=str(row["title"]) if row["title"] is not None else None,
-                meeting_date=_optional_string(metadata.get("meeting_date")),
-                body=_optional_string(metadata.get("body")),
-                document_type=_optional_string(metadata.get("document_type")),
-                jurisdiction=_optional_string(metadata.get("jurisdiction")),
-                source_url=_optional_string(row["source_url"])
-                or _optional_string(metadata.get("source_url")),
-                source_path=_optional_string(row["source_path"])
-                or _optional_string(metadata.get("stored_source_path"))
-                or _optional_string(metadata.get("source_filename")),
-                source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
-                source_unit_start_id=_optional_string(row["source_unit_start_id"]),
-                source_unit_end_id=_optional_string(row["source_unit_end_id"]),
-                keyword_score=float(row["keyword_score"]),
-            )
+        candidate = SearchCandidate(
+            passage_id=str(row["passage_id"]),
+            document_id=str(row["document_id"]),
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+            text=str(row["passage_text"]),
+            title=str(row["title"]) if row["title"] is not None else None,
+            meeting_date=_optional_string(metadata.get("meeting_date")),
+            body=_optional_string(metadata.get("body")),
+            document_type=_optional_string(metadata.get("document_type")),
+            jurisdiction=_optional_string(metadata.get("jurisdiction")),
+            source_url=_optional_string(row["source_url"])
+            or _optional_string(metadata.get("source_url")),
+            source_path=_optional_string(row["source_path"])
+            or _optional_string(metadata.get("stored_source_path"))
+            or _optional_string(metadata.get("source_filename")),
+            source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
+            source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+            source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+            keyword_score=float(row["keyword_score"]),
         )
+        revision = snapshot.revisions_by_document_id[candidate.document_id]
+        candidates.append(_candidate_with_revision(candidate, revision))
     return candidates
 
 
@@ -444,12 +504,23 @@ def merge_search_candidates(
     keyword_weight: float,
     vector_weight: float,
     filters: SearchFilters | None = None,
+    include_history: bool = False,
+    _snapshot: _EligibleDocumentSnapshot | None = None,
 ) -> list[SearchResult]:
     """Merge keyword and vector candidates into ranked search results."""
 
     resolved_filters = filters or SearchFilters()
+    snapshot = _snapshot or _load_eligible_document_snapshot(
+        database_path,
+        include_history=include_history,
+    )
     passage_context = _filter_passage_context_by_metadata(
-        _load_passage_context(database_path, keyword_candidates, vector_candidates),
+        _load_passage_context(
+            database_path,
+            keyword_candidates,
+            vector_candidates,
+            snapshot=snapshot,
+        ),
         filters=resolved_filters,
     )
     filtered_passage_ids = set(passage_context)
@@ -507,6 +578,10 @@ def merge_search_candidates(
             source_type=context.source_type,
             source_unit_start_id=context.source_unit_start_id,
             source_unit_end_id=context.source_unit_end_id,
+            source_id=context.source_id,
+            revision_id=context.revision_id,
+            revision_number=context.revision_number,
+            is_current_snapshot=context.is_current_snapshot,
         )
 
     return sorted(
@@ -639,6 +714,7 @@ def format_search_results(
     *,
     query: str | None = None,
     filters: SearchFilters | None = None,
+    include_history: bool = False,
 ) -> str:
     """Format ranked search results for terminal output."""
 
@@ -653,6 +729,8 @@ def format_search_results(
         lines.append(f"filters: {', '.join(resolved_filters.labels())}")
     for result in results:
         lines.append(result.citation)
+        if include_history:
+            lines.append(_format_result_revision(result))
         metadata_line = _format_result_metadata(result)
         if metadata_line is not None:
             lines.append(metadata_line)
@@ -666,9 +744,14 @@ def _ensure_passage_embeddings(
     *,
     embedding_provider: EmbeddingProvider,
     vector_store: VectorStore,
+    eligible_passage_ids: set[str],
 ) -> None:
     metadata = _embedding_metadata(embedding_provider)
-    missing_passages = _load_missing_passages(database_path, metadata)
+    missing_passages = [
+        passage
+        for passage in _load_missing_passages(database_path, metadata)
+        if passage.passage_id in eligible_passage_ids
+    ]
     if not missing_passages:
         return
 
@@ -805,6 +888,7 @@ def _expand_contextual_keyword_candidates(
     keyword_candidates: Sequence[SearchCandidate],
     *,
     limit: int,
+    snapshot: _EligibleDocumentSnapshot,
 ) -> list[SearchCandidate]:
     expanded = list(keyword_candidates)
     seen_passage_ids = {candidate.passage_id for candidate in keyword_candidates}
@@ -818,7 +902,11 @@ def _expand_contextual_keyword_candidates(
         if not candidate.text.startswith("•") or len(candidate.text) > 220:
             continue
 
-        for neighbor in _load_adjacent_passages(database_path, candidate.passage_id):
+        for neighbor in _load_adjacent_passages(
+            database_path,
+            candidate.passage_id,
+            snapshot=snapshot,
+        ):
             if len(expanded) >= limit or neighbor.passage_id in seen_passage_ids:
                 continue
             if not neighbor.text.startswith("•") or len(neighbor.text) > 320:
@@ -841,6 +929,10 @@ def _expand_contextual_keyword_candidates(
                     source_unit_start_id=neighbor.source_unit_start_id,
                     source_unit_end_id=neighbor.source_unit_end_id,
                     keyword_score=(candidate.keyword_score or 0.0) + 0.5,
+                    source_id=neighbor.source_id,
+                    revision_id=neighbor.revision_id,
+                    revision_number=neighbor.revision_number,
+                    is_current_snapshot=neighbor.is_current_snapshot,
                 )
             )
             seen_passage_ids.add(neighbor.passage_id)
@@ -872,9 +964,13 @@ def _load_passage_context(
     database_path: Path,
     keyword_candidates: Sequence[SearchCandidate],
     vector_candidates: Sequence[SearchCandidate],
+    *,
+    snapshot: _EligibleDocumentSnapshot,
 ) -> dict[str, SearchCandidate]:
     merged: dict[str, SearchCandidate] = {
-        candidate.passage_id: candidate for candidate in keyword_candidates
+        candidate.passage_id: candidate
+        for candidate in keyword_candidates
+        if snapshot.includes_candidate(candidate)
     }
     passage_ids_to_load = [
         candidate.passage_id
@@ -910,10 +1006,14 @@ def _load_passage_context(
             ).fetchall()
 
         for row in rows:
+            passage_id = str(row["passage_id"])
+            document_id = str(row["document_id"])
+            if snapshot.document_id_by_passage_id.get(passage_id) != document_id:
+                continue
             metadata = _load_metadata(row["metadata_json"])
-            merged[str(row["passage_id"])] = SearchCandidate(
-                passage_id=str(row["passage_id"]),
-                document_id=str(row["document_id"]),
+            candidate = SearchCandidate(
+                passage_id=passage_id,
+                document_id=document_id,
                 page_start=int(row["page_start"]),
                 page_end=int(row["page_end"]),
                 text=str(row["passage_text"]),
@@ -930,6 +1030,10 @@ def _load_passage_context(
                 source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
                 source_unit_start_id=_optional_string(row["source_unit_start_id"]),
                 source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+            )
+            merged[passage_id] = _candidate_with_revision(
+                candidate,
+                snapshot.revisions_by_document_id[document_id],
             )
 
     for candidate in vector_candidates:
@@ -954,6 +1058,10 @@ def _load_passage_context(
             source_unit_end_id=existing.source_unit_end_id,
             keyword_score=existing.keyword_score,
             vector_score=candidate.vector_score,
+            source_id=existing.source_id,
+            revision_id=existing.revision_id,
+            revision_number=existing.revision_number,
+            is_current_snapshot=existing.is_current_snapshot,
         )
 
     return merged
@@ -992,6 +1100,8 @@ def _load_chunk_hit_counts(
 def _load_adjacent_passages(
     database_path: Path,
     passage_id: str,
+    *,
+    snapshot: _EligibleDocumentSnapshot,
 ) -> list[SearchCandidate]:
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -1028,27 +1138,35 @@ def _load_adjacent_passages(
 
     candidates: list[SearchCandidate] = []
     for row in rows:
+        neighbor_passage_id = str(row["passage_id"])
+        document_id = str(row["document_id"])
+        if snapshot.document_id_by_passage_id.get(neighbor_passage_id) != document_id:
+            continue
         metadata = _load_metadata(row["metadata_json"])
+        candidate = SearchCandidate(
+            passage_id=neighbor_passage_id,
+            document_id=document_id,
+            page_start=int(row["page_start"]),
+            page_end=int(row["page_end"]),
+            text=str(row["passage_text"]),
+            title=str(row["title"]) if row["title"] is not None else None,
+            meeting_date=_optional_string(metadata.get("meeting_date")),
+            body=_optional_string(metadata.get("body")),
+            document_type=_optional_string(metadata.get("document_type")),
+            jurisdiction=_optional_string(metadata.get("jurisdiction")),
+            source_url=_optional_string(row["source_url"])
+            or _optional_string(metadata.get("source_url")),
+            source_path=_optional_string(row["source_path"])
+            or _optional_string(metadata.get("stored_source_path"))
+            or _optional_string(metadata.get("source_filename")),
+            source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
+            source_unit_start_id=_optional_string(row["source_unit_start_id"]),
+            source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+        )
         candidates.append(
-            SearchCandidate(
-                passage_id=str(row["passage_id"]),
-                document_id=str(row["document_id"]),
-                page_start=int(row["page_start"]),
-                page_end=int(row["page_end"]),
-                text=str(row["passage_text"]),
-                title=str(row["title"]) if row["title"] is not None else None,
-                meeting_date=_optional_string(metadata.get("meeting_date")),
-                body=_optional_string(metadata.get("body")),
-                document_type=_optional_string(metadata.get("document_type")),
-                jurisdiction=_optional_string(metadata.get("jurisdiction")),
-                source_url=_optional_string(row["source_url"])
-                or _optional_string(metadata.get("source_url")),
-                source_path=_optional_string(row["source_path"])
-                or _optional_string(metadata.get("stored_source_path"))
-                or _optional_string(metadata.get("source_filename")),
-                source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
-                source_unit_start_id=_optional_string(row["source_unit_start_id"]),
-                source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+            _candidate_with_revision(
+                candidate,
+                snapshot.revisions_by_document_id[document_id],
             )
         )
     return candidates
@@ -1163,12 +1281,199 @@ def _format_result_metadata(result: SearchResult) -> str | None:
     return f"metadata: {'; '.join(parts)}"
 
 
-def _count_passages(database_path: Path) -> int:
+def _load_eligible_document_snapshot(
+    database_path: Path,
+    *,
+    include_history: bool,
+) -> _EligibleDocumentSnapshot:
+    """Capture immutable revision eligibility for every retrieval stage."""
+
     with sqlite3.connect(database_path) as connection:
-        row = connection.execute("SELECT COUNT(*) FROM passages").fetchone()
-    if row is None:
-        return 0
-    return int(row[0])
+        connection.row_factory = sqlite3.Row
+        connection.execute("BEGIN")
+        revision_rows = connection.execute(
+            """
+            SELECT
+                source_revisions.id AS revision_id,
+                source_revisions.source_id,
+                source_revisions.document_id,
+                source_revisions.revision_number,
+                documents.source_url,
+                documents.metadata_json,
+                source_artifacts.media_type,
+                CASE
+                    WHEN sources.current_revision_id = source_revisions.id THEN 1
+                    ELSE 0
+                END AS is_current
+            FROM source_revisions
+            JOIN sources ON sources.id = source_revisions.source_id
+            JOIN documents ON documents.id = source_revisions.document_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            WHERE source_artifacts.state = 'published'
+                AND (? OR sources.current_revision_id = source_revisions.id)
+            ORDER BY source_revisions.source_id, source_revisions.revision_number
+            """,
+            (include_history,),
+        ).fetchall()
+        revisions: dict[str, _EligibleRevision] = {}
+        for row in revision_rows:
+            metadata = _load_metadata(row["metadata_json"])
+            document_id = str(row["document_id"])
+            revisions[document_id] = _EligibleRevision(
+                source_id=str(row["source_id"]),
+                revision_id=str(row["revision_id"]),
+                document_id=document_id,
+                revision_number=int(row["revision_number"]),
+                is_current_snapshot=bool(row["is_current"]),
+                body=_optional_string(metadata.get("body")),
+                document_type=_optional_string(metadata.get("document_type")),
+                jurisdiction=_optional_string(metadata.get("jurisdiction")),
+                source_url=_optional_string(row["source_url"])
+                or _optional_string(metadata.get("source_url")),
+                source_type=source_type_for_media_type(_optional_string(row["media_type"])),
+                meeting_date=_optional_string(metadata.get("meeting_date")),
+            )
+        if not revisions:
+            connection.commit()
+            return _EligibleDocumentSnapshot({}, {})
+        passage_rows = connection.execute(
+            """
+            SELECT id, document_id
+            FROM passages
+            """
+        ).fetchall()
+        passage_rows = [row for row in passage_rows if str(row["document_id"]) in revisions]
+        connection.commit()
+
+    return _EligibleDocumentSnapshot(
+        revisions_by_document_id=revisions,
+        document_id_by_passage_id={str(row["id"]): str(row["document_id"]) for row in passage_rows},
+    )
+
+
+def _candidate_with_revision(
+    candidate: SearchCandidate,
+    revision: _EligibleRevision,
+) -> SearchCandidate:
+    return SearchCandidate(
+        passage_id=candidate.passage_id,
+        document_id=candidate.document_id,
+        page_start=candidate.page_start,
+        page_end=candidate.page_end,
+        text=candidate.text,
+        title=candidate.title,
+        meeting_date=candidate.meeting_date,
+        body=candidate.body,
+        document_type=candidate.document_type,
+        jurisdiction=candidate.jurisdiction,
+        source_url=candidate.source_url,
+        source_path=candidate.source_path,
+        source_type=candidate.source_type,
+        source_unit_start_id=candidate.source_unit_start_id,
+        source_unit_end_id=candidate.source_unit_end_id,
+        keyword_score=candidate.keyword_score,
+        vector_score=candidate.vector_score,
+        source_id=revision.source_id,
+        revision_id=revision.revision_id,
+        revision_number=revision.revision_number,
+        is_current_snapshot=revision.is_current_snapshot,
+    )
+
+
+def _search_filtered_keyword_candidates(
+    database_path: Path,
+    query: str,
+    *,
+    limit: int,
+    snapshot: _EligibleDocumentSnapshot,
+    filters: SearchFilters,
+) -> list[SearchCandidate]:
+    requested_limit = limit
+    while True:
+        candidates = search_keyword_candidates(
+            database_path,
+            query,
+            limit=requested_limit,
+            _snapshot=snapshot,
+        )
+        filtered = _filter_candidates_by_metadata(candidates, filters=filters)
+        if len(filtered) >= limit or len(candidates) < requested_limit:
+            return filtered[:limit]
+        requested_limit *= 2
+
+
+def _search_eligible_vector_candidates(
+    vector_searcher: VectorSearcher,
+    query_embedding: QueryEmbedding,
+    *,
+    limit: int,
+    snapshot: _EligibleDocumentSnapshot,
+    filters: SearchFilters,
+) -> list[SearchCandidate]:
+    """Refill vector hits until eligible results reach the limit or the store is exhausted."""
+
+    requested_limit = limit
+    while True:
+        candidates = vector_searcher.search(query_embedding, limit=requested_limit)
+        eligible = [
+            candidate
+            for candidate in candidates
+            if snapshot.includes_candidate(candidate)
+            and _revision_matches_filters(
+                snapshot.revisions_by_document_id[candidate.document_id],
+                filters,
+            )
+        ]
+        if len(eligible) >= limit or len(candidates) < requested_limit:
+            return [
+                _candidate_with_revision(
+                    candidate,
+                    snapshot.revisions_by_document_id[candidate.document_id],
+                )
+                for candidate in eligible[:limit]
+            ]
+        requested_limit *= 2
+
+
+def _revision_matches_filters(
+    revision: _EligibleRevision,
+    filters: SearchFilters,
+) -> bool:
+    return _matches_search_filters(
+        SearchCandidate(
+            passage_id="snapshot",
+            document_id=revision.document_id,
+            page_start=1,
+            page_end=1,
+            text="",
+            title=None,
+            meeting_date=revision.meeting_date,
+            body=revision.body,
+            document_type=revision.document_type,
+            jurisdiction=revision.jurisdiction,
+            source_url=revision.source_url,
+            source_type=revision.source_type,
+        ),
+        filters,
+    )
+
+
+def _format_result_revision(result: SearchResult) -> str:
+    state = _snapshot_state_label(result.is_current_snapshot)
+    number = str(result.revision_number) if result.revision_number is not None else "unknown"
+    parts = [f"revision: {number} ({state})"]
+    if result.source_id is not None:
+        parts.append(f"source_id={result.source_id}")
+    if result.revision_id is not None:
+        parts.append(f"revision_id={result.revision_id}")
+    parts.append(f"document_id={result.document_id}")
+    return "; ".join(parts)
+
+
+def _snapshot_state_label(is_current_snapshot: bool | None) -> str:
+    if is_current_snapshot is None:
+        return "state unknown"
+    return "current" if is_current_snapshot else "historical"
 
 
 def _load_metadata(raw_metadata: object) -> dict[str, object]:

@@ -132,6 +132,7 @@ def test_load_packet_source_provenance_uses_published_artifacts(tmp_path: Path) 
             VALUES('document-html', 'Council Update', '{}', 'artifact-html')
             """
         )
+        _publish_fixture_revisions(connection, (("source-html", "document-html"),))
         connection.commit()
 
     loaded = load_packet_source_provenance(database_path, [_html_search_result()])
@@ -145,6 +146,12 @@ def test_load_packet_source_provenance_uses_published_artifacts(tmp_path: Path) 
             resolved_reference="https://cdn.example.test/update.html",
             retrieved_at="2026-05-02T10:30:00+00:00",
             artifact_hash="artifact-hash",
+            source_id="source-html",
+            revision_id="revision-document-html",
+            revision_number=1,
+            is_current_snapshot=None,
+            artifact_id="artifact-html",
+            acquired_at="2026-05-02T10:00:00+00:00",
         )
     }
 
@@ -187,8 +194,10 @@ def test_packet_command_writes_markdown_from_mocked_retrieval(
             query: str,
             *,
             filters: SearchFilters | None = None,
+            include_history: bool = False,
         ) -> list[SearchResult]:
             assert query == "stormwater"
+            assert not include_history
             assert filters is not None
             captured_filters.append(filters)
             return [_search_result()]
@@ -287,6 +296,13 @@ def test_packet_command_writes_mixed_source_provenance(
                 ("document-html", "Council Update", "artifact-html"),
             ],
         )
+        _publish_fixture_revisions(
+            connection,
+            (
+                ("source-pdf", "document-a"),
+                ("source-html", "document-html"),
+            ),
+        )
         connection.commit()
 
     class FakeSearchEngine:
@@ -295,8 +311,10 @@ def test_packet_command_writes_mixed_source_provenance(
             query: str,
             *,
             filters: SearchFilters | None = None,
+            include_history: bool = False,
         ) -> list[SearchResult]:
             assert query == "budget"
+            assert not include_history
             return [_search_result(), _html_search_result()]
 
     monkeypatch.setattr("newsrag.search.build_search_engine", lambda **_: FakeSearchEngine())
@@ -333,6 +351,7 @@ def test_packet_command_requires_overwrite_for_existing_output(
             query: str,
             *,
             filters: SearchFilters | None = None,
+            include_history: bool = False,
         ) -> list[SearchResult]:
             return [_search_result()]
 
@@ -373,6 +392,31 @@ def test_packet_command_requires_overwrite_for_existing_output(
 
     assert overwrite_result.exit_code == 0
     assert "# Source Packet: stormwater" in output_path.read_text(encoding="utf-8")
+
+
+def _publish_fixture_revisions(
+    connection: sqlite3.Connection,
+    memberships: tuple[tuple[str, str], ...],
+) -> None:
+    for source_id, document_id in memberships:
+        revision_id = f"revision-{document_id}"
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at
+            )
+            VALUES(?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """,
+            (revision_id, source_id, document_id),
+        )
+        connection.execute(
+            """
+            UPDATE sources
+            SET current_revision_id = ?, publication_generation = 1
+            WHERE id = ?
+            """,
+            (revision_id, source_id),
+        )
 
 
 def _pdf_source_provenance() -> PacketSourceProvenance:

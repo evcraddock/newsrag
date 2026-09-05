@@ -9,9 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from newsrag.acquisition import AcquisitionError, AcquisitionRequest, StagedSourceArtifact
 from newsrag.adapters import AdapterInput, AdapterResult, CanonicalSourceUnit, ExtractorIdentity
+from newsrag.cli import app
 from newsrag.config import EmbeddingConfig
 from newsrag.daemon import DaemonRunner
 from newsrag.embeddings import ChunkEmbedding, EmbeddingMetadata, QueryEmbedding
@@ -534,6 +536,48 @@ def test_cancelled_daemon_retains_ownership_until_processing_finishes(corpus: Co
         assert get_job(corpus.paths.database, job.id).status == "done"
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("saved", [True, False])
+def test_retry_cli_explains_saved_candidate_or_reacquisition(corpus: Corpus, saved: bool) -> None:
+    if saved:
+        corpus.embeddings.fail = True
+        failed = corpus.update(html("retry candidate"))
+    else:
+        corpus.path.unlink()
+        failed = corpus.run(enqueue_refresh(corpus.paths.database, corpus.source_id))
+    assert failed.status == "failed"
+    output = CliRunner().invoke(
+        app,
+        [
+            "--data-dir",
+            str(corpus.paths.database.parent),
+            "jobs",
+            "retry",
+            failed.id,
+        ],
+    )
+    assert output.exit_code == 0, output.exception
+    assert ("Retrying saved artifact" if saved else "retry will reacquire") in output.stdout
+
+
+def test_refresh_registered_symlink_follows_a_new_stable_target(corpus: Corpus) -> None:
+    target_a = corpus.path.with_name("target-a.html")
+    target_b = corpus.path.with_name("target-b.html")
+    alias = corpus.path.with_name("alias.html")
+    target_a.write_bytes(html("alias first version"))
+    target_b.write_bytes(html("alias second version"))
+    alias.symlink_to(target_a)
+    initial = corpus.run(enqueue_ingest_source(corpus.paths.database, source=str(alias)).jobs[0])
+    assert initial.result is not None
+    source_id = initial.result["source_id"]
+    alias.unlink()
+    alias.symlink_to(target_b)
+    refreshed = corpus.run(enqueue_refresh(corpus.paths.database, source_id))
+    assert refreshed.status == "done", refreshed.error
+    assert refreshed.result is not None and refreshed.result["outcome"] == "revision_created"
+    assert refreshed.result["source_id"] == source_id
+    assert refreshed.payload["candidate"]["observation"]["resolved_path"] == str(target_b.resolve())
 
 
 def test_committed_receipt_survives_failure_acknowledgement_and_replay(corpus: Corpus) -> None:

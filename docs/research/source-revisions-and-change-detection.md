@@ -1,6 +1,6 @@
 # Source revisions and change detection
 
-Status: Approved on 2026-09-05. This is a design specification; the refresh commands and revision behavior described below are not implemented yet.
+Status: Approved on 2026-09-05. This design specification is implemented by `task-08cdcec9`; the original design task itself did not implement runtime behavior.
 
 ## Goal and boundary
 

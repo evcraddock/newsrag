@@ -70,6 +70,23 @@ newsrag search "Clear Springs Road SH-152"
 
 Keyword retrieval treats whitespace-separated terms as literal text and requires all terms to match, while vector retrieval uses the original query. Hyphens and quotes are handled safely; Boolean operators, column filters, wildcards, and quoted-phrase syntax are not interpreted as FTS commands.
 
+Refresh a known source while keeping its historical evidence:
+
+```bash
+newsrag documents show <document-id>       # Includes the source ID
+newsrag refresh <source-id>                # Enqueues one background refresh
+newsrag jobs list
+newsrag documents versions <document-id>
+newsrag search "budget" --include-history
+newsrag packet "budget" --include-history --out packets/budget-history.md
+```
+
+Refresh rereads the registered file or public URL and compares complete content hashes. New bytes become the current local searchable revision only after successful processing. Search, new packets, and corpus discovery use current revisions by default; `--include-history` includes previous published revisions. Inventory and direct document lookup retain historical records. Nothing is uploaded or shared by publication.
+
+Unchanged bytes do not reindex or overwrite metadata. If the source returns its own historical bytes, that revision is reactivated without reindexing. Bytes already published for another source are reported as a duplicate and leave the requested source unchanged. `newsrag jobs retry <job-id>` retries a failed refresh's saved candidate once acquired; use a new refresh to check the live source again. Historical citations, metadata, and existing packet files are preserved. Refresh is manual and single-source only; metadata editing, bulk refresh, schedules, and reprocessing are separate concerns.
+
+Stop the old daemon before upgrading a corpus to schema 6, then restart it using the new version. Migration preserves existing document and citation IDs and rejects ambiguous source history rather than choosing or deleting revisions. Legacy descriptive metadata is inherited conservatively because its original user/adapter attribution may be unknown.
+
 List documents ingested during an inclusive UTC calendar-date range:
 
 ```bash

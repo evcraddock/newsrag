@@ -25,6 +25,12 @@ class PacketSourceProvenance:
     resolved_reference: str
     retrieved_at: str | None
     artifact_hash: str
+    source_id: str | None = None
+    revision_id: str | None = None
+    revision_number: int | None = None
+    is_current_snapshot: bool | None = None
+    artifact_id: str | None = None
+    acquired_at: str | None = None
 
 
 def load_packet_source_provenance(
@@ -44,16 +50,21 @@ def load_packet_source_provenance(
             f"""
             SELECT
                 documents.id AS document_id,
+                source_revisions.id AS revision_id,
+                source_revisions.source_id,
+                source_revisions.revision_number,
                 sources.kind AS source_kind,
                 sources.submitted_reference AS submitted_reference,
                 sources.resolved_reference AS resolved_reference,
+                source_artifacts.id AS artifact_id,
                 source_artifacts.media_type AS media_type,
                 source_artifacts.content_hash AS artifact_hash,
                 source_artifacts.acquired_at AS acquired_at,
                 source_artifacts.provenance_json AS provenance_json
             FROM documents
             JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
-            JOIN sources ON sources.id = source_artifacts.source_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
             WHERE documents.id IN ({placeholders})
                 AND source_artifacts.state = 'published'
             """,
@@ -91,6 +102,19 @@ def load_packet_source_provenance(
                 or submitted_reference
             )
             retrieved_at = None
+        matching_result = next(result for result in results if result.document_id == document_id)
+        revision_id = str(row["revision_id"])
+        source_id = str(row["source_id"])
+        if matching_result.revision_id is not None and matching_result.revision_id != revision_id:
+            raise PacketError(f"Revision identity changed for packet document: {document_id}")
+        if matching_result.source_id is not None and matching_result.source_id != source_id:
+            raise PacketError(f"Source identity changed for packet document: {document_id}")
+        revision_number = int(row["revision_number"])
+        if (
+            matching_result.revision_number is not None
+            and matching_result.revision_number != revision_number
+        ):
+            raise PacketError(f"Revision number changed for packet document: {document_id}")
         provenance[document_id] = PacketSourceProvenance(
             document_id=document_id,
             source_type=source_type,
@@ -99,6 +123,12 @@ def load_packet_source_provenance(
             resolved_reference=resolved_reference,
             retrieved_at=retrieved_at,
             artifact_hash=str(row["artifact_hash"]),
+            source_id=source_id,
+            revision_id=revision_id,
+            revision_number=revision_number,
+            is_current_snapshot=matching_result.is_current_snapshot,
+            artifact_id=str(row["artifact_id"]),
+            acquired_at=str(row["acquired_at"]),
         )
 
     missing_document_ids = sorted(set(document_ids) - provenance.keys())
@@ -116,6 +146,7 @@ def format_source_packet(
     results: Sequence[SearchResult],
     filters: SearchFilters | None = None,
     source_provenance: Mapping[str, PacketSourceProvenance] | None = None,
+    include_history: bool = False,
 ) -> str:
     """Format retrieved evidence as a fixed Markdown source packet."""
 
@@ -129,7 +160,8 @@ def format_source_packet(
         for index, result in enumerate(results, start=1):
             lines.extend(
                 [
-                    f"{index}. **{result.citation}**",
+                    f"{index}. **{result.citation}**"
+                    + (_history_label(result) if include_history else ""),
                     f"   > {_normalize_text(result.text)}",
                     "",
                 ]
@@ -207,6 +239,18 @@ def format_source_list_entry(
             details.append(f"{label}: {value.strip()}")
 
     if provenance is not None:
+        if provenance.source_id is not None:
+            details.append(f"source ID: {provenance.source_id}")
+        if provenance.revision_id is not None:
+            details.append(f"revision ID: {provenance.revision_id}")
+        if provenance.revision_number is not None:
+            state = _snapshot_state_label(provenance.is_current_snapshot)
+            details.append(f"revision: {provenance.revision_number} ({state} at retrieval)")
+        details.append(f"document ID: {provenance.document_id}")
+        if provenance.artifact_id is not None:
+            details.append(f"artifact ID: {provenance.artifact_id}")
+        if provenance.acquired_at is not None:
+            details.append(f"artifact acquired at: {provenance.acquired_at}")
         details.append(f"source type: {provenance.source_type}")
         if provenance.source_kind == "url":
             details.append(f"supplied URL: {provenance.submitted_reference}")
@@ -221,6 +265,18 @@ def format_source_list_entry(
     if not details:
         return result.citation
     return f"{result.citation} ({'; '.join(details)})"
+
+
+def _history_label(result: SearchResult) -> str:
+    state = _snapshot_state_label(result.is_current_snapshot)
+    number = result.revision_number if result.revision_number is not None else "unknown"
+    return f" [revision {number}, {state} at retrieval]"
+
+
+def _snapshot_state_label(is_current_snapshot: bool | None) -> str:
+    if is_current_snapshot is None:
+        return "state unknown"
+    return "current" if is_current_snapshot else "historical"
 
 
 def _load_json_object(raw_value: object) -> dict[str, object]:

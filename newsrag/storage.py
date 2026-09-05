@@ -671,17 +671,18 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             removed_document_ids = _consolidate_duplicate_documents(connection)
         else:
             removed_document_ids = ()
-        connection.execute(
-            """
-            UPDATE source_artifacts
-            SET state = 'published'
-            WHERE id IN (
-                SELECT artifact_id
-                FROM documents
-                WHERE artifact_id IS NOT NULL
+        if previous_schema_version != SCHEMA_VERSION:
+            connection.execute(
+                """
+                UPDATE source_artifacts
+                SET state = 'published'
+                WHERE id IN (
+                    SELECT artifact_id
+                    FROM documents
+                    WHERE artifact_id IS NOT NULL
+                )
+                """
             )
-            """
-        )
         _validate_revision_ownership(connection)
         connection.execute(
             """

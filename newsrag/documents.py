@@ -56,6 +56,11 @@ class DocumentSummary:
     extent_label: str
     extent_count: int
     created_at: str
+    source_id: str
+    revision_id: str
+    revision_number: int
+    published_at: str
+    is_current: bool
 
     @property
     def page_count(self) -> int | None:
@@ -81,6 +86,11 @@ class DocumentDetail:
     extent_label: str
     extent_count: int
     created_at: str
+    source_id: str
+    revision_id: str
+    revision_number: int
+    published_at: str
+    is_current: bool
 
     @property
     def page_count(self) -> int | None:
@@ -89,6 +99,29 @@ class DocumentDetail:
         if self.source_type != SOURCE_TYPE_PDF:
             return None
         return self.extent_count
+
+
+@dataclass(frozen=True)
+class DocumentVersion:
+    """One immutable published revision in a source history."""
+
+    source_id: str
+    revision_id: str
+    document_id: str
+    revision_number: int
+    published_at: str
+    artifact_hash: str
+    acquired_at: str
+    is_current: bool
+
+
+@dataclass(frozen=True)
+class DocumentVersionHistory:
+    """Published revision history resolved from any member document."""
+
+    source_id: str
+    requested_document_id: str
+    versions: tuple[DocumentVersion, ...]
 
 
 @dataclass(frozen=True)
@@ -128,7 +161,9 @@ def list_document_summaries(
             f"""
             SELECT COUNT(*) AS total
             FROM documents
-            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
             {query.where_sql}
             """,
             query.parameters,
@@ -143,6 +178,11 @@ def list_document_summaries(
                 documents.metadata_json,
                 documents.created_at,
                 source_artifacts.media_type,
+                source_revisions.id AS revision_id,
+                source_revisions.source_id,
+                source_revisions.revision_number,
+                source_revisions.published_at,
+                CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current,
                 (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
                 (
                     SELECT COUNT(*)
@@ -156,7 +196,9 @@ def list_document_summaries(
                     WHERE source_units.document_id = documents.id
                 ) AS source_unit_count
             FROM documents
-            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
             {query.where_sql}
             ORDER BY documents.created_at DESC, documents.id ASC
             LIMIT ? OFFSET ?
@@ -191,6 +233,11 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
                 documents.metadata_json,
                 documents.created_at,
                 source_artifacts.media_type,
+                source_revisions.id AS revision_id,
+                source_revisions.source_id,
+                source_revisions.revision_number,
+                source_revisions.published_at,
+                CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current,
                 (SELECT COUNT(*) FROM pages WHERE pages.document_id = documents.id) AS page_count,
                 (
                     SELECT COUNT(*)
@@ -204,8 +251,11 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
                     WHERE source_units.document_id = documents.id
                 ) AS source_unit_count
             FROM documents
-            LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
             WHERE documents.id = ?
+                AND source_artifacts.state = 'published'
             """,
             (document_id,),
         ).fetchone()
@@ -226,7 +276,99 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
         extent_label=extent_label,
         extent_count=extent_count,
         created_at=str(row["created_at"]),
+        source_id=str(row["source_id"]),
+        revision_id=str(row["revision_id"]),
+        revision_number=int(row["revision_number"]),
+        published_at=str(row["published_at"]),
+        is_current=bool(row["is_current"]),
     )
+
+
+def get_document_versions(
+    database_path: Path,
+    document_id: str,
+) -> DocumentVersionHistory:
+    """Return a source's published history from any member document ID."""
+
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        source_row = connection.execute(
+            """
+            SELECT source_revisions.source_id
+            FROM source_revisions
+            JOIN documents ON documents.id = source_revisions.document_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            WHERE source_revisions.document_id = ?
+                AND source_artifacts.state = 'published'
+            """,
+            (document_id,),
+        ).fetchone()
+        if source_row is None:
+            raise DocumentNotFoundError(f"Unknown published document: {document_id}")
+        source_id = str(source_row["source_id"])
+        rows = connection.execute(
+            """
+            SELECT
+                source_revisions.id AS revision_id,
+                source_revisions.document_id,
+                source_revisions.revision_number,
+                source_revisions.published_at,
+                source_artifacts.content_hash,
+                source_artifacts.acquired_at,
+                CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current
+            FROM source_revisions
+            JOIN sources ON sources.id = source_revisions.source_id
+            JOIN documents ON documents.id = source_revisions.document_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            WHERE source_revisions.source_id = ?
+                AND source_artifacts.state = 'published'
+            ORDER BY source_revisions.revision_number ASC
+            """,
+            (source_id,),
+        ).fetchall()
+
+    return DocumentVersionHistory(
+        source_id=source_id,
+        requested_document_id=document_id,
+        versions=tuple(
+            DocumentVersion(
+                source_id=source_id,
+                revision_id=str(row["revision_id"]),
+                document_id=str(row["document_id"]),
+                revision_number=int(row["revision_number"]),
+                published_at=str(row["published_at"]),
+                artifact_hash=str(row["content_hash"]),
+                acquired_at=str(row["acquired_at"]),
+                is_current=bool(row["is_current"]),
+            )
+            for row in rows
+        ),
+    )
+
+
+def format_document_versions(history: DocumentVersionHistory) -> str:
+    """Format immutable revision history in first-publication order."""
+
+    lines = [
+        "NewsRAG Document Versions",
+        f"source_id: {history.source_id}",
+        f"requested_document_id: {history.requested_document_id}",
+    ]
+    for version in history.versions:
+        state = "current" if version.is_current else "historical"
+        lines.append(
+            " | ".join(
+                (
+                    f"revision {version.revision_number} ({state})",
+                    f"revision_id={version.revision_id}",
+                    f"document_id={version.document_id}",
+                    f"artifact_sha256={version.artifact_hash}",
+                    f"acquired_at={version.acquired_at}",
+                    f"published_at={version.published_at}",
+                )
+            )
+        )
+    return "\n".join(lines)
 
 
 def format_document_list(page: DocumentListPage) -> str:
@@ -258,6 +400,10 @@ def format_document_list(page: DocumentListPage) -> str:
             f"body={_display_value(_metadata_string(metadata, 'body'))}",
             f"document_type={_display_value(_metadata_string(metadata, 'document_type'))}",
             f"source_type={document.source_type}",
+            f"revision={document.revision_number}",
+            "current" if document.is_current else "historical",
+            f"source_id={document.source_id}",
+            f"revision_id={document.revision_id}",
             f"{document.extent_label}={document.extent_count}",
             f"source={_display_value(_best_source(document.source_url, document.source_path, metadata))}",
             f"created_at={document.created_at}",
@@ -273,6 +419,11 @@ def format_document_detail(document: DocumentDetail) -> str:
     lines = [
         "NewsRAG Document",
         f"id: {document.id}",
+        f"source_id: {document.source_id}",
+        f"revision_id: {document.revision_id}",
+        f"revision_number: {document.revision_number}",
+        f"current: {'yes' if document.is_current else 'no'}",
+        f"published_at: {document.published_at}",
         f"title: {_display_value(document.title)}",
         f"created_at: {document.created_at}",
         f"source_type: {document.source_type}",
@@ -296,7 +447,7 @@ def format_document_detail(document: DocumentDetail) -> str:
 
 
 def _build_filter_query(filters: DocumentFilters) -> _QueryParts:
-    clauses: list[str] = []
+    clauses: list[str] = ["source_artifacts.state = 'published'"]
     parameters: list[object] = []
 
     for key, value in (
@@ -418,6 +569,11 @@ def _row_to_summary(row: sqlite3.Row) -> DocumentSummary:
         extent_label=extent_label,
         extent_count=extent_count,
         created_at=str(row["created_at"]),
+        source_id=str(row["source_id"]),
+        revision_id=str(row["revision_id"]),
+        revision_number=int(row["revision_number"]),
+        published_at=str(row["published_at"]),
+        is_current=bool(row["is_current"]),
     )
 
 
