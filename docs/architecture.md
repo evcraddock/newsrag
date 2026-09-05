@@ -164,6 +164,12 @@ Deterministic fact extraction, document briefs, structured enrichment, topics, t
 
 Schema version 5 replaces the previously unused page-only discovery schema. Upgrading from schema versions 1–4 resets only regenerable document profiles, briefs, discovery items/evidence, and their FTS tables rather than converting old derived records. Sources, artifacts, documents, source units, chunks, passages, embeddings, and search indexes are not reset.
 
+## Processing generations
+
+Schema 7 adds immutable processing generations and an active generation pointer per document. `reprocess` accepts 1–20 explicit document IDs and rebuilds from private, hash-verified snapshots of preserved artifacts, without acquisition or source-revision changes. It reuses the source-processing pipeline while retaining old source-unit, page, chunk, passage, embedding, and normalized-output identities. Processing configuration fingerprints define no-op behavior and detect extractor, chunker, embedding, and index changes.
+
+Generation publication, active-pointer compare-and-swap, derived SQLite rows, and job completion share one transaction. Vector compensation is restricted to newly generated IDs; previous-generation vectors are never deleted during a failed rebuild. Search snapshots select active processing generations and retain exact generation provenance for packets and source-unit ranges. LanceDB dimension partitions and provider/model/version filtering prevent comparison of incompatible embeddings. Refresh and reprocessing share worker-lock recovery. See [Reprocessing](reprocessing.md) for commands, retry semantics, migration, and limitations.
+
 ## Packet generation
 
 `newsrag packet` uses the same retrieval pipeline as search and writes an extractive Markdown source packet. The initial packet template is fixed and research-oriented, with configurable templates left for later.

@@ -6,7 +6,7 @@ Status: Approved on 2026-09-05. This design specification is implemented by `tas
 
 Complete the revision and refresh policy left open by [Source identity and repeated ingestion](source-identity-and-repeated-ingestion.md). This is the design deliverable for `task-9603f915`, not an implementation of refresh or versioning.
 
-The source-neutral design already created the follow-up tasks. Reuse `task-08cdcec9` for implementation; do not create a duplicate backlog. Reprocessing remains separately assigned to `task-aa5c6e7a` and `task-aec94144`.
+The source-neutral design already created the follow-up tasks. Reuse `task-08cdcec9` for implementation; do not create a duplicate backlog. Reprocessing is implemented separately by `task-aec94144`, which absorbed the remaining decisions after `task-aa5c6e7a` was cancelled as redundant; see [Reprocessing](../reprocessing.md).
 
 ### Already designed and implemented
 
@@ -173,7 +173,7 @@ Refreshing must not renumber old source units, regenerate their text, rewrite th
 
 Inventory listing remains a record of all published documents, now with revision/current markers; `documents show <id>` continues to work for historical documents. Explicit document-level brief, extraction, and enrichment operations also remain available for historical document IDs. Corpus-wide topics/entities/timeline/leads browsing should default to evidence from current documents and offer the same `--include-history` scope to avoid presenting obsolete evidence as current. Old discovery records are preserved, not copied to a new revision; refresh does not automatically run enrichment.
 
-Reprocessing unchanged artifacts is not implemented here. Its separate design must account for retained citation anchors and any derived-data generations before changing previously referenced source units.
+Reprocessing unchanged artifacts is not implemented by this refresh task. The separate [Reprocessing](../reprocessing.md) workflow retains old citation anchors and derived-data generations rather than changing previously referenced source units.
 
 ## Migration and compatibility
 
@@ -193,7 +193,7 @@ Implement incrementally within that existing task, with these bounded stages:
 2. **Refresh job and safe publication:** add one-source manual refresh, hash decisions, retry checkpoints, reactivation, duplicate handling, completion recovery, and failure-safe pointer switching. Verify deterministic local and mocked-URL cases, races, interruption, and every no-op/failure outcome.
 3. **History-aware retrieval and presentation:** expose version inventory and current/history scope across search, packets, and corpus discovery. Verify mixed PDF/HTML results, exclusion before candidate truncation, concurrent refresh/query consistency, and unchanged historical packet provenance.
 
-Any need for independently tracked subtasks should be proposed to the user rather than silently creating another backlog or changing downstream dependencies. Reprocessing remains in the existing reprocessing tasks.
+Any need for independently tracked subtasks should be proposed to the user rather than silently creating another backlog or changing downstream dependencies. Reprocessing remains in existing implementation task `task-aec94144`; no replacement design task is required.
 
 ## Acceptance evidence expected from implementation
 

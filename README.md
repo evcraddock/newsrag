@@ -85,7 +85,19 @@ Refresh rereads the registered file or public URL and compares complete content 
 
 Unchanged bytes do not reindex or overwrite metadata. If the source returns its own historical bytes, that revision is reactivated without reindexing. Bytes already published for another source are reported as a duplicate and leave the requested source unchanged. `newsrag jobs retry <job-id>` retries a failed refresh's saved candidate once acquired; use a new refresh to check the live source again. Historical citations, metadata, and existing packet files are preserved. Refresh is manual and single-source only; metadata editing, bulk refresh, schedules, and reprocessing are separate concerns.
 
-Stop the old daemon before upgrading a corpus to schema 6, then restart it using the new version. Migration preserves existing document and citation IDs and rejects ambiguous source history rather than choosing or deleting revisions. Legacy descriptive metadata is inherited conservatively because its original user/adapter attribution may be unknown.
+Rebuild derived evidence from saved artifacts without refetching or creating source revisions:
+
+```bash
+newsrag reprocess <document-id>                       # Up to 20 explicit IDs
+newsrag reprocess <pdf-document-id> --pdf-extractor pdfplumber
+newsrag documents generations <document-id>
+newsrag jobs list
+newsrag jobs retry <failed-job-id>
+```
+
+Reprocessing retains old citation anchors and stages a complete replacement processing generation before making it active. Unchanged processing fingerprints produce a verified no-op. Failed runs leave existing searchable evidence intact; retries retain their saved configuration and base generation. See [Reprocessing](docs/reprocessing.md) for batch limits, compatible embedding models, and recovery behavior.
+
+Stop all old daemons before upgrading a corpus to schema 7, then restart them using the new version. Migration preserves existing document and citation IDs, source history, and derived evidence. Legacy descriptive metadata is inherited conservatively; unknown legacy processing configurations are marked explicitly rather than invented.
 
 List documents ingested during an inclusive UTC calendar-date range:
 
