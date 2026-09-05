@@ -124,8 +124,8 @@ def list_jobs(database_path: Path) -> list[Job]:
     return [_row_to_job(row) for row in rows]
 
 
-def claim_next_job(database_path: Path) -> Job | None:
-    """Claim the next pending job and mark it running."""
+def claim_next_job(database_path: Path, *, include_refresh: bool = True) -> Job | None:
+    """Claim pending work, optionally leaving refreshes to their lock owner."""
 
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -134,11 +134,11 @@ def claim_next_job(database_path: Path) -> Job | None:
             """
             SELECT id
             FROM jobs
-            WHERE status = ?
+            WHERE status = ? AND (? OR kind != 'refresh-source')
             ORDER BY created_at ASC, id ASC
             LIMIT 1
             """,
-            (PENDING,),
+            (PENDING, include_refresh),
         ).fetchone()
 
         if row is None:
@@ -203,6 +203,24 @@ def retry_failed_job(database_path: Path, job_id: str) -> Job:
     if job.status != FAILED:
         raise JobRetryError(f"Job {job_id} is {job.status}; only failed jobs can be retried")
 
+    if job.kind == "refresh-source":
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ensure_refresh_job_index(connection)
+            try:
+                cursor = connection.execute(
+                    "UPDATE jobs SET status = ?, result_json = NULL, error = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = ?",
+                    (PENDING, job_id, FAILED),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise JobRetryError(
+                    "Another refresh is already pending or running for this source"
+                ) from exc
+            if cursor.rowcount != 1:
+                raise JobRetryError(f"Job {job_id} is no longer failed")
+        return get_job(database_path, job_id)
+
     return _set_job_status(
         database_path,
         job_id,
@@ -254,13 +272,38 @@ def _set_job_status(
                 result_json = ?,
                 error = ?,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            WHERE id = ? AND NOT (kind = 'refresh-source' AND status = 'done')
             """,
             (status, discard_payload, result_json, error, job_id),
         )
         connection.commit()
 
     return get_job(database_path, job_id)
+
+
+def ensure_refresh_job_index(connection: sqlite3.Connection) -> None:
+    """Enforce one queued or running refresh per registered source."""
+
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_refresh_source "
+        "ON jobs(json_extract(payload_json, '$.source_id')) "
+        "WHERE kind = 'refresh-source' AND status IN ('pending', 'running')"
+    )
+
+
+def recover_interrupted_refresh_jobs(database_path: Path) -> None:
+    """Fail unacknowledged refreshes while the caller holds the corpus worker lock.
+
+    Successful refresh publication atomically marks its job done, so only
+    genuinely interrupted work remains running once no worker owns the lock.
+    """
+
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE kind = 'refresh-source' AND status = 'running'",
+            ("refresh_interrupted: worker exited before completion; use jobs retry to resume",),
+        )
 
 
 def _row_to_job(row: sqlite3.Row) -> Job:

@@ -419,6 +419,8 @@ class PreparedSourceArtifact:
     work_dir: Path
     metadata: dict[str, Any]
     adapter_options: dict[str, object]
+    user_metadata: dict[str, Any] | None = None
+    user_metadata_origin: str = "explicit"
 
 
 class SourceProcessingPipeline:
@@ -447,9 +449,11 @@ class SourceProcessingPipeline:
         *,
         job_id: str,
         adapter: SourceAdapter | None = None,
+        on_publish: Callable[[sqlite3.Connection, str], None] | None = None,
+        on_stage: Callable[[str], None] | None = None,
     ) -> str:
         resolved_adapter = adapter or self.adapter
-        with _ingest_stage(job_id, "adapter_extraction", artifact.source_path):
+        with _ingest_stage(job_id, "adapter_extraction", artifact.source_path, on_stage=on_stage):
             adapter_result = self._extract_source_units(artifact, adapter=resolved_adapter)
         LOGGER.info(
             "ingest_units_ready job_id=%s source_path=%r units=%d extractor=%s",
@@ -459,7 +463,7 @@ class SourceProcessingPipeline:
             adapter_result.extractor.name,
         )
 
-        with _ingest_stage(job_id, "chunking", artifact.source_path):
+        with _ingest_stage(job_id, "chunking", artifact.source_path, on_stage=on_stage):
             chunks = self.chunker.chunk_units(adapter_result.units)
         LOGGER.info(
             "ingest_chunks_ready job_id=%s source_path=%r chunks=%d",
@@ -468,7 +472,7 @@ class SourceProcessingPipeline:
             len(chunks),
         )
 
-        with _ingest_stage(job_id, "chunk_embeddings", artifact.source_path):
+        with _ingest_stage(job_id, "chunk_embeddings", artifact.source_path, on_stage=on_stage):
             chunk_embeddings = self.embedding_provider.embed_chunks(
                 [chunk.text for chunk in chunks]
             )
@@ -498,7 +502,7 @@ class SourceProcessingPipeline:
             source_unit_ids=source_unit_ids,
         )
         passage_rows = _build_passage_rows_from_chunks(chunk_rows)
-        with _ingest_stage(job_id, "passage_embeddings", artifact.source_path):
+        with _ingest_stage(job_id, "passage_embeddings", artifact.source_path, on_stage=on_stage):
             passage_embeddings = self.embedding_provider.embed_chunks(
                 [passage_row[8] for passage_row in passage_rows]
             )
@@ -512,7 +516,7 @@ class SourceProcessingPipeline:
             passage_embeddings,
         )
 
-        with _ingest_stage(job_id, "publication", artifact.source_path):
+        with _ingest_stage(job_id, "publication", artifact.source_path, on_stage=on_stage):
             _publish_document_bundle(
                 self.storage_paths.database,
                 document_id=document_id,
@@ -534,6 +538,11 @@ class SourceProcessingPipeline:
                 passage_vectors=passage_vector_rows,
                 vector_store=self.vector_store,
                 passage_vector_store=self.passage_vector_store,
+                job_id=job_id,
+                user_metadata=artifact.user_metadata or {},
+                user_metadata_origin=artifact.user_metadata_origin,
+                ingestion_options=artifact.adapter_options,
+                on_publish=on_publish,
             )
         LOGGER.info(
             "ingest_published job_id=%s source_path=%r document_id=%s pages=%d chunks=%d "
@@ -729,6 +738,7 @@ class IngestionPipeline:
                         work_dir=self.storage_paths.ocr_pdfs,
                         metadata=document_metadata,
                         adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
+                        user_metadata=metadata,
                     ),
                     job_id=job.id,
                     adapter=selected_adapter.adapter,
@@ -1239,7 +1249,15 @@ def _metadata_source_url(metadata: dict[str, Any]) -> str | None:
 
 
 @contextmanager
-def _ingest_stage(job_id: str, stage: str, source_reference: Path | str) -> Iterator[None]:
+def _ingest_stage(
+    job_id: str,
+    stage: str,
+    source_reference: Path | str,
+    *,
+    on_stage: Callable[[str], None] | None = None,
+) -> Iterator[None]:
+    if on_stage is not None:
+        on_stage(stage)
     started_at = perf_counter()
     LOGGER.info(
         "ingest_stage_started job_id=%s stage=%s source_reference=%r",
@@ -1515,7 +1533,14 @@ def _publish_document_bundle(
     passage_vectors: Sequence[PassageVectorRecord],
     vector_store: VectorStore,
     passage_vector_store: PassageVectorStore,
+    job_id: str,
+    user_metadata: dict[str, Any],
+    user_metadata_origin: str,
+    ingestion_options: dict[str, object],
+    on_publish: Callable[[sqlite3.Connection, str], None] | None = None,
 ) -> None:
+    from newsrag.revisions import publish_revision
+
     metadata_json = json.dumps(metadata, sort_keys=True)
 
     with _publication_transaction(
@@ -1534,9 +1559,12 @@ def _publish_document_bundle(
                 source_hash,
                 normalized_path,
                 metadata_json,
-                artifact_id
+                artifact_id,
+                user_metadata_json,
+                user_metadata_origin,
+                ingestion_options_json
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
@@ -1547,6 +1575,9 @@ def _publish_document_bundle(
                 str(normalized_path) if normalized_path is not None else None,
                 metadata_json,
                 artifact_id,
+                json.dumps(user_metadata, sort_keys=True),
+                user_metadata_origin,
+                json.dumps(ingestion_options, sort_keys=True),
             ),
         )
         connection.execute(
@@ -1645,6 +1676,10 @@ def _publish_document_bundle(
         )
         vector_store.add_chunks(chunk_vectors)
         passage_vector_store.add_passages(passage_vectors)
+        if on_publish is None:
+            publish_revision(connection, document_id=document_id, job_id=job_id)
+        else:
+            on_publish(connection, document_id)
 
 
 @contextmanager

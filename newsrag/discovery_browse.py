@@ -45,6 +45,10 @@ class DiscoveryBrowseItem:
     source_path: str | None
     source_url: str | None
     metadata: dict[str, Any]
+    source_id: str
+    revision_id: str
+    revision_number: int
+    is_current: bool
 
     @property
     def meeting_date(self) -> str | None:
@@ -74,6 +78,7 @@ class DiscoveryBrowsePage:
     limit: int
     offset: int
     filters: DiscoveryBrowseFilters
+    include_history: bool
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,7 @@ def list_browse_items(
     limit: int = DEFAULT_DISCOVERY_LIST_LIMIT,
     offset: int = 0,
     order_by: str = "label",
+    include_history: bool = False,
 ) -> DiscoveryBrowsePage:
     """List a bounded page of discovery records with document metadata."""
 
@@ -103,7 +109,11 @@ def list_browse_items(
     _validate_pagination(limit=limit, offset=offset)
     resolved_filters = filters or DiscoveryBrowseFilters()
     _validate_filters(resolved_filters)
-    query = _build_filter_query(item_types=item_types, filters=resolved_filters)
+    query = _build_filter_query(
+        item_types=item_types,
+        filters=resolved_filters,
+        include_history=include_history,
+    )
     order_sql = _order_sql(order_by)
 
     with sqlite3.connect(database_path) as connection:
@@ -113,6 +123,9 @@ def list_browse_items(
             SELECT COUNT(*) AS total
             FROM discovery_items
             JOIN documents ON documents.id = discovery_items.document_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             {query.where_sql}
             """,
             query.parameters,
@@ -122,6 +135,9 @@ def list_browse_items(
             {_select_browse_columns()}
             FROM discovery_items
             JOIN documents ON documents.id = discovery_items.document_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             {query.where_sql}
             {order_sql}
             LIMIT ? OFFSET ?
@@ -138,6 +154,7 @@ def list_browse_items(
         limit=limit,
         offset=offset,
         filters=resolved_filters,
+        include_history=include_history,
     )
 
 
@@ -155,7 +172,11 @@ def get_browse_item(database_path: Path, item_id: str) -> DiscoveryBrowseItem:
             {_select_browse_columns()}
             FROM discovery_items
             JOIN documents ON documents.id = discovery_items.document_id
+            JOIN source_revisions ON source_revisions.document_id = documents.id
+            JOIN sources ON sources.id = source_revisions.source_id
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             WHERE discovery_items.id = ?
+                AND source_artifacts.state = 'published'
             """,
             (resolved_item_id,),
         ).fetchall()
@@ -207,6 +228,10 @@ def format_browse_detail(
         f"type: {record.item_type}",
         f"label: {record.label}",
         f"document_id: {record.document_id}",
+        f"source_id: {item.source_id}",
+        f"revision_id: {item.revision_id}",
+        f"revision_number: {item.revision_number}",
+        f"current: {'yes' if item.is_current else 'no'}",
         f"document_title: {_display_value(item.document_title)}",
         f"meeting_date: {_display_value(item.meeting_date)}",
         f"source: {_display_value(_best_source(item))}",
@@ -266,6 +291,14 @@ def _format_browse_list(
             f"title={_display_value(browse_item.document_title)}",
             f"meeting_date={_display_value(browse_item.meeting_date)}",
         ]
+        if page.include_history:
+            state = "current" if browse_item.is_current else "historical"
+            parts.extend(
+                (
+                    f"revision={browse_item.revision_number} ({state})",
+                    f"revision_id={browse_item.revision_id}",
+                )
+            )
         if include_display_date:
             parts.insert(2, f"date={_display_value(browse_item.display_date)}")
         citation = _first_citation(record)
@@ -280,8 +313,11 @@ def _build_filter_query(
     *,
     item_types: tuple[str, ...],
     filters: DiscoveryBrowseFilters,
+    include_history: bool,
 ) -> _QueryParts:
-    clauses: list[str] = []
+    clauses: list[str] = ["source_artifacts.state = 'published'"]
+    if not include_history:
+        clauses.append("sources.current_revision_id = source_revisions.id")
     parameters: list[object] = []
 
     placeholders = ", ".join("?" for _ in item_types)
@@ -350,7 +386,11 @@ def _select_browse_columns() -> str:
             documents.title AS document_title,
             documents.source_path,
             documents.source_url,
-            documents.metadata_json
+            documents.metadata_json,
+            source_revisions.id AS revision_id,
+            source_revisions.source_id,
+            source_revisions.revision_number,
+            CASE WHEN sources.current_revision_id = source_revisions.id THEN 1 ELSE 0 END AS is_current
         """
 
 
@@ -419,6 +459,10 @@ def _row_to_browse_item(
         source_path=_optional_string(row["source_path"]),
         source_url=_optional_string(row["source_url"]),
         metadata=_load_json_object(row["metadata_json"]),
+        source_id=str(row["source_id"]),
+        revision_id=str(row["revision_id"]),
+        revision_number=int(row["revision_number"]),
+        is_current=bool(row["is_current"]),
     )
 
 

@@ -93,6 +93,11 @@ DISCOVERY_MIN_CONFIDENCE_OPTION = typer.Option(
 )
 DISCOVERY_LIMIT_OPTION = typer.Option(50, "--limit", help="Maximum items to show, up to 500.")
 DISCOVERY_OFFSET_OPTION = typer.Option(0, "--offset", help="Number of matching items to skip.")
+INCLUDE_HISTORY_OPTION = typer.Option(
+    False,
+    "--include-history",
+    help="Include all published revisions instead of only current revisions.",
+)
 
 app = typer.Typer(
     help="Local-first evidence retrieval for city hall PDFs.",
@@ -391,6 +396,7 @@ def search_command(
         "--until",
         help="Only search documents with meeting dates on or before YYYY-MM-DD.",
     ),
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """Search indexed evidence passages with hybrid keyword/vector retrieval."""
 
@@ -416,12 +422,19 @@ def search_command(
             lancedb_path=storage_paths.lancedb,
             embedding_config=settings.config.embedding,
         )
-        results = engine.search(query, filters=filters)
+        results = engine.search(query, filters=filters, include_history=include_history)
     except SearchError as exc:
         typer.echo(str(exc))
         raise typer.Exit(code=1) from exc
 
-    typer.echo(format_search_results(results, query=query, filters=filters))
+    typer.echo(
+        format_search_results(
+            results,
+            query=query,
+            filters=filters,
+            include_history=include_history,
+        )
+    )
 
 
 @app.command("packet")
@@ -459,6 +472,7 @@ def packet_command(
         "--until",
         help="Only search documents with meeting dates on or before YYYY-MM-DD.",
     ),
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """Generate an extractive Markdown source packet from retrieved evidence."""
 
@@ -490,7 +504,7 @@ def packet_command(
             lancedb_path=storage_paths.lancedb,
             embedding_config=settings.config.embedding,
         )
-        results = engine.search(query, filters=filters)
+        results = engine.search(query, filters=filters, include_history=include_history)
         source_provenance = load_packet_source_provenance(storage_paths.database, results)
         write_source_packet(
             out,
@@ -499,6 +513,7 @@ def packet_command(
                 results=results,
                 filters=filters,
                 source_provenance=source_provenance,
+                include_history=include_history,
             ),
             overwrite=overwrite,
         )
@@ -617,6 +632,46 @@ def documents_show_command(ctx: typer.Context, document_id: str) -> None:
     typer.echo(format_document_detail(document))
 
 
+@documents_app.command("versions")
+def documents_versions_command(ctx: typer.Context, document_id: str) -> None:
+    """List published revisions for the source containing one document."""
+
+    from newsrag.documents import (
+        DocumentError,
+        format_document_versions,
+        get_document_versions,
+    )
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        history = get_document_versions(database_path, document_id)
+    except DocumentError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(format_document_versions(history))
+
+
+@app.command("refresh")
+def refresh_command(ctx: typer.Context, source_id: str) -> None:
+    """Enqueue an explicit refresh of one source's current revision."""
+
+    from newsrag.refresh import RefreshError, enqueue_refresh
+    from newsrag.storage import initialize_storage
+
+    settings, _ = _resolve_runtime_settings(ctx)
+    database_path = initialize_storage(settings.data_dir).database
+    try:
+        job = enqueue_refresh(database_path=database_path, source_id=source_id)
+    except RefreshError as exc:
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"Enqueued refresh job {job.id} for source {source_id}; status={job.status}")
+
+
 @discover_app.command("document")
 def discover_document_command(
     ctx: typer.Context,
@@ -708,6 +763,7 @@ def topics_list_command(
     min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
     limit: int = DISCOVERY_LIMIT_OPTION,
     offset: int = DISCOVERY_OFFSET_OPTION,
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """List corpus topics from discovery records."""
 
@@ -737,6 +793,7 @@ def topics_list_command(
             filters=filters,
             limit=limit,
             offset=offset,
+            include_history=include_history,
         )
     except DiscoveryBrowseError as exc:
         typer.echo(str(exc))
@@ -775,6 +832,7 @@ def entities_list_command(
     min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
     limit: int = DISCOVERY_LIMIT_OPTION,
     offset: int = DISCOVERY_OFFSET_OPTION,
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """List corpus entities from discovery records."""
 
@@ -804,6 +862,7 @@ def entities_list_command(
             filters=filters,
             limit=limit,
             offset=offset,
+            include_history=include_history,
         )
     except DiscoveryBrowseError as exc:
         typer.echo(str(exc))
@@ -843,6 +902,7 @@ def timeline_command(
     min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
     limit: int = DISCOVERY_LIMIT_OPTION,
     offset: int = DISCOVERY_OFFSET_OPTION,
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """Show dated evidence-backed discovery items across the corpus."""
 
@@ -874,6 +934,7 @@ def timeline_command(
             limit=limit,
             offset=offset,
             order_by="timeline",
+            include_history=include_history,
         )
     except DiscoveryBrowseError as exc:
         typer.echo(str(exc))
@@ -894,6 +955,7 @@ def leads_list_command(
     min_confidence: float | None = DISCOVERY_MIN_CONFIDENCE_OPTION,
     limit: int = DISCOVERY_LIMIT_OPTION,
     offset: int = DISCOVERY_OFFSET_OPTION,
+    include_history: bool = INCLUDE_HISTORY_OPTION,
 ) -> None:
     """List possible story leads from discovery records."""
 
@@ -924,6 +986,7 @@ def leads_list_command(
             limit=limit,
             offset=offset,
             order_by="created",
+            include_history=include_history,
         )
     except DiscoveryBrowseError as exc:
         typer.echo(str(exc))
@@ -987,6 +1050,15 @@ def jobs_retry_command(ctx: typer.Context, job_id: str) -> None:
         raise typer.Exit(code=1) from exc
 
     typer.echo(f"Retried {job.id}; status={job.status}")
+    if job.kind == "refresh-source":
+        candidate = job.payload.get("candidate")
+        if isinstance(candidate, dict):
+            typer.echo(
+                f"Retrying saved artifact {candidate.get('artifact_id')}; "
+                "not reacquiring the source. Use a new refresh to check live bytes."
+            )
+        else:
+            typer.echo("No saved candidate yet; retry will reacquire the source.")
 
 
 @watch_app.command("add")
@@ -1096,7 +1168,27 @@ def _format_job_line(job: Job) -> str:
     if isinstance(source_url, str) and source_url.strip():
         parts.append(f"url={safe_url_reference(source_url)}")
     if job.result is not None:
-        for key in ("outcome", "source_id", "artifact_id", "document_id"):
+        for key in ("outcome", "requested_source_id"):
+            value = job.result.get(key)
+            if isinstance(value, str) and value:
+                parts.append(f"{key}={value}")
+        if (
+            job.kind == "refresh-source"
+            and job.result.get("outcome") == "duplicate_ignored"
+            and isinstance(job.result.get("requested_source_id"), str)
+        ):
+            parts.append(
+                "no revision published for requested source "
+                + str(job.result["requested_source_id"])
+            )
+        for key in (
+            "source_id",
+            "artifact_id",
+            "previous_revision_id",
+            "current_revision_id",
+            "revision_id",
+            "document_id",
+        ):
             value = job.result.get(key)
             if isinstance(value, str) and value:
                 parts.append(f"{key}={value}")

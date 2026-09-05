@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from newsrag.cli import app
+from newsrag.revisions import publish_revision
 from newsrag.storage import (
     REQUIRED_TABLES,
     StorageError,
@@ -224,7 +225,7 @@ def test_schema_upgrade_resets_only_regenerable_discovery_data(tmp_path: Path) -
         "document_briefs_fts": 0,
         "discovery_items_fts": 0,
     }
-    assert schema_version == "5"
+    assert schema_version == "6"
 
 
 def test_initialize_storage_backfills_passages_from_existing_chunks(tmp_path: Path) -> None:
@@ -713,6 +714,246 @@ def test_source_unit_locations_can_represent_non_page_units(tmp_path: Path) -> N
     assert json.loads(row[1]) == {"block_number": 1, "heading_path": ["Budget"]}
     assert row[2] == "Budget — block 1"
     assert json.loads(row[3]) == {"content_kind": "paragraph"}
+
+
+def test_initialize_storage_migrates_revision_and_legacy_metadata(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 'hash-1',
+                '/tmp/report.pdf', '2026-01-02 03:04:05', 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, title, metadata_json, artifact_id, created_at
+            )
+            VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                "document-1",
+                "Budget Packet",
+                json.dumps(
+                    {
+                        "body": "City Council",
+                        "meeting_date": "2026-01-01",
+                        "source_filename": "report.pdf",
+                        "source_size_bytes": 100,
+                        "source_mtime_ns": 123,
+                        "stored_source_path": "/tmp/report.pdf",
+                        "retrieved_at": "2026-01-02T03:04:05Z",
+                    }
+                ),
+                "artifact-1",
+                "2026-01-02 03:04:06",
+            ),
+        )
+        connection.execute("UPDATE metadata SET value = '5' WHERE key = 'schema_version'")
+        connection.commit()
+
+    initialize_storage(paths.data_dir)
+    initialize_storage(paths.data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        document = connection.execute(
+            """
+            SELECT user_metadata_json, user_metadata_origin, ingestion_options_json
+            FROM documents WHERE id = 'document-1'
+            """
+        ).fetchone()
+        revision = connection.execute(
+            "SELECT * FROM source_revisions WHERE document_id = 'document-1'"
+        ).fetchone()
+        source = connection.execute(
+            """
+            SELECT current_revision_id, publication_generation
+            FROM sources WHERE id = 'source-1'
+            """
+        ).fetchone()
+        revision_count = connection.execute("SELECT COUNT(*) FROM source_revisions").fetchone()[0]
+
+    assert document is not None
+    assert json.loads(document["user_metadata_json"]) == {
+        "body": "City Council",
+        "meeting_date": "2026-01-01",
+        "title": "Budget Packet",
+    }
+    assert document["user_metadata_origin"] == "legacy"
+    assert document["ingestion_options_json"] == "{}"
+    assert revision is not None
+    assert revision["source_id"] == "source-1"
+    assert revision["revision_number"] == 1
+    assert revision["published_at"] == "2026-01-02 03:04:06"
+    assert revision["job_id"] is None
+    assert source is not None
+    assert tuple(source) == (revision["id"], 1)
+    assert revision_count == 1
+
+
+def test_initialize_storage_rejects_ambiguous_legacy_source_history(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        for number in (1, 2):
+            connection.execute(
+                """
+                INSERT INTO source_artifacts(
+                    id, source_id, media_type, content_hash, stored_path, acquired_at, state
+                )
+                VALUES(?, 'source-1', 'application/pdf', ?, ?, CURRENT_TIMESTAMP, 'published')
+                """,
+                (f"artifact-{number}", f"hash-{number}", f"/tmp/report-{number}.pdf"),
+            )
+            connection.execute(
+                """
+                INSERT INTO documents(id, metadata_json, artifact_id)
+                VALUES(?, '{}', ?)
+                """,
+                (f"document-{number}", f"artifact-{number}"),
+            )
+        connection.commit()
+
+    with pytest.raises(StorageError, match="multiple published documents are ambiguous"):
+        initialize_storage(paths.data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        document_ids = connection.execute("SELECT id FROM documents ORDER BY id").fetchall()
+        revision_count = connection.execute("SELECT COUNT(*) FROM source_revisions").fetchone()[0]
+    assert document_ids == [("document-1",), ("document-2",)]
+    assert revision_count == 0
+
+
+def test_schema_six_reinitialization_preserves_revision_history(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        for number in (1, 2):
+            connection.execute(
+                """
+                INSERT INTO source_artifacts(
+                    id, source_id, media_type, content_hash, stored_path, acquired_at, state
+                )
+                VALUES(?, 'source-1', 'application/pdf', ?, ?, CURRENT_TIMESTAMP, 'published')
+                """,
+                (f"artifact-{number}", f"hash-{number}", f"/tmp/report-{number}.pdf"),
+            )
+            connection.execute(
+                """
+                INSERT INTO documents(id, metadata_json, artifact_id)
+                VALUES(?, '{}', ?)
+                """,
+                (f"document-{number}", f"artifact-{number}"),
+            )
+            if number == 1:
+                publish_revision(connection, document_id="document-1", job_id=None)
+            else:
+                publish_revision(
+                    connection,
+                    document_id="document-2",
+                    job_id="job-2",
+                    expected_generation=1,
+                )
+
+    initialize_storage(paths.data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        documents = connection.execute("SELECT id FROM documents ORDER BY id").fetchall()
+        revisions = connection.execute(
+            """
+            SELECT document_id, revision_number
+            FROM source_revisions ORDER BY revision_number
+            """
+        ).fetchall()
+        source = connection.execute(
+            """
+            SELECT current_revision_id, publication_generation
+            FROM sources WHERE id = 'source-1'
+            """
+        ).fetchone()
+        current_document = connection.execute(
+            "SELECT document_id FROM source_revisions WHERE id = ?", (source[0],)
+        ).fetchone()[0]
+
+    assert documents == [("document-1",), ("document-2",)]
+    assert revisions == [("document-1", 1), ("document-2", 2)]
+    assert source[1] == 2
+    assert current_document == "document-2"
+
+
+def test_initialize_storage_rejects_invalid_revision_ownership(tmp_path: Path) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        for number in (1, 2):
+            connection.execute(
+                """
+                INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+                VALUES(?, 'local_path', ?, ?)
+                """,
+                (
+                    f"source-{number}",
+                    f"/tmp/report-{number}.pdf",
+                    f"/tmp/report-{number}.pdf",
+                ),
+            )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 'hash-1',
+                '/tmp/report-1.pdf', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(id, metadata_json, artifact_id)
+            VALUES('document-1', '{}', 'artifact-1')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at
+            )
+            VALUES(
+                'revision-bad', 'source-2', 'document-1', 1, CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(StorageError, match="Invalid revision ownership.*revision-bad"):
+        initialize_storage(paths.data_dir)
 
 
 def test_initialize_storage_rejects_file_path(tmp_path: Path) -> None:

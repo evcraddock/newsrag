@@ -137,9 +137,12 @@ def test_search_candidates_and_results_retain_source_unit_ranges(tmp_path: Path)
         connection.execute(
             """
             INSERT INTO source_artifacts(
-                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at
+                id, source_id, media_type, byte_size, content_hash, stored_path, acquired_at, state
             )
-            VALUES('artifact-1', 'source-1', 'application/pdf', 10, 'hash-1', '/tmp/report.pdf', CURRENT_TIMESTAMP)
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 10, 'hash-1',
+                '/tmp/report.pdf', CURRENT_TIMESTAMP, 'published'
+            )
             """
         )
         connection.execute(
@@ -223,6 +226,7 @@ def test_search_candidates_and_results_retain_source_unit_ranges(tmp_path: Path)
             VALUES('passage-1', 'stormwater improvements')
             """
         )
+        _publish_fixture_revisions(connection, (("source-1", "document-1"),))
         connection.commit()
 
     candidates = search_keyword_candidates(database_path, "stormwater", limit=5)
@@ -996,6 +1000,41 @@ def _seed_search_corpus(tmp_path: Path) -> Path:
                 ("passage-j", "budget online public update"),
             ],
         )
+        _publish_fixture_revisions(
+            connection,
+            (
+                ("source-a", "document-a"),
+                ("source-b", "document-b"),
+                ("source-c", "document-c"),
+                ("source-d", "document-d"),
+                ("source-html", "document-html"),
+            ),
+        )
         connection.commit()
 
     return database_path
+
+
+def _publish_fixture_revisions(
+    connection: sqlite3.Connection,
+    memberships: Sequence[tuple[str, str]],
+) -> None:
+    for source_id, document_id in memberships:
+        revision_id = f"revision-{document_id}"
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at
+            )
+            VALUES(?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """,
+            (revision_id, source_id, document_id),
+        )
+        connection.execute(
+            """
+            UPDATE sources
+            SET current_revision_id = ?, publication_generation = 1
+            WHERE id = ?
+            """,
+            (revision_id, source_id),
+        )
