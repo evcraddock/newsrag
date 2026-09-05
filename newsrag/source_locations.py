@@ -41,6 +41,7 @@ class ResolvedSourceRange:
     passage_id: str | None = None
     page_start: int | None = None
     page_end: int | None = None
+    processing_generation_id: str | None = None
 
 
 def load_document_extent(
@@ -51,7 +52,9 @@ def load_document_extent(
 
     row = connection.execute(
         """
-        SELECT source_artifacts.media_type
+        SELECT
+            source_artifacts.media_type,
+            documents.current_processing_generation_id
         FROM documents
         JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
         WHERE documents.id = ?
@@ -75,9 +78,11 @@ def load_document_extent(
         """
         SELECT COUNT(*), COALESCE(SUM(LENGTH(normalized_text)), 0)
         FROM source_units
-        WHERE document_id = ? AND location_type = ?
+        WHERE document_id = ?
+            AND location_type = ?
+            AND processing_generation_id IS ?
         """,
-        (document_id, location_type),
+        (document_id, location_type, row[1]),
     ).fetchone()
     extent_count = int(extent_row[0]) if extent_row is not None else 0
     text_length = int(extent_row[1]) if extent_row is not None else 0
@@ -96,6 +101,7 @@ def resolve_source_range(
     source_unit_start_id: str | None,
     source_unit_end_id: str | None = None,
     passage_id: str | None = None,
+    processing_generation_id: str | None = None,
 ) -> ResolvedSourceRange:
     """Resolve and validate a typed source-unit range, optionally through a passage."""
 
@@ -103,10 +109,16 @@ def resolve_source_range(
     resolved_start_id = _optional_string(source_unit_start_id)
     resolved_end_id = _optional_string(source_unit_end_id)
     resolved_passage_id = _optional_string(passage_id)
+    resolved_generation_id = _optional_string(processing_generation_id)
     if resolved_passage_id is not None:
         passage_row = connection.execute(
             """
-            SELECT document_id, source_unit_start_id, source_unit_end_id, text
+            SELECT
+                document_id,
+                source_unit_start_id,
+                source_unit_end_id,
+                text,
+                processing_generation_id
             FROM passages
             WHERE id = ?
             """,
@@ -122,8 +134,12 @@ def resolve_source_range(
             raise SourceLocationError("Evidence source-unit range does not match its passage")
         if resolved_end_id is not None and resolved_end_id != passage_end_id:
             raise SourceLocationError("Evidence source-unit range does not match its passage")
+        passage_generation_id = _optional_string(passage_row[4])
+        if resolved_generation_id is not None and resolved_generation_id != passage_generation_id:
+            raise SourceLocationError("Evidence processing generation does not match its passage")
         resolved_start_id = passage_start_id
         resolved_end_id = passage_end_id
+        resolved_generation_id = passage_generation_id
         passage_text = str(passage_row[3])
 
     if resolved_start_id is None:
@@ -133,7 +149,13 @@ def resolve_source_range(
 
     unit_rows = connection.execute(
         """
-        SELECT id, ordinal, location_type, location_json, structure_json
+        SELECT
+            id,
+            ordinal,
+            location_type,
+            location_json,
+            structure_json,
+            processing_generation_id
         FROM source_units
         WHERE document_id = ? AND id IN (?, ?)
         """,
@@ -144,6 +166,16 @@ def resolve_source_range(
     end_unit = units.get(resolved_end_id)
     if start_unit is None or end_unit is None:
         raise SourceLocationError("Evidence source units do not belong to the document")
+
+    start_generation_id = _optional_string(start_unit[5])
+    end_generation_id = _optional_string(end_unit[5])
+    if start_generation_id != end_generation_id:
+        raise SourceLocationError("Evidence source-unit range mixes processing generations")
+    if resolved_generation_id is not None and resolved_generation_id != start_generation_id:
+        raise SourceLocationError(
+            "Evidence source units do not belong to the processing generation"
+        )
+    resolved_generation_id = start_generation_id
 
     start_ordinal = int(start_unit[1])
     end_ordinal = int(end_unit[1])
@@ -157,10 +189,12 @@ def resolve_source_range(
         """
         SELECT id, location_type, normalized_text
         FROM source_units
-        WHERE document_id = ? AND ordinal BETWEEN ? AND ?
+        WHERE document_id = ?
+            AND processing_generation_id IS ?
+            AND ordinal BETWEEN ? AND ?
         ORDER BY ordinal ASC
         """,
-        (document_id, start_ordinal, end_ordinal),
+        (document_id, resolved_generation_id, start_ordinal, end_ordinal),
     ).fetchall()
     if not range_rows or any(str(row[1]) != location_type for row in range_rows):
         raise SourceLocationError("Evidence source-unit range is incomplete")
@@ -179,10 +213,19 @@ def resolve_source_range(
             SELECT pages.id, pages.page_number, pages.source_unit_id
             FROM pages
             JOIN source_units ON source_units.id = pages.source_unit_id
-            WHERE pages.document_id = ? AND source_units.ordinal BETWEEN ? AND ?
+            WHERE pages.document_id = ?
+                AND pages.processing_generation_id IS ?
+                AND source_units.processing_generation_id IS ?
+                AND source_units.ordinal BETWEEN ? AND ?
             ORDER BY source_units.ordinal ASC
             """,
-            (document_id, start_ordinal, end_ordinal),
+            (
+                document_id,
+                resolved_generation_id,
+                resolved_generation_id,
+                start_ordinal,
+                end_ordinal,
+            ),
         ).fetchall()
         if len(page_rows) != len(range_rows):
             raise SourceLocationError("PDF source-unit range is missing linked page records")
@@ -220,6 +263,7 @@ def resolve_source_range(
         passage_id=resolved_passage_id,
         page_start=page_start,
         page_end=page_end,
+        processing_generation_id=resolved_generation_id,
     )
 
 

@@ -83,11 +83,12 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifact_staging", "artifacts/staging"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
     "source_revisions",
+    "processing_generations",
     "source_units",
     "documents",
     "pages",
@@ -157,8 +158,22 @@ SCHEMA_STATEMENTS = (
         user_metadata_origin TEXT,
         ingestion_options_json TEXT NOT NULL DEFAULT '{}',
         artifact_id TEXT,
+        current_processing_generation_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id)
+        FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id),
+        FOREIGN KEY(current_processing_generation_id) REFERENCES processing_generations(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS processing_generations (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        configuration_json TEXT NOT NULL,
+        normalized_path TEXT,
+        job_id TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(document_id) REFERENCES documents(id)
     )
     """,
     """
@@ -180,11 +195,13 @@ SCHEMA_STATEMENTS = (
         document_id TEXT NOT NULL,
         page_number INTEGER NOT NULL,
         source_unit_id TEXT,
+        processing_generation_id TEXT,
         text TEXT NOT NULL DEFAULT '',
         extractor TEXT NOT NULL DEFAULT 'unknown',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(document_id) REFERENCES documents(id),
-        FOREIGN KEY(source_unit_id) REFERENCES source_units(id)
+        FOREIGN KEY(source_unit_id) REFERENCES source_units(id),
+        FOREIGN KEY(processing_generation_id) REFERENCES processing_generations(id)
     )
     """,
     """
@@ -192,6 +209,7 @@ SCHEMA_STATEMENTS = (
         id TEXT PRIMARY KEY,
         artifact_id TEXT NOT NULL,
         document_id TEXT NOT NULL,
+        processing_generation_id TEXT,
         ordinal INTEGER NOT NULL,
         location_type TEXT NOT NULL,
         location_json TEXT NOT NULL DEFAULT '{}',
@@ -203,13 +221,15 @@ SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id),
         FOREIGN KEY(document_id) REFERENCES documents(id),
-        UNIQUE(document_id, ordinal)
+        FOREIGN KEY(processing_generation_id) REFERENCES processing_generations(id),
+        UNIQUE(document_id, processing_generation_id, ordinal)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS chunks (
         id TEXT PRIMARY KEY,
         document_id TEXT NOT NULL,
+        processing_generation_id TEXT,
         page_start INTEGER NOT NULL,
         page_end INTEGER NOT NULL,
         source_unit_start_id TEXT,
@@ -217,6 +237,7 @@ SCHEMA_STATEMENTS = (
         text TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(processing_generation_id) REFERENCES processing_generations(id),
         FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
         FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id)
     )
@@ -232,6 +253,7 @@ SCHEMA_STATEMENTS = (
         id TEXT PRIMARY KEY,
         chunk_id TEXT NOT NULL,
         document_id TEXT NOT NULL,
+        processing_generation_id TEXT,
         page_start INTEGER NOT NULL,
         page_end INTEGER NOT NULL,
         source_unit_start_id TEXT,
@@ -241,6 +263,7 @@ SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(chunk_id) REFERENCES chunks(id),
         FOREIGN KEY(document_id) REFERENCES documents(id),
+        FOREIGN KEY(processing_generation_id) REFERENCES processing_generations(id),
         FOREIGN KEY(source_unit_start_id) REFERENCES source_units(id),
         FOREIGN KEY(source_unit_end_id) REFERENCES source_units(id)
     )
@@ -612,6 +635,12 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         _ensure_column(
             connection,
+            "documents",
+            "current_processing_generation_id",
+            "TEXT REFERENCES processing_generations(id)",
+        )
+        _ensure_column(
+            connection,
             "source_artifacts",
             "state",
             "TEXT NOT NULL DEFAULT 'processing'",
@@ -631,6 +660,14 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             "source_unit_id",
             "TEXT REFERENCES source_units(id)",
         )
+        for table_name in ("source_units", "pages", "chunks", "passages"):
+            _ensure_column(
+                connection,
+                table_name,
+                "processing_generation_id",
+                "TEXT REFERENCES processing_generations(id)",
+            )
+        _migrate_source_unit_ordinal_uniqueness(connection)
         for table_name in ("chunks", "passages", "embedding_records"):
             _ensure_column(
                 connection,
@@ -671,7 +708,7 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             removed_document_ids = _consolidate_duplicate_documents(connection)
         else:
             removed_document_ids = ()
-        if previous_schema_version != SCHEMA_VERSION:
+        if previous_schema_version in {None, "1", "2", "3", "4", "5"}:
             connection.execute(
                 """
                 UPDATE source_artifacts
@@ -693,6 +730,9 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         _backfill_legacy_document_metadata(connection)
         _backfill_source_revisions(connection)
+        if previous_schema_version != SCHEMA_VERSION:
+            _backfill_processing_generations(connection)
+        _validate_processing_generation_ownership(connection)
         connection.execute(
             """
             INSERT INTO passages_fts(passage_id, text)
@@ -703,8 +743,82 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         connection.commit()
 
-    migration_required = previous_schema_version != SCHEMA_VERSION
-    return migration_required, removed_document_ids
+    vector_migration_required = previous_schema_version in {None, "1", "2", "3", "4", "5"}
+    return vector_migration_required, removed_document_ids
+
+
+def _migrate_source_unit_ordinal_uniqueness(connection: sqlite3.Connection) -> None:
+    """Replace the legacy per-document ordinal constraint without losing rows."""
+
+    unique_column_sets = {
+        tuple(
+            str(column_row[2])
+            for column_row in connection.execute(f"PRAGMA index_info('{index_row[1]}')")
+        )
+        for index_row in connection.execute("PRAGMA index_list('source_units')")
+        if bool(index_row[2])
+    }
+    current_columns = ("document_id", "processing_generation_id", "ordinal")
+    if current_columns in unique_column_sets:
+        return
+    if connection.in_transaction:
+        raise StorageError("Cannot migrate source-unit ordinal uniqueness inside a transaction")
+
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN")
+        connection.execute(
+            """
+            CREATE TABLE source_units_schema7 (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                processing_generation_id TEXT,
+                ordinal INTEGER NOT NULL,
+                location_type TEXT NOT NULL,
+                location_json TEXT NOT NULL DEFAULT '{}',
+                human_label TEXT NOT NULL,
+                normalized_text TEXT NOT NULL DEFAULT '',
+                structure_json TEXT NOT NULL DEFAULT '{}',
+                extractor TEXT NOT NULL,
+                extractor_version TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id),
+                FOREIGN KEY(document_id) REFERENCES documents(id),
+                FOREIGN KEY(processing_generation_id) REFERENCES processing_generations(id),
+                UNIQUE(document_id, processing_generation_id, ordinal)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units_schema7(
+                id, artifact_id, document_id, processing_generation_id, ordinal,
+                location_type, location_json, human_label, normalized_text,
+                structure_json, extractor, extractor_version, created_at
+            )
+            SELECT
+                id, artifact_id, document_id, processing_generation_id, ordinal,
+                location_type, location_json, human_label, normalized_text,
+                structure_json, extractor, extractor_version, created_at
+            FROM source_units
+            """
+        )
+        connection.execute("DROP TABLE source_units")
+        connection.execute("ALTER TABLE source_units_schema7 RENAME TO source_units")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys = ON")
+
+    invalid_foreign_key = connection.execute("PRAGMA foreign_key_check").fetchone()
+    if invalid_foreign_key is not None:
+        raise StorageError(
+            "Source-unit ordinal migration produced an invalid foreign-key reference: "
+            f"{invalid_foreign_key}"
+        )
 
 
 def _read_schema_version(connection: sqlite3.Connection) -> str | None:
@@ -1196,6 +1310,129 @@ def _backfill_source_revisions(connection: sqlite3.Connection) -> None:
             """,
             (revision_id, source_id),
         )
+
+
+def _backfill_processing_generations(connection: sqlite3.Connection) -> None:
+    """Assign one legacy processing generation to each published document."""
+
+    rows = connection.execute(
+        """
+        SELECT
+            documents.id,
+            documents.normalized_path,
+            documents.created_at,
+            documents.current_processing_generation_id
+        FROM documents
+        JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+        WHERE source_artifacts.state = 'published'
+        ORDER BY documents.created_at ASC, documents.id ASC
+        """
+    ).fetchall()
+    for document_id_value, normalized_path, created_at, current_generation_id in rows:
+        document_id = str(document_id_value)
+        if current_generation_id is None:
+            existing_generations = connection.execute(
+                "SELECT id FROM processing_generations WHERE document_id = ? ORDER BY id",
+                (document_id,),
+            ).fetchall()
+            if existing_generations:
+                generation_ids = ", ".join(str(row[0]) for row in existing_generations)
+                raise StorageError(
+                    f"Cannot initialize processing history for document {document_id}: "
+                    f"generation history exists without a current pointer ({generation_ids})"
+                )
+            generation_id = f"processing-generation-legacy-{document_id}"
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO processing_generations(
+                        id, document_id, fingerprint, configuration_json,
+                        normalized_path, job_id, created_at
+                    )
+                    VALUES(?, ?, 'legacy:unknown', '{}', ?, NULL, ?)
+                    """,
+                    (generation_id, document_id, normalized_path, created_at),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StorageError(
+                    f"Cannot initialize processing history for document {document_id}: {exc}"
+                ) from exc
+            connection.execute(
+                """
+                UPDATE documents
+                SET current_processing_generation_id = ?
+                WHERE id = ? AND current_processing_generation_id IS NULL
+                """,
+                (generation_id, document_id),
+            )
+        else:
+            generation_id = str(current_generation_id)
+
+        for table_name in ("source_units", "pages", "chunks", "passages"):
+            connection.execute(
+                f"""
+                UPDATE {table_name}
+                SET processing_generation_id = ?
+                WHERE document_id = ? AND processing_generation_id IS NULL
+                """,
+                (generation_id, document_id),
+            )
+
+
+def _validate_processing_generation_ownership(connection: sqlite3.Connection) -> None:
+    """Reject pointers and derived rows assigned to another document's generation."""
+
+    invalid_pointer = connection.execute(
+        """
+        SELECT documents.id, documents.current_processing_generation_id
+        FROM documents
+        LEFT JOIN processing_generations
+            ON processing_generations.id = documents.current_processing_generation_id
+        WHERE documents.current_processing_generation_id IS NOT NULL
+            AND (
+                processing_generations.id IS NULL
+                OR processing_generations.document_id != documents.id
+            )
+        ORDER BY documents.id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_pointer is not None:
+        raise StorageError(
+            f"Invalid current processing generation pointer for document {invalid_pointer[0]}: "
+            f"{invalid_pointer[1]}"
+        )
+
+    for table_name in ("source_units", "pages", "chunks", "passages"):
+        invalid_membership = connection.execute(
+            f"""
+            SELECT {table_name}.id, {table_name}.document_id,
+                {table_name}.processing_generation_id
+            FROM {table_name}
+            LEFT JOIN processing_generations
+                ON processing_generations.id = {table_name}.processing_generation_id
+            JOIN documents ON documents.id = {table_name}.document_id
+            WHERE (
+                    {table_name}.processing_generation_id IS NOT NULL
+                    AND (
+                        processing_generations.id IS NULL
+                        OR processing_generations.document_id != {table_name}.document_id
+                    )
+                )
+                OR (
+                    documents.current_processing_generation_id IS NOT NULL
+                    AND {table_name}.processing_generation_id IS NULL
+                )
+            ORDER BY {table_name}.id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+        if invalid_membership is not None:
+            raise StorageError(
+                f"Invalid processing generation membership for {table_name} row "
+                f"{invalid_membership[0]} in document {invalid_membership[1]}: "
+                f"{invalid_membership[2]}"
+            )
 
 
 def _consolidate_duplicate_documents(connection: sqlite3.Connection) -> tuple[str, ...]:

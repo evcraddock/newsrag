@@ -8,8 +8,6 @@ from datetime import date
 from pathlib import Path
 from typing import Protocol
 
-import lancedb  # type: ignore[import-untyped]
-
 from newsrag.config import EmbeddingConfig
 from newsrag.embeddings import (
     EmbeddingError,
@@ -24,6 +22,11 @@ from newsrag.sources import (
     PAGE_LOCATION_TYPE,
     SUPPORTED_SOURCE_TYPES,
     source_type_for_media_type,
+)
+from newsrag.vector_tables import (
+    add_vector_records,
+    delete_vector_records,
+    search_vector_records,
 )
 
 DEFAULT_SEARCH_LIMIT = 5
@@ -100,6 +103,7 @@ class PassageVectorRecord:
     metadata: EmbeddingMetadata
     source_unit_start_id: str | None = None
     source_unit_end_id: str | None = None
+    processing_generation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,7 @@ class SearchCandidate:
     revision_id: str | None = None
     revision_number: int | None = None
     is_current_snapshot: bool | None = None
+    processing_generation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +161,7 @@ class SearchResult:
     revision_id: str | None = None
     revision_number: int | None = None
     is_current_snapshot: bool | None = None
+    processing_generation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +177,7 @@ class _EligibleRevision:
     source_url: str | None
     source_type: str | None
     meeting_date: str | None
+    processing_generation_id: str | None
 
 
 @dataclass(frozen=True)
@@ -179,7 +186,15 @@ class _EligibleDocumentSnapshot:
     document_id_by_passage_id: Mapping[str, str]
 
     def includes_candidate(self, candidate: SearchCandidate) -> bool:
-        return self.document_id_by_passage_id.get(candidate.passage_id) == candidate.document_id
+        if self.document_id_by_passage_id.get(candidate.passage_id) != candidate.document_id:
+            return False
+        expected_generation_id = self.revisions_by_document_id[
+            candidate.document_id
+        ].processing_generation_id
+        return (
+            candidate.processing_generation_id is None
+            or candidate.processing_generation_id == expected_generation_id
+        )
 
 
 @dataclass(frozen=True)
@@ -228,7 +243,7 @@ class LanceDbPassageVectorStore:
         if not passages:
             return
 
-        records = [
+        records: list[dict[str, object]] = [
             {
                 "passage_id": passage.passage_id,
                 "document_id": passage.document_id,
@@ -241,27 +256,38 @@ class LanceDbPassageVectorStore:
                 "provider": passage.metadata.provider,
                 "model": passage.metadata.model,
                 "version": passage.metadata.version,
+                **(
+                    {"processing_generation_id": passage.processing_generation_id}
+                    if passage.processing_generation_id is not None
+                    else {}
+                ),
             }
             for passage in passages
         ]
 
-        database = lancedb.connect(self.lancedb_path)
-        try:
-            table = database.open_table(self.table_name)
-        except ValueError:
-            database.create_table(self.table_name, data=records)
-            return
+        add_vector_records(self.lancedb_path, self.table_name, records)
 
-        table.add(records)
+    def delete_passages(self, ids: Sequence[str]) -> None:
+        """Delete only newly-added passage vectors during compensation."""
+
+        delete_vector_records(
+            self.lancedb_path,
+            self.table_name,
+            "passage_id",
+            ids,
+        )
 
     def delete_document(self, document_id: str) -> None:
-        database = lancedb.connect(self.lancedb_path)
-        try:
-            table = database.open_table(self.table_name)
-        except ValueError:
-            return
-        escaped_document_id = document_id.replace("'", "''")
-        table.delete(f"document_id = '{escaped_document_id}'")
+        """Delete a document's vectors for legacy initial-publication cleanup."""
+
+        # Retained for initial-ingest compatibility. Reprocessing must call
+        # delete_passages with only the newly-created IDs.
+        delete_vector_records(
+            self.lancedb_path,
+            self.table_name,
+            "document_id",
+            [document_id],
+        )
 
 
 @dataclass(frozen=True)
@@ -273,32 +299,39 @@ class LanceDbPassageVectorSearcher:
     max_vector_distance: float | None = DEFAULT_MAX_VECTOR_DISTANCE
 
     def search(self, query_embedding: QueryEmbedding, *, limit: int) -> list[SearchCandidate]:
-        database = lancedb.connect(self.lancedb_path)
-        try:
-            table = database.open_table(self.table_name)
-        except ValueError:
-            return []
-
-        rows = table.search(list(query_embedding.vector)).limit(limit).to_list()
+        rows = search_vector_records(
+            self.lancedb_path,
+            self.table_name,
+            key="passage_id",
+            vector=query_embedding.vector,
+            provider=query_embedding.metadata.provider,
+            model=query_embedding.metadata.model,
+            version=query_embedding.metadata.version,
+            limit=limit,
+        )
         candidates: list[SearchCandidate] = []
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            distance = float(row["_distance"])
+            raw_distance = row["_distance"]
+            if isinstance(raw_distance, bool) or not isinstance(raw_distance, int | float):
+                continue
+            distance = float(raw_distance)
             if self.max_vector_distance is not None and distance > self.max_vector_distance:
                 continue
             candidates.append(
                 SearchCandidate(
                     passage_id=str(row["passage_id"]),
                     document_id=str(row["document_id"]),
-                    page_start=int(row["page_start"]),
-                    page_end=int(row["page_end"]),
+                    page_start=_required_integer(row.get("page_start"), "page_start"),
+                    page_end=_required_integer(row.get("page_end"), "page_end"),
                     text=str(row["text"]),
                     title=None,
                     meeting_date=None,
                     source_unit_start_id=_optional_string(row.get("source_unit_start_id")),
                     source_unit_end_id=_optional_string(row.get("source_unit_end_id")),
                     vector_score=distance,
+                    processing_generation_id=_optional_string(row.get("processing_generation_id")),
                 )
             )
         return candidates
@@ -431,18 +464,29 @@ def search_keyword_candidates(
         database_path,
         include_history=include_history,
     )
-    document_ids = tuple(sorted(snapshot.revisions_by_document_id))
-    if not document_ids:
+    eligible_generations = tuple(
+        (
+            document_id,
+            snapshot.revisions_by_document_id[document_id].processing_generation_id,
+        )
+        for document_id in sorted(snapshot.revisions_by_document_id)
+    )
+    if not eligible_generations:
         return []
-    placeholders = ", ".join("?" for _ in document_ids)
+    eligible_values = ", ".join("(?, ?)" for _ in eligible_generations)
+    eligible_parameters = tuple(value for pair in eligible_generations for value in pair)
 
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
+            WITH eligible(document_id, processing_generation_id) AS (
+                VALUES {eligible_values}
+            )
             SELECT
                 passages.id AS passage_id,
                 passages.document_id AS document_id,
+                passages.processing_generation_id AS processing_generation_id,
                 passages.page_start AS page_start,
                 passages.page_end AS page_end,
                 passages.source_unit_start_id AS source_unit_start_id,
@@ -456,14 +500,16 @@ def search_keyword_candidates(
                 bm25(passages_fts) AS keyword_score
             FROM passages_fts
             JOIN passages ON passages.id = passages_fts.passage_id
+            JOIN eligible
+                ON eligible.document_id = passages.document_id
+                AND eligible.processing_generation_id IS passages.processing_generation_id
             JOIN documents ON documents.id = passages.document_id
             LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
             WHERE passages_fts MATCH ?
-                AND passages.document_id IN ({placeholders})
             ORDER BY bm25(passages_fts) ASC, passages.id ASC
             LIMIT ?
             """,
-            (fts_query, *document_ids, limit),
+            (*eligible_parameters, fts_query, limit),
         ).fetchall()
 
     candidates: list[SearchCandidate] = []
@@ -489,6 +535,7 @@ def search_keyword_candidates(
             source_unit_start_id=_optional_string(row["source_unit_start_id"]),
             source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             keyword_score=float(row["keyword_score"]),
+            processing_generation_id=_optional_string(row["processing_generation_id"]),
         )
         revision = snapshot.revisions_by_document_id[candidate.document_id]
         candidates.append(_candidate_with_revision(candidate, revision))
@@ -582,6 +629,7 @@ def merge_search_candidates(
             revision_id=context.revision_id,
             revision_number=context.revision_number,
             is_current_snapshot=context.is_current_snapshot,
+            processing_generation_id=context.processing_generation_id,
         )
 
     return sorted(
@@ -769,6 +817,7 @@ def _ensure_passage_embeddings(
                     metadata=embedding.metadata,
                     source_unit_start_id=passage.source_unit_start_id,
                     source_unit_end_id=passage.source_unit_end_id,
+                    processing_generation_id=passage.processing_generation_id,
                 )
                 for passage, embedding in zip(batch, embeddings, strict=True)
             ]
@@ -793,6 +842,7 @@ class _PassageForEmbedding:
     text: str
     source_unit_start_id: str | None
     source_unit_end_id: str | None
+    processing_generation_id: str | None
 
 
 def _load_missing_passages(
@@ -810,8 +860,11 @@ def _load_missing_passages(
                 passages.page_end AS page_end,
                 passages.text AS passage_text,
                 passages.source_unit_start_id AS source_unit_start_id,
-                passages.source_unit_end_id AS source_unit_end_id
+                passages.source_unit_end_id AS source_unit_end_id,
+                passages.processing_generation_id AS processing_generation_id
             FROM passages
+            LEFT JOIN processing_generations
+                ON processing_generations.id = passages.processing_generation_id
             LEFT JOIN embedding_records
                 ON embedding_records.source_kind = 'passage'
                 AND embedding_records.source_key = passages.id
@@ -819,6 +872,10 @@ def _load_missing_passages(
                 AND embedding_records.model = ?
                 AND embedding_records.version = ?
             WHERE embedding_records.id IS NULL
+                AND (
+                    passages.processing_generation_id IS NULL
+                    OR processing_generations.fingerprint = 'legacy:unknown'
+                )
             ORDER BY passages.document_id ASC, passages.page_start ASC, passages.ordinal ASC, passages.id ASC
             """,
             (metadata.provider, metadata.model, metadata.version),
@@ -833,6 +890,7 @@ def _load_missing_passages(
             text=str(row["passage_text"]),
             source_unit_start_id=_optional_string(row["source_unit_start_id"]),
             source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+            processing_generation_id=_optional_string(row["processing_generation_id"]),
         )
         for row in rows
     ]
@@ -933,6 +991,7 @@ def _expand_contextual_keyword_candidates(
                     revision_id=neighbor.revision_id,
                     revision_number=neighbor.revision_number,
                     is_current_snapshot=neighbor.is_current_snapshot,
+                    processing_generation_id=neighbor.processing_generation_id,
                 )
             )
             seen_passage_ids.add(neighbor.passage_id)
@@ -987,6 +1046,7 @@ def _load_passage_context(
                 SELECT
                     passages.id AS passage_id,
                     passages.document_id AS document_id,
+                    passages.processing_generation_id AS processing_generation_id,
                     passages.page_start AS page_start,
                     passages.page_end AS page_end,
                     passages.source_unit_start_id AS source_unit_start_id,
@@ -1030,6 +1090,7 @@ def _load_passage_context(
                 source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
                 source_unit_start_id=_optional_string(row["source_unit_start_id"]),
                 source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+                processing_generation_id=_optional_string(row["processing_generation_id"]),
             )
             merged[passage_id] = _candidate_with_revision(
                 candidate,
@@ -1062,6 +1123,7 @@ def _load_passage_context(
             revision_id=existing.revision_id,
             revision_number=existing.revision_number,
             is_current_snapshot=existing.is_current_snapshot,
+            processing_generation_id=existing.processing_generation_id,
         )
 
     return merged
@@ -1115,6 +1177,7 @@ def _load_adjacent_passages(
             SELECT
                 passages.id AS passage_id,
                 passages.document_id AS document_id,
+                passages.processing_generation_id AS processing_generation_id,
                 passages.page_start AS page_start,
                 passages.page_end AS page_end,
                 passages.source_unit_start_id AS source_unit_start_id,
@@ -1162,6 +1225,7 @@ def _load_adjacent_passages(
             source_type=source_type_for_media_type(_optional_string(row["source_media_type"])),
             source_unit_start_id=_optional_string(row["source_unit_start_id"]),
             source_unit_end_id=_optional_string(row["source_unit_end_id"]),
+            processing_generation_id=_optional_string(row["processing_generation_id"]),
         )
         candidates.append(
             _candidate_with_revision(
@@ -1301,6 +1365,7 @@ def _load_eligible_document_snapshot(
                 documents.source_url,
                 documents.metadata_json,
                 source_artifacts.media_type,
+                documents.current_processing_generation_id,
                 CASE
                     WHEN sources.current_revision_id = source_revisions.id THEN 1
                     ELSE 0
@@ -1332,14 +1397,18 @@ def _load_eligible_document_snapshot(
                 or _optional_string(metadata.get("source_url")),
                 source_type=source_type_for_media_type(_optional_string(row["media_type"])),
                 meeting_date=_optional_string(metadata.get("meeting_date")),
+                processing_generation_id=_optional_string(row["current_processing_generation_id"]),
             )
         if not revisions:
             connection.commit()
             return _EligibleDocumentSnapshot({}, {})
         passage_rows = connection.execute(
             """
-            SELECT id, document_id
+            SELECT passages.id, passages.document_id
             FROM passages
+            JOIN documents ON documents.id = passages.document_id
+            WHERE passages.processing_generation_id
+                IS documents.current_processing_generation_id
             """
         ).fetchall()
         passage_rows = [row for row in passage_rows if str(row["document_id"]) in revisions]
@@ -1377,6 +1446,7 @@ def _candidate_with_revision(
         revision_id=revision.revision_id,
         revision_number=revision.revision_number,
         is_current_snapshot=revision.is_current_snapshot,
+        processing_generation_id=revision.processing_generation_id,
     )
 
 
@@ -1466,6 +1536,8 @@ def _format_result_revision(result: SearchResult) -> str:
         parts.append(f"source_id={result.source_id}")
     if result.revision_id is not None:
         parts.append(f"revision_id={result.revision_id}")
+    if result.processing_generation_id is not None:
+        parts.append(f"processing_generation_id={result.processing_generation_id}")
     parts.append(f"document_id={result.document_id}")
     return "; ".join(parts)
 
@@ -1492,6 +1564,12 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _required_integer(value: object, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SearchError(f"Vector record {field_name} must be an integer")
+    return value
 
 
 def _truncate_text(

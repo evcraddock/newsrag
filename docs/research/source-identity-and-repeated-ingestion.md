@@ -143,7 +143,7 @@ This design does not define:
 - reprocessing after extractor, chunking, embedding, or index changes; or
 - duplicate handling across separate corpora.
 
-Source revisions and refresh are defined by the approved [Source revisions and change detection](source-revisions-and-change-detection.md) design from `task-9603f915`; implementation remains in `task-08cdcec9`. Reprocessing is defined by `task-aa5c6e7a`.
+Source revisions and refresh are defined by the approved [Source revisions and change detection](source-revisions-and-change-detection.md) design from `task-9603f915` and implemented in `task-08cdcec9`. Reprocessing requirements and remaining decisions were consolidated into `task-aec94144` after `task-aa5c6e7a` was cancelled as redundant; see [Reprocessing](../reprocessing.md).
 
 ## Implementation task
 

@@ -225,7 +225,7 @@ def test_schema_upgrade_resets_only_regenerable_discovery_data(tmp_path: Path) -
         "document_briefs_fts": 0,
         "discovery_items_fts": 0,
     }
-    assert schema_version == "6"
+    assert schema_version == "7"
 
 
 def test_initialize_storage_backfills_passages_from_existing_chunks(tmp_path: Path) -> None:
@@ -953,6 +953,391 @@ def test_initialize_storage_rejects_invalid_revision_ownership(tmp_path: Path) -
         connection.commit()
 
     with pytest.raises(StorageError, match="Invalid revision ownership.*revision-bad"):
+        initialize_storage(paths.data_dir)
+
+
+def test_schema_six_upgrade_preserves_history_and_backfills_processing_generations(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.executescript(
+            """
+            DROP TABLE source_units;
+            CREATE TABLE source_units (
+                id TEXT PRIMARY KEY,
+                artifact_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                location_type TEXT NOT NULL,
+                location_json TEXT NOT NULL DEFAULT '{}',
+                human_label TEXT NOT NULL,
+                normalized_text TEXT NOT NULL DEFAULT '',
+                structure_json TEXT NOT NULL DEFAULT '{}',
+                extractor TEXT NOT NULL,
+                extractor_version TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id),
+                FOREIGN KEY(document_id) REFERENCES documents(id),
+                UNIQUE(document_id, ordinal)
+            );
+            UPDATE metadata SET value = '6' WHERE key = 'schema_version';
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-published', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-published', 'source-published', 'application/pdf',
+                'hash-published', '/tmp/report.pdf', CURRENT_TIMESTAMP, 'published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(
+                id, normalized_path, metadata_json, artifact_id
+            )
+            VALUES(
+                'document-published', '/tmp/report-normalized.pdf', '{}',
+                'artifact-published'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at
+            )
+            VALUES(
+                'revision-published', 'source-published', 'document-published',
+                1, CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            UPDATE sources
+            SET current_revision_id = 'revision-published', publication_generation = 1
+            WHERE id = 'source-published'
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, human_label,
+                normalized_text, extractor
+            )
+            VALUES(
+                'unit-stable', 'artifact-published', 'document-published', 1,
+                'page', 'p. 1', 'preserved text', 'legacy-extractor'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO pages(id, document_id, page_number, source_unit_id, text, extractor)
+            VALUES(
+                'page-stable', 'document-published', 1, 'unit-stable',
+                'preserved text', 'legacy-extractor'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks(
+                id, document_id, page_start, page_end, source_unit_start_id,
+                source_unit_end_id, text
+            )
+            VALUES(
+                'chunk-stable', 'document-published', 1, 1,
+                'unit-stable', 'unit-stable', 'preserved text'
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO chunks_fts(chunk_id, text) VALUES('chunk-stable', 'preserved text')"
+        )
+        connection.execute(
+            """
+            INSERT INTO passages(
+                id, chunk_id, document_id, page_start, page_end,
+                source_unit_start_id, source_unit_end_id, ordinal, text
+            )
+            VALUES(
+                'passage-stable', 'chunk-stable', 'document-published', 1, 1,
+                'unit-stable', 'unit-stable', 1, 'preserved text'
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO passages_fts(passage_id, text) VALUES('passage-stable', 'preserved text')"
+        )
+        connection.execute(
+            """
+            INSERT INTO embedding_records(
+                id, source_kind, source_key, provider, model, version, dimensions
+            )
+            VALUES(
+                'embedding-stable', 'passage', 'passage-stable',
+                'test', 'legacy', '1', 2
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO document_profiles(
+                id, document_id, source_type, extent_type, extent_count,
+                text_length, extraction_quality_json, extractor
+            )
+            VALUES(
+                'profile-stable', 'document-published', 'pdf', 'pages', 1,
+                14, '{}', 'legacy'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-staged', 'local_path', '/tmp/staged.pdf', '/tmp/staged.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at, state
+            )
+            VALUES(
+                'artifact-staged', 'source-staged', 'application/pdf',
+                'hash-staged', '/tmp/staged.pdf', CURRENT_TIMESTAMP, 'processing'
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO documents(id, metadata_json, artifact_id)
+            VALUES('document-staged', '{}', 'artifact-staged')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, ordinal, location_type, human_label,
+                normalized_text, extractor
+            )
+            VALUES(
+                'unit-staged', 'artifact-staged', 'document-staged', 1,
+                'page', 'p. 1', 'staged text', 'legacy-extractor'
+            )
+            """
+        )
+        connection.commit()
+
+    lance_database = lancedb.connect(paths.lancedb)
+    lance_database.create_table(
+        "passage_embeddings",
+        data=[
+            {
+                "passage_id": "passage-stable",
+                "document_id": "document-published",
+                "text": "preserved text",
+                "vector": [0.1, 0.2],
+            }
+        ],
+    )
+
+    initialize_storage(paths.data_dir)
+    initialize_storage(paths.data_dir)
+
+    with sqlite3.connect(paths.database) as connection:
+        connection.row_factory = sqlite3.Row
+        generation = connection.execute(
+            "SELECT * FROM processing_generations WHERE document_id = 'document-published'"
+        ).fetchone()
+        document = connection.execute(
+            """
+            SELECT current_processing_generation_id
+            FROM documents WHERE id = 'document-published'
+            """
+        ).fetchone()
+        memberships = {
+            table_name: connection.execute(
+                f"SELECT id, processing_generation_id FROM {table_name} "
+                "WHERE document_id = 'document-published'"
+            ).fetchall()
+            for table_name in ("source_units", "pages", "chunks", "passages")
+        }
+        staged = connection.execute(
+            """
+            SELECT source_artifacts.state, documents.current_processing_generation_id,
+                source_units.processing_generation_id
+            FROM documents
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            JOIN source_units ON source_units.document_id = documents.id
+            WHERE documents.id = 'document-staged'
+            """
+        ).fetchone()
+        preserved = {
+            table_name: connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+            for table_name in (
+                "source_revisions",
+                "chunks_fts",
+                "passages_fts",
+                "embedding_records",
+                "document_profiles",
+            )
+        }
+        foreign_keys = {
+            table_name: connection.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
+            for table_name in ("documents", "source_units", "pages", "chunks", "passages")
+        }
+        connection.execute(
+            """
+            INSERT INTO processing_generations(
+                id, document_id, fingerprint, configuration_json
+            )
+            VALUES('generation-new', 'document-published', 'pipeline:v2', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, processing_generation_id, ordinal,
+                location_type, human_label, normalized_text, extractor
+            )
+            VALUES(
+                'unit-new', 'artifact-published', 'document-published',
+                'generation-new', 1, 'page', 'p. 1', 'new text', 'new-extractor'
+            )
+            """
+        )
+        foreign_key_violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+
+    assert generation is not None
+    assert generation["fingerprint"] == "legacy:unknown"
+    assert generation["configuration_json"] == "{}"
+    assert generation["normalized_path"] == "/tmp/report-normalized.pdf"
+    assert generation["job_id"] is None
+    assert document is not None
+    assert document["current_processing_generation_id"] == generation["id"]
+    assert {
+        table_name: [(row["id"], row["processing_generation_id"]) for row in rows]
+        for table_name, rows in memberships.items()
+    } == {
+        "source_units": [("unit-stable", generation["id"])],
+        "pages": [("page-stable", generation["id"])],
+        "chunks": [("chunk-stable", generation["id"])],
+        "passages": [("passage-stable", generation["id"])],
+    }
+    assert tuple(staged) == ("processing", None, None)
+    assert preserved == {
+        "source_revisions": 1,
+        "chunks_fts": 1,
+        "passages_fts": 1,
+        "embedding_records": 1,
+        "document_profiles": 1,
+    }
+    assert all(
+        any(
+            row[2] == "processing_generations"
+            and row[3] in {"current_processing_generation_id", "processing_generation_id"}
+            for row in rows
+        )
+        for rows in foreign_keys.values()
+    )
+    assert foreign_key_violations == []
+    vector_rows = lance_database.open_table("passage_embeddings").to_arrow().to_pylist()
+    assert vector_rows[0]["passage_id"] == "passage-stable"
+    assert vector_rows[0]["text"] == "preserved text"
+
+
+def test_initialize_storage_rejects_invalid_processing_generation_ownership(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute("INSERT INTO documents(id, metadata_json) VALUES('document-1', '{}')")
+        connection.execute("INSERT INTO documents(id, metadata_json) VALUES('document-2', '{}')")
+        connection.execute(
+            """
+            INSERT INTO processing_generations(
+                id, document_id, fingerprint, configuration_json
+            )
+            VALUES('generation-2', 'document-2', 'pipeline:v1', '{}')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE documents
+            SET current_processing_generation_id = 'generation-2'
+            WHERE id = 'document-1'
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(StorageError, match="Invalid current processing generation pointer"):
+        initialize_storage(paths.data_dir)
+
+
+def test_initialize_storage_rejects_invalid_derived_generation_membership(
+    tmp_path: Path,
+) -> None:
+    paths = initialize_storage(tmp_path / ".newsrag")
+    with sqlite3.connect(paths.database) as connection:
+        connection.execute(
+            """
+            INSERT INTO sources(id, kind, submitted_reference, normalized_reference)
+            VALUES('source-1', 'local_path', '/tmp/report.pdf', '/tmp/report.pdf')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_artifacts(
+                id, source_id, media_type, content_hash, stored_path, acquired_at
+            )
+            VALUES(
+                'artifact-1', 'source-1', 'application/pdf', 'hash-1',
+                '/tmp/report.pdf', CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO documents(id, metadata_json, artifact_id) VALUES('document-1', '{}', 'artifact-1')"
+        )
+        connection.execute("INSERT INTO documents(id, metadata_json) VALUES('document-2', '{}')")
+        connection.execute(
+            """
+            INSERT INTO processing_generations(
+                id, document_id, fingerprint, configuration_json
+            )
+            VALUES('generation-2', 'document-2', 'pipeline:v1', '{}')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO source_units(
+                id, artifact_id, document_id, processing_generation_id, ordinal,
+                location_type, human_label, extractor
+            )
+            VALUES(
+                'unit-invalid', 'artifact-1', 'document-1', 'generation-2', 1,
+                'page', 'p. 1', 'test'
+            )
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(StorageError, match="Invalid processing generation membership"):
         initialize_storage(paths.data_dir)
 
 

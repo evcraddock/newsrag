@@ -125,7 +125,7 @@ def list_jobs(database_path: Path) -> list[Job]:
 
 
 def claim_next_job(database_path: Path, *, include_refresh: bool = True) -> Job | None:
-    """Claim pending work, optionally leaving refreshes to their lock owner."""
+    """Claim work, optionally leaving refresh/reprocessing to their lock owner."""
 
     with sqlite3.connect(database_path) as connection:
         connection.row_factory = sqlite3.Row
@@ -134,7 +134,7 @@ def claim_next_job(database_path: Path, *, include_refresh: bool = True) -> Job 
             """
             SELECT id
             FROM jobs
-            WHERE status = ? AND (? OR kind != 'refresh-source')
+            WHERE status = ? AND (? OR kind NOT IN ('refresh-source', 'reprocess-document'))
             ORDER BY created_at ASC, id ASC
             LIMIT 1
             """,
@@ -203,10 +203,11 @@ def retry_failed_job(database_path: Path, job_id: str) -> Job:
     if job.status != FAILED:
         raise JobRetryError(f"Job {job_id} is {job.status}; only failed jobs can be retried")
 
-    if job.kind == "refresh-source":
+    if job.kind in {"refresh-source", "reprocess-document"}:
         with sqlite3.connect(database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             ensure_refresh_job_index(connection)
+            ensure_reprocessing_job_index(connection)
             try:
                 cursor = connection.execute(
                     "UPDATE jobs SET status = ?, result_json = NULL, error = NULL, "
@@ -215,7 +216,7 @@ def retry_failed_job(database_path: Path, job_id: str) -> Job:
                 )
             except sqlite3.IntegrityError as exc:
                 raise JobRetryError(
-                    "Another refresh is already pending or running for this source"
+                    f"Another {job.kind} job is already pending or running for this target"
                 ) from exc
             if cursor.rowcount != 1:
                 raise JobRetryError(f"Job {job_id} is no longer failed")
@@ -272,7 +273,7 @@ def _set_job_status(
                 result_json = ?,
                 error = ?,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND NOT (kind = 'refresh-source' AND status = 'done')
+            WHERE id = ? AND NOT (kind IN ('refresh-source', 'reprocess-document') AND status = 'done')
             """,
             (status, discard_payload, result_json, error, job_id),
         )
@@ -291,11 +292,22 @@ def ensure_refresh_job_index(connection: sqlite3.Connection) -> None:
     )
 
 
-def recover_interrupted_refresh_jobs(database_path: Path) -> None:
-    """Fail unacknowledged refreshes while the caller holds the corpus worker lock.
+def ensure_reprocessing_job_index(connection: sqlite3.Connection) -> None:
+    """Enforce one active rebuild per document, including concurrent retries."""
 
-    Successful refresh publication atomically marks its job done, so only
-    genuinely interrupted work remains running once no worker owns the lock.
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_reprocessing_document "
+        "ON jobs(json_extract(payload_json, '$.document_id')) "
+        "WHERE kind = 'reprocess-document' AND status IN ('pending', 'running')"
+    )
+
+
+def recover_interrupted_refresh_jobs(database_path: Path) -> None:
+    """Recover refresh/reprocessing while the caller holds the corpus worker lock.
+
+    Both publication paths atomically mark their jobs done, so only genuinely
+    interrupted work remains running once no worker owns the lock. The original
+    helper name is retained for compatibility with refresh callers.
     """
 
     with sqlite3.connect(database_path) as connection:
@@ -303,6 +315,11 @@ def recover_interrupted_refresh_jobs(database_path: Path) -> None:
             "UPDATE jobs SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP "
             "WHERE kind = 'refresh-source' AND status = 'running'",
             ("refresh_interrupted: worker exited before completion; use jobs retry to resume",),
+        )
+        connection.execute(
+            "UPDATE jobs SET status = 'failed', error = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE kind = 'reprocess-document' AND status = 'running'",
+            ("reprocess_interrupted: worker exited before completion; use jobs retry to resume",),
         )
 
 
