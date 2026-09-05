@@ -83,10 +83,11 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifact_staging", "artifacts/staging"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
+    "source_revisions",
     "source_units",
     "documents",
     "pages",
@@ -120,8 +121,11 @@ SCHEMA_STATEMENTS = (
         submitted_reference TEXT NOT NULL,
         normalized_reference TEXT NOT NULL,
         resolved_reference TEXT,
+        current_revision_id TEXT,
+        publication_generation INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(kind, normalized_reference)
+        UNIQUE(kind, normalized_reference),
+        FOREIGN KEY(current_revision_id) REFERENCES source_revisions(id)
     )
     """,
     """
@@ -149,9 +153,25 @@ SCHEMA_STATEMENTS = (
         source_hash TEXT,
         normalized_path TEXT,
         metadata_json TEXT NOT NULL DEFAULT '{}',
+        user_metadata_json TEXT,
+        user_metadata_origin TEXT,
+        ingestion_options_json TEXT NOT NULL DEFAULT '{}',
         artifact_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY(artifact_id) REFERENCES source_artifacts(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS source_revisions (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        document_id TEXT UNIQUE NOT NULL,
+        revision_number INTEGER NOT NULL,
+        published_at TEXT NOT NULL,
+        job_id TEXT,
+        FOREIGN KEY(source_id) REFERENCES sources(id),
+        FOREIGN KEY(document_id) REFERENCES documents(id),
+        UNIQUE(source_id, revision_number)
     )
     """,
     """
@@ -564,6 +584,26 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         _ensure_column(connection, "documents", "source_hash", "TEXT")
         _ensure_column(connection, "documents", "normalized_path", "TEXT")
         _ensure_column(connection, "documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+        _ensure_column(connection, "documents", "user_metadata_json", "TEXT")
+        _ensure_column(connection, "documents", "user_metadata_origin", "TEXT")
+        _ensure_column(
+            connection,
+            "documents",
+            "ingestion_options_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        _ensure_column(
+            connection,
+            "sources",
+            "current_revision_id",
+            "TEXT REFERENCES source_revisions(id)",
+        )
+        _ensure_column(
+            connection,
+            "sources",
+            "publication_generation",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         _ensure_column(
             connection,
             "documents",
@@ -627,7 +667,10 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         _backfill_passages(connection)
         _backfill_pdf_source_model(connection)
-        removed_document_ids = _consolidate_duplicate_documents(connection)
+        if previous_schema_version in {None, "1", "2"}:
+            removed_document_ids = _consolidate_duplicate_documents(connection)
+        else:
+            removed_document_ids = ()
         connection.execute(
             """
             UPDATE source_artifacts
@@ -639,6 +682,7 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             )
             """
         )
+        _validate_revision_ownership(connection)
         connection.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_unique_artifact
@@ -646,6 +690,8 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
             WHERE artifact_id IS NOT NULL
             """
         )
+        _backfill_legacy_document_metadata(connection)
+        _backfill_source_revisions(connection)
         connection.execute(
             """
             INSERT INTO passages_fts(passage_id, text)
@@ -938,6 +984,216 @@ def _backfill_pdf_source_model(connection: sqlite3.Connection) -> None:
                 AND (source_unit_start_id IS NULL OR source_unit_end_id IS NULL)
             """,
             (source_kind,),
+        )
+
+
+_LEGACY_GENERATED_METADATA_FIELDS = frozenset(
+    {
+        "artifact_id",
+        "content_hash",
+        "extent_count",
+        "extent_type",
+        "extractor",
+        "extractor_version",
+        "normalized_path",
+        "resolved_url",
+        "retrieved_at",
+        "source_filename",
+        "source_hash",
+        "source_mtime_ns",
+        "source_size_bytes",
+        "source_url",
+        "stored_source_path",
+        "submitted_url",
+        "text_length",
+    }
+)
+
+
+def _backfill_legacy_document_metadata(connection: sqlite3.Connection) -> None:
+    """Preserve legacy descriptive metadata without claiming explicit attribution."""
+
+    rows = connection.execute(
+        """
+        SELECT id, title, metadata_json
+        FROM documents
+        WHERE user_metadata_json IS NULL
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for document_id, title, raw_metadata in rows:
+        metadata = _load_metadata_json(raw_metadata)
+        inherited = {
+            str(key): value
+            for key, value in metadata.items()
+            if str(key) not in _LEGACY_GENERATED_METADATA_FIELDS
+        }
+        if isinstance(title, str) and title.strip():
+            inherited.setdefault("title", title.strip())
+        connection.execute(
+            """
+            UPDATE documents
+            SET user_metadata_json = ?, user_metadata_origin = 'legacy'
+            WHERE id = ? AND user_metadata_json IS NULL
+            """,
+            (json.dumps(inherited, sort_keys=True), str(document_id)),
+        )
+    connection.execute(
+        """
+        UPDATE documents
+        SET user_metadata_origin = 'legacy'
+        WHERE user_metadata_json IS NOT NULL AND user_metadata_origin IS NULL
+        """
+    )
+
+
+def _validate_revision_ownership(connection: sqlite3.Connection) -> None:
+    invalid_revision = connection.execute(
+        """
+        SELECT source_revisions.id, source_revisions.source_id, source_revisions.document_id
+        FROM source_revisions
+        LEFT JOIN documents ON documents.id = source_revisions.document_id
+        LEFT JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+        WHERE source_artifacts.id IS NULL
+            OR source_artifacts.source_id != source_revisions.source_id
+            OR source_artifacts.state != 'published'
+        ORDER BY source_revisions.id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_revision is not None:
+        raise StorageError(
+            "Invalid revision ownership: revision "
+            f"{invalid_revision[0]} assigns document {invalid_revision[2]} to source "
+            f"{invalid_revision[1]}"
+        )
+
+    invalid_pointer = connection.execute(
+        """
+        SELECT sources.id, sources.current_revision_id
+        FROM sources
+        LEFT JOIN source_revisions
+            ON source_revisions.id = sources.current_revision_id
+        WHERE sources.current_revision_id IS NOT NULL
+            AND (
+                source_revisions.id IS NULL
+                OR source_revisions.source_id != sources.id
+            )
+        ORDER BY sources.id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_pointer is not None:
+        raise StorageError(
+            f"Invalid current revision pointer for source {invalid_pointer[0]}: "
+            f"{invalid_pointer[1]}"
+        )
+
+    duplicate_artifact = connection.execute(
+        """
+        SELECT artifact_id, GROUP_CONCAT(id), COUNT(*)
+        FROM documents
+        WHERE artifact_id IS NOT NULL
+        GROUP BY artifact_id
+        HAVING COUNT(*) > 1
+        ORDER BY artifact_id ASC
+        LIMIT 1
+        """
+    ).fetchone()
+    if duplicate_artifact is not None:
+        raise StorageError(
+            f"Ambiguous published ownership for artifact {duplicate_artifact[0]}: "
+            f"documents {duplicate_artifact[1]}"
+        )
+
+
+def _backfill_source_revisions(connection: sqlite3.Connection) -> None:
+    """Initialize unambiguous published source history without choosing a winner."""
+
+    source_rows = connection.execute(
+        """
+        SELECT id, current_revision_id, publication_generation
+        FROM sources
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for source_id_value, current_revision_id, generation_value in source_rows:
+        source_id = str(source_id_value)
+        document_rows = connection.execute(
+            """
+            SELECT documents.id, documents.created_at
+            FROM documents
+            JOIN source_artifacts ON source_artifacts.id = documents.artifact_id
+            WHERE source_artifacts.source_id = ?
+                AND source_artifacts.state = 'published'
+            ORDER BY documents.created_at ASC, documents.id ASC
+            """,
+            (source_id,),
+        ).fetchall()
+        revision_rows = connection.execute(
+            """
+            SELECT id, document_id
+            FROM source_revisions
+            WHERE source_id = ?
+            ORDER BY revision_number ASC, id ASC
+            """,
+            (source_id,),
+        ).fetchall()
+
+        if revision_rows:
+            revision_document_ids = {str(row[1]) for row in revision_rows}
+            unversioned_document_ids = [
+                str(row[0]) for row in document_rows if str(row[0]) not in revision_document_ids
+            ]
+            if unversioned_document_ids:
+                raise StorageError(
+                    f"Source {source_id} has published documents outside its revision history: "
+                    + ", ".join(unversioned_document_ids)
+                )
+            if current_revision_id is None:
+                raise StorageError(
+                    f"Source {source_id} has revision history but no current revision pointer"
+                )
+            continue
+
+        if not document_rows:
+            continue
+        if len(document_rows) > 1:
+            document_ids = ", ".join(str(row[0]) for row in document_rows)
+            raise StorageError(
+                f"Cannot initialize revision history for source {source_id}: multiple "
+                f"published documents are ambiguous ({document_ids})"
+            )
+        if current_revision_id is not None:
+            raise StorageError(
+                f"Source {source_id} points to revision {current_revision_id} but has no history"
+            )
+        generation = int(generation_value)
+        if generation != 0:
+            raise StorageError(
+                f"Cannot initialize revision history for source {source_id}: no current "
+                f"revision at publication generation {generation}"
+            )
+
+        document_id = str(document_rows[0][0])
+        published_at = str(document_rows[0][1])
+        revision_id = f"revision-legacy-{document_id}"
+        connection.execute(
+            """
+            INSERT INTO source_revisions(
+                id, source_id, document_id, revision_number, published_at, job_id
+            )
+            VALUES(?, ?, ?, 1, ?, NULL)
+            """,
+            (revision_id, source_id, document_id, published_at),
+        )
+        connection.execute(
+            """
+            UPDATE sources
+            SET current_revision_id = ?, publication_generation = 1
+            WHERE id = ?
+            """,
+            (revision_id, source_id),
         )
 
 

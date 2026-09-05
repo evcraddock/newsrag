@@ -286,12 +286,11 @@ def _published_document_for_source(
 ) -> str | None:
     row = connection.execute(
         """
-        SELECT documents.id
-        FROM source_artifacts
-        JOIN documents ON documents.artifact_id = source_artifacts.id
-        WHERE source_artifacts.source_id = ?
-        ORDER BY documents.created_at ASC, documents.id ASC
-        LIMIT 1
+        SELECT source_revisions.document_id
+        FROM sources
+        JOIN source_revisions
+            ON source_revisions.id = sources.current_revision_id
+        WHERE sources.id = ?
         """,
         (source_id,),
     ).fetchone()
