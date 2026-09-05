@@ -62,6 +62,14 @@ newsrag doctor
 newsrag status --initialize
 ```
 
+Search indexed evidence using plain text, including hyphenated road names:
+
+```bash
+newsrag search "Clear Springs Road SH-152"
+```
+
+Keyword retrieval treats whitespace-separated terms as literal text and requires all terms to match, while vector retrieval uses the original query. Hyphens and quotes are handled safely; Boolean operators, column filters, wildcards, and quoted-phrase syntax are not interpreted as FTS commands.
+
 List documents ingested during an inclusive UTC calendar-date range:
 
 ```bash
