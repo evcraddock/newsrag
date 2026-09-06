@@ -296,7 +296,7 @@ def test_invalid_header_reference(tmp_path: Path, options: dict[str, object]) ->
         ('<row r="1"><c r="A2"><v>1</v></c></row>', "wrong row"),
         ('<row r="1"><c r="A1"><v>1</v></c><c r="A1"><v>2</v></c></row>', "duplicated"),
         ('<row r="1"><c r="XFE1"><v>1</v></c></row>', "native"),
-        ('<row r="1048577"><c r="A1048577"><v>1</v></c></row>', "bounds"),
+        ('<row r="1048577"><c r="A1048577"><v>1</v></c></row>', "native Excel limits"),
         ('<row r="1"><c r="A1" s="0"><v>1</v></c></row>', "style"),
         ('<row r="1"><c r="A1"><f t="dataTable" ref="A1:A2"/><v>1</v></c></row>', "data-table"),
         ('<row r="1"><c r="A1"><f t="shared" si="1"/><v>1</v></c></row>', "anchor"),

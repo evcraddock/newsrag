@@ -40,6 +40,7 @@ from newsrag.xlsx_package import (
     XlsxPackage,
     load_xlsx_package,
 )
+from newsrag.xlsx_structure import validate_structure
 
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLSX_EXTRACTOR = ExtractorIdentity("xlsx-xml", "1")
@@ -248,6 +249,7 @@ def _shared_strings(package: XlsxPackage, budget: _Budget) -> tuple[tuple[str, s
     root = _single_related(package, "sharedStrings")
     if root is None:
         return ()
+    validate_structure(root, coordinate=_coordinate, bounds=_bounds)
     _children(root, {"si"})
     if root.get("uniqueCount") is not None and _integer(
         root.get("uniqueCount"), "shared strings"
@@ -269,6 +271,7 @@ def _styles(package: XlsxPackage, budget: _Budget) -> tuple[dict[str, Any], ...]
     root = _single_related(package, "styles")
     if root is None:
         return ()
+    validate_structure(root, coordinate=_coordinate, bounds=_bounds)
     names = {
         "numFmts",
         "fonts",
@@ -387,6 +390,7 @@ class _Workbook:
 
     def extract(self) -> AdapterResult:
         root = self.package.xml_parts[self.package.workbook_part]
+        validate_structure(root, coordinate=_coordinate, bounds=_bounds)
         _children(
             root,
             {
@@ -584,6 +588,7 @@ class _Workbook:
         styles: tuple[dict[str, Any], ...],
     ) -> Table:
         root = self.package.xml_parts[target]
+        validate_structure(root, coordinate=_coordinate, bounds=_bounds)
         allowed = {
             "sheetPr",
             "dimension",
@@ -846,7 +851,10 @@ class _Workbook:
             raise AdapterError("XLSX inline string requires an exclusive inline value")
         if value_element is not None and len(value_element):
             raise AdapterError("XLSX stored value cannot contain elements")
-        attributes: dict[str, Any] = {"stored_type": cell_type}
+        attributes: dict[str, Any] = {
+            "stored_type": cell_type,
+            "stored_value_present": value_element is not None,
+        }
         if element.get("s") is not None:
             attributes["style"] = self._style(element.get("s"), styles)
         formula: dict[str, Any] | None = None
@@ -975,6 +983,7 @@ class _Workbook:
                 raise AdapterError("XLSX native table requires a unique table relationship")
             seen_targets.add(relationship.target_part)
             table = self.package.xml_parts[relationship.target_part]
+            validate_structure(table, coordinate=_coordinate, bounds=_bounds)
             self._differential_references(table)
             _children(table, {"autoFilter", "sortState", "tableColumns", "tableStyleInfo"})
             for name in ("autoFilter", "sortState", "tableColumns", "tableStyleInfo"):
@@ -1145,12 +1154,17 @@ class _Workbook:
                             raise AdapterError(
                                 "XLSX array formula cache has an unsupported string representation"
                             )
+                        cache_present = cell is not None and cell.metadata["stored_value_present"]
+                        if cache_present and cell is not None and cell.kind == "blank":
+                            raise AdapterError(
+                                "XLSX array formula has an invalid empty numeric cache"
+                            )
                         member = {
                             "kind": "array",
                             "expression": None,
-                            "cache_present": cell is not None and cell.kind != "blank",
+                            "cache_present": bool(cache_present),
                             "cache_kind": cell.kind
-                            if cell is not None and cell.kind != "blank"
+                            if cache_present and cell is not None
                             else "unavailable",
                         }
                     assert member is not None
