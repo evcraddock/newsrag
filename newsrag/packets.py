@@ -8,6 +8,7 @@ from pathlib import Path
 
 from newsrag.search import SearchFilters, SearchResult
 from newsrag.source_locations import format_inert_markdown_evidence
+from newsrag.source_locations import format_inert_tabular_text as _inert_table_line
 from newsrag.sources import (
     SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
@@ -204,6 +205,7 @@ def format_source_packet(
     """Format retrieved evidence as a fixed Markdown source packet."""
 
     resolved_filters = filters or SearchFilters()
+    tabular_materialized: dict[str, int] = {}
     lines = [f"# Source Packet: {query}", ""]
     if resolved_filters.is_active:
         lines.extend([f"Filters: {', '.join(resolved_filters.labels())}", ""])
@@ -225,6 +227,7 @@ def format_source_packet(
                     )
                 for reason in result.table_evidence.omitted_context:
                     evidence_text += "\n   > Context omitted: " + _inert_table_line(reason)
+                tabular_materialized[result.passage_id] = len(evidence_text) + len(citation) + 32
             else:
                 evidence_text = _format_source_controlled_markdown(
                     _normalize_text(result.text), source_type
@@ -275,7 +278,15 @@ def format_source_packet(
                     raise PacketError(
                         "Missing source provenance for packet document: " + result.document_id
                     )
-            lines.append(f"- {format_source_list_entry(result, provenance=provenance)}")
+            entry = format_source_list_entry(result, provenance=provenance)
+            if (
+                result.passage_id in tabular_materialized
+                and tabular_materialized[result.passage_id] + len(entry) + 3 > 32_768
+            ):
+                raise PacketError(
+                    "Tabular item exceeds the 32768-character packet materialization budget; select a narrower region"
+                )
+            lines.append(f"- {entry}")
     else:
         lines.append("- No sources found.")
     lines.append("")
@@ -300,6 +311,16 @@ def format_source_list_entry(
 
     source_type = provenance.source_type if provenance is not None else result.source_type
     details = []
+    if result.table_evidence is not None:
+        details.append(
+            "focus selector: " + json.dumps(result.table_evidence.focus.reference(), sort_keys=True)
+        )
+        details.append(
+            "context selectors: "
+            + json.dumps(
+                [item.reference() for item in result.table_evidence.context], sort_keys=True
+            )
+        )
     if source_type in {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_TEXT}:
         details.append(_format_line_result_location(result))
     elif source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_CSV}:
@@ -363,15 +384,6 @@ def _result_source_type(
         if provenance is not None:
             return provenance.source_type
     return result.source_type
-
-
-def _inert_table_line(value: str) -> str:
-    # Entity-encode punctuation so source values cannot become Markdown syntax,
-    # HTML, formulas, autolinks, or terminal escape sequences. Preserve spaces.
-    return "".join(
-        character if character.isalnum() or character == " " else f"&#{ord(character)};"
-        for character in value
-    )
 
 
 def _format_source_controlled_markdown(value: str, source_type: str | None) -> str:

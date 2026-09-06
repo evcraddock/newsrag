@@ -32,8 +32,14 @@ class TableEvidence:
             (
                 "focus (extractive table representation):",
                 self.focus.text,
+                *self.focus.annotations,
                 *(
                     f"{item.role} ({item.selection.region.label}):\n{item.selection.text}"
+                    + (
+                        "\n" + "\n".join(item.selection.annotations)
+                        if item.selection.annotations
+                        else ""
+                    )
                     for item in self.context
                 ),
             )
@@ -79,7 +85,7 @@ def resolve_contexts(
     header_row = descriptor.get("header_row")
     roles = {"header": 0, "preceding": 1, "following": 2, "merge-anchor": 3}
     previous = -1
-    contexts = []
+    contexts: list[ContextEvidence] = []
     count, chars = len(focus.cells), len(focus.text)
     context_chars = 0
     seen: set[str] = set()
@@ -88,7 +94,7 @@ def resolve_contexts(
             raise TableError("Context reference must be an object")
         fields = dict(reference)
         role = fields.pop("role", None)
-        if role not in roles or roles[role] < previous or role in seen:
+        if role not in roles or roles[role] < previous or (role != "merge-anchor" and role in seen):
             raise TableError("Context roles are unknown, duplicated or out of order")
         previous = roles[role]
         seen.add(role)
@@ -105,9 +111,36 @@ def resolve_contexts(
         ):
             raise TableError("Context mixes table/sheet ownership")
         if role == "merge-anchor":
-            # Merge context is part of the shared contract, but no CSV cell has a
-            # merge. The XLSX adapter must provide and validate merge descriptors.
-            raise TableError("Merge-anchor context requires a supported persisted merge")
+            raw_merges = descriptor.get("metadata", {}).get("merges", [])
+            if not isinstance(raw_merges, list) or len(raw_merges) > 10_000:
+                raise TableError("Invalid bounded merge descriptors")
+            merges = [TableRegion.from_dict(value) for value in raw_merges]
+            matching = [
+                merge
+                for merge in merges
+                if merge.table_id == focus.region.table_id
+                and merge.sheet_index == focus.region.sheet_index
+                and (merge.row_start, merge.column_start) == (region.row_start, region.column_start)
+                and not (
+                    merge.row_end < focus.region.row_start
+                    or merge.row_start > focus.region.row_end
+                    or merge.column_end < focus.region.column_start
+                    or merge.column_start > focus.region.column_end
+                )
+            ]
+            if region.cell_count != 1 or len(matching) != 1 or not selection.cells[0].searchable:
+                raise TableError(
+                    "Merge-anchor context must select the stored anchor of an intersecting persisted merge"
+                )
+            if any(item.selection.region == region for item in contexts):
+                raise TableError("Duplicate merge-anchor context")
+            count += 1
+            context_chars += len(selection.text)
+            chars += len(selection.text)
+            if count > MAX_ITEM_CELLS or chars > MAX_ITEM_CHARS or context_chars > 16_384:
+                raise TableError("Evidence context exceeds materialization budget")
+            contexts.append(ContextEvidence(role, selection))
+            continue
         expected_row = {
             "header": header_row,
             "preceding": focus.region.row_start - 1,

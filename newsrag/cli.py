@@ -300,7 +300,7 @@ def ingest_command(
     source_type: str | None = typer.Option(
         None,
         "--type",
-        help="Explicit source type hint; currently supported: docx, html, markdown, pdf, text.",
+        help="Explicit source type hint; currently supported: csv, docx, html, markdown, pdf, text.",
     ),
     pdf_extractor: str | None = PDF_EXTRACTOR_OPTION,
     csv_delimiter: str | None = typer.Option(
@@ -402,7 +402,7 @@ def search_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only search documents with this source type: docx, html, markdown, pdf, or text.",
+        help="Only search documents with this source type: csv, docx, html, markdown, pdf, or text.",
     ),
     since: str | None = typer.Option(
         None,
@@ -483,7 +483,7 @@ def packet_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only search documents with this source type: docx, html, markdown, pdf, or text.",
+        help="Only search documents with this source type: csv, docx, html, markdown, pdf, or text.",
     ),
     since: str | None = typer.Option(
         None,
@@ -568,7 +568,7 @@ def documents_list_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only list documents with this source type: docx, html, markdown, pdf, or text.",
+        help="Only list documents with this source type: csv, docx, html, markdown, pdf, or text.",
     ),
     since: str | None = typer.Option(
         None,

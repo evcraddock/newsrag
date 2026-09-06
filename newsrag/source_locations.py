@@ -439,6 +439,14 @@ def validate_evidence_quote(resolved: ResolvedSourceRange, quote: str) -> None:
         raise SourceLocationError("Evidence quote was not found in cited source text")
 
 
+def format_inert_tabular_text(value: str) -> str:
+    """Entity-escape source punctuation without normalizing literal cell whitespace."""
+    return "".join(
+        character if character.isalnum() or character == " " else f"&#{ord(character)};"
+        for character in value
+    )
+
+
 def format_inert_markdown_evidence(value: str) -> str:
     """Format untrusted source evidence as inert Markdown-visible text."""
 

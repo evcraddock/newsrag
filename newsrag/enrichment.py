@@ -18,6 +18,7 @@ from newsrag.source_locations import (
     ResolvedSourceRange,
     SourceLocationError,
     format_evidence_location,
+    format_inert_tabular_text,
     resolve_source_range,
 )
 from newsrag.tabular import TableError, TableRegion
@@ -202,6 +203,10 @@ def format_enrichment_result(result: EnrichmentResult) -> str:
                 compact_pdf=True,
             )
         lines.append(f"- {item.item_type}: {item.label}{location}")
+    if any(
+        evidence.table_region is not None for item in result.items for evidence in item.evidence
+    ):
+        return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 
 
@@ -352,6 +357,12 @@ def _validate_payload(
     )
     if not summary_evidence:
         raise EnrichmentError("summary_evidence must contain at least one evidence reference")
+    if any(item.table_region is not None for item in summary_evidence) and summary not in {
+        item.quote for item in summary_evidence
+    }:
+        raise EnrichmentError(
+            "Tabular summaries must be an exact extractive representation; inferred arithmetic, units, dates, and row relationships are unsupported"
+        )
 
     notable_actions = tuple(
         _validate_claim(item, request=request, field_name="notable_actions")
@@ -389,6 +400,33 @@ def _validate_claim(
     if not isinstance(evidence_raw, dict):
         raise EnrichmentError(f"{field_name} entry evidence must be an object")
     evidence = _validate_evidence_object(evidence_raw, request=request, field_name=field_name)
+    if evidence.table_region is not None:
+        if summary != evidence.quote:
+            raise EnrichmentError(
+                "Tabular claims must retain exact extractive values; inferred claims are unsupported"
+            )
+        allowed_labels = {evidence.table_region.label, evidence.quote}
+        for context in request.evidence_contexts:
+            if (
+                context.table_evidence is not None
+                and context.table_evidence.focus.region == evidence.table_region
+            ):
+                allowed_labels.update(
+                    str(cell.value)
+                    for cell in context.table_evidence.focus.cells
+                    if cell.searchable
+                )
+                allowed_labels.update(
+                    str(cell.value)
+                    for item in context.table_evidence.context
+                    if item.role == "header"
+                    for cell in item.selection.cells
+                    if cell.searchable
+                )
+        if label not in allowed_labels:
+            raise EnrichmentError(
+                "Tabular claim label must be a coordinate label or an attributed literal value/header"
+            )
     return _ValidatedClaim(label=label, summary=summary, evidence=evidence)
 
 

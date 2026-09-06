@@ -1,6 +1,6 @@
 # newsrag
 
-Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, Markdown, and DOCX, with OCR, hybrid search, and cited Markdown source packets.
+Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, Markdown, DOCX, and CSV, with OCR, hybrid search, and cited Markdown source packets.
 
 ## Installation
 
@@ -94,6 +94,17 @@ newsrag search "road budget" --source-type docx
 
 The [DOCX adapter](docs/docx.md) validates bounded ZIP/XML packages without an Office runtime. It never executes macros, embedded objects, or fields, never retrieves external resources, and excludes embedded-image OCR.
 
+Ingest CSV with exact cell coordinates and separately attributed header/neighbor context:
+
+```bash
+newsrag ingest ./expenses.csv
+newsrag ingest ./expenses.csv --csv-delimiter semicolon --csv-header absent
+newsrag search "Roads" --source-type csv
+newsrag reprocess <csv-document-id> --csv-header absent
+```
+
+The [CSV adapter](docs/csv.md) preserves literal strings, leading zeros, whitespace, and logical records. It supports strict encoding/dialect/header recipes, mixed directories and manifests, and generation-retaining refresh/reprocessing. It never calculates formulas or infers arithmetic, units, currency, or civic dates. XLSX parsing is not implemented.
+
 Search indexed evidence using plain text, including hyphenated road names:
 
 ```bash
@@ -129,7 +140,7 @@ newsrag jobs retry <failed-job-id>
 
 Reprocessing retains old citation anchors and stages a complete replacement processing generation before making it active. Unchanged processing fingerprints produce a verified no-op. Failed runs leave existing searchable evidence intact; retries retain their saved configuration and base generation. See [Reprocessing](docs/reprocessing.md) for batch limits, compatible embedding models, and recovery behavior.
 
-Stop all old daemons before upgrading a corpus to schema 7, then restart them using the new version. Migration preserves existing document and citation IDs, source history, and derived evidence. Legacy descriptive metadata is inherited conservatively; unknown legacy processing configurations are marked explicitly rather than invented.
+Stop all old daemons before upgrading a corpus to schema 8, then restart them using the new version. Migration preserves existing document and citation IDs, source history, and derived evidence. Legacy descriptive metadata is inherited conservatively; unknown legacy processing configurations are marked explicitly rather than invented.
 
 List documents ingested during an inclusive UTC calendar-date range:
 

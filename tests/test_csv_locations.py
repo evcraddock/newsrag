@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 import test_text_ingestion as support
 
-from newsrag.packets import format_source_packet, load_packet_source_provenance
+from newsrag.packets import PacketError, format_source_packet, load_packet_source_provenance
 from newsrag.source_locations import (
     SourceLocationError,
     resolve_source_range,
@@ -70,6 +70,33 @@ def test_search_focus_header_and_neighbors_remain_distinct(tmp_path: Path) -> No
                 document_id=result.document_id,
                 source_unit_start_id=result.source_unit_start_id,
             )
+
+
+def test_unicode_line_separators_remain_inside_literal_cells(tmp_path: Path) -> None:
+    corpus = support._corpus(tmp_path / "corpus")
+    source = tmp_path / "unicode.csv"
+    source.write_text("Name\nRoads\u2028Parks\u2029Center\n")
+    job = corpus.ingest(str(source))
+    assert job.status == "done", job.error
+    result = support._keyword_results(corpus.paths.database, "Roads")[0]
+    assert result.table_evidence is not None
+    assert result.table_evidence.focus.cells[0].value == "Roads\u2028Parks\u2029Center"
+    assert "\\u2028" in result.text and "\\u2029" in result.text
+
+
+def test_escaped_packet_materialization_fails_without_truncation(tmp_path: Path) -> None:
+    corpus = support._corpus(tmp_path / "corpus")
+    source = tmp_path / "large.csv"
+    source.write_text("Name\nRoads" + "!" * 7000 + "\n")
+    job = corpus.ingest(str(source))
+    assert job.status == "done", job.error
+    results = support._keyword_results(corpus.paths.database, "Roads")
+    with pytest.raises(PacketError, match="materialization"):
+        format_source_packet(
+            query="Roads",
+            results=results,
+            source_provenance=load_packet_source_provenance(corpus.paths.database, results),
+        )
 
 
 def test_packet_preserves_literal_values_and_inert_context(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -15,6 +16,7 @@ from newsrag.tabular import (
     TableError,
     TablePassage,
     TableRegion,
+    positive_integer,
     render_cells,
     serialized,
     validate_region,
@@ -78,7 +80,11 @@ def validate_tabular_ownership(connection: sqlite3.Connection) -> None:
         SELECT t.table_id FROM source_tables t
         LEFT JOIN processing_generations g ON g.id = t.processing_generation_id
         LEFT JOIN documents d ON d.id = t.document_id
-        WHERE g.id IS NULL OR d.id IS NULL OR g.document_id != t.document_id LIMIT 1
+        WHERE g.id IS NULL OR d.id IS NULL OR g.document_id != t.document_id
+            OR json_extract(t.descriptor_json, '$.table_id') IS NOT t.table_id
+            OR json_type(t.descriptor_json, '$.sheet_index') IS NOT 'integer'
+            OR t.table_id != 'sheet-' || json_extract(t.descriptor_json, '$.sheet_index')
+        LIMIT 1
     """).fetchone()
     if invalid:
         raise TableError("Table descriptor has inconsistent document/generation ownership")
@@ -107,10 +113,27 @@ def validate_tabular_ownership(connection: sqlite3.Connection) -> None:
             OR p.document_id != t.document_id OR c.document_id != t.document_id
             OR p.processing_generation_id IS NOT t.processing_generation_id
             OR c.processing_generation_id IS NOT t.processing_generation_id
+            OR json_extract(t.focus_json, '$.table_id') IS NOT t.table_id
+            OR json_extract(t.focus_json, '$.source_unit_start_id') IS NOT p.source_unit_start_id
+            OR json_extract(t.focus_json, '$.source_unit_end_id') IS NOT p.source_unit_end_id
         LIMIT 1
     """).fetchone()
     if invalid:
         raise TableError("Table passage has inconsistent document/generation ownership")
+    invalid = connection.execute("""
+        SELECT t.passage_id FROM table_passages t, json_each(t.context_json) context
+        LEFT JOIN source_units first ON first.id = json_extract(context.value, '$.source_unit_start_id')
+        LEFT JOIN source_units last ON last.id = json_extract(context.value, '$.source_unit_end_id')
+        WHERE first.id IS NULL OR last.id IS NULL
+            OR first.document_id != t.document_id OR last.document_id != t.document_id
+            OR first.processing_generation_id IS NOT t.processing_generation_id
+            OR last.processing_generation_id IS NOT t.processing_generation_id
+            OR json_extract(context.value, '$.table_id') IS NOT t.table_id
+            OR json_extract(context.value, '$.role') NOT IN ('header', 'preceding', 'following', 'merge-anchor')
+        LIMIT 1
+    """).fetchone()
+    if invalid:
+        raise TableError("Table context has inconsistent document/generation ownership")
     invalid = connection.execute("""
         SELECT u.id FROM source_units u
         LEFT JOIN source_tables t ON t.document_id = u.document_id
@@ -120,6 +143,59 @@ def validate_tabular_ownership(connection: sqlite3.Connection) -> None:
     """).fetchone()
     if invalid:
         raise TableError("Table row has no owned descriptor; cannot fabricate a legacy location")
+
+
+def validate_bundle_metadata(
+    *,
+    document_id: str,
+    generation_id: str,
+    tables: tuple[Table, ...],
+    source_units: Sequence[tuple[object, ...]],
+    passages: tuple[TablePassage, ...],
+) -> None:
+    """Bound the entire serialized owned bundle, including selectors and row labels."""
+    from newsrag.tabular import MAX_METADATA_BYTES
+
+    size = 0
+
+    def consume(value: object) -> None:
+        nonlocal size
+        size += len(serialized(value).encode("utf-8"))
+        if size > MAX_METADATA_BYTES:
+            raise TableError("Tabular bundle exceeds the 64 MiB serialized metadata budget")
+
+    anchors = {}
+    for unit in source_units:
+        consume((*unit, generation_id))
+        location = json.loads(str(unit[5]))
+        anchors[location["table_id"], location["row_start"]] = str(unit[0])
+    for table in tables:
+        consume((document_id, generation_id, table.table_id, table.descriptor()))
+        for cell in table.cells:
+            consume(
+                (
+                    document_id,
+                    generation_id,
+                    table.table_id,
+                    anchors[table.table_id, cell.row],
+                    asdict(cell),
+                )
+            )
+    for passage in passages:
+        references = []
+        for role, region in [
+            ("focus", passage.focus),
+            *((item.role, item.region) for item in passage.context),
+        ]:
+            references.append(
+                {
+                    "role": role,
+                    **region.to_dict(),
+                    "source_unit_start_id": anchors[region.table_id, region.row_start],
+                    "source_unit_end_id": anchors[region.table_id, region.row_end],
+                }
+            )
+        consume((document_id, generation_id, references, passage.omitted_context))
 
 
 def persist_tables(
@@ -173,6 +249,7 @@ class ResolvedTableRegion:
     source_unit_start_id: str
     source_unit_end_id: str
     cells: tuple[Cell, ...]
+    annotations: tuple[str, ...] = ()
 
     @property
     def text(self) -> str:
@@ -231,6 +308,8 @@ def resolve_table_region(
         if record[4] != document_id or record[5] != generation_id or record[6] != "table_row":
             raise TableError("Cell row anchor has inconsistent ownership")
         location = json.loads(record[7])
+        for name in ("sheet_index", "row_start", "row_end", "column_start", "column_end"):
+            positive_integer(location.get(name), f"row anchor {name}")
         if any(
             location.get(key) != value
             for key, value in (
@@ -266,7 +345,17 @@ def resolve_table_region(
         and source_unit_end_id != end_id
     ):
         raise TableError("Evidence rectangle does not match its source-unit endpoints")
-    return ResolvedTableRegion(document_id, generation_id, region, start_id, end_id, resolved)
+    annotations = []
+    for value in table.metadata.get("merges", []):
+        merge = TableRegion.from_dict(value)
+        if (
+            region.row_start <= merge.row_start <= region.row_end
+            and region.column_start <= merge.column_start <= region.column_end
+        ):
+            annotations.append(f"merged anchor: {merge.label}")
+    return ResolvedTableRegion(
+        document_id, generation_id, region, start_id, end_id, resolved, tuple(annotations)
+    )
 
 
 def persist_table_passage(
@@ -292,6 +381,9 @@ def persist_table_passage(
         contexts.append({"role": context.role, **resolved.reference()})
     if focus.text != passage.focus_text or len(passage.text) > MAX_ITEM_CHARS:
         raise TableError("Focus representation does not match its selected cells/budget")
+    from newsrag.tabular_evidence import resolve_contexts
+
+    resolve_contexts(connection, focus, contexts)
     connection.execute(
         "INSERT INTO table_passages VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (

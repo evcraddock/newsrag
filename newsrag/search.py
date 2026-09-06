@@ -867,12 +867,16 @@ def format_search_results(
     if resolved_filters.is_active:
         lines.append(f"filters: {', '.join(resolved_filters.labels())}")
     for result in results:
-        lines.append(result.citation)
+        lines.append(
+            json.dumps(result.citation) if result.table_evidence is not None else result.citation
+        )
         if include_history:
             lines.append(_format_result_revision(result))
         metadata_line = _format_result_metadata(result)
         if metadata_line is not None:
-            lines.append(metadata_line)
+            lines.append(
+                json.dumps(metadata_line) if result.table_evidence is not None else metadata_line
+            )
         if result.table_evidence is not None:
             if result.keyword_match_role:
                 lines.append(f"keyword match: {result.keyword_match_role}")

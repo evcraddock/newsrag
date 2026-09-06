@@ -114,6 +114,43 @@ def test_refresh_inherits_active_recipe_and_retains_packet_snapshot(tmp_path: Pa
     )
 
 
+def test_refresh_revalidates_new_charset_and_retries_saved_invalid_bytes(tmp_path: Path) -> None:
+    first = b"Name\nCaf\xe9\n"
+    second = "Name\nCafé Roads\n".encode()
+    transport = support.HttpTransport(
+        [
+            support.HttpResponse(
+                200, {"content-type": "text/plain; charset=windows-1252"}, (first,)
+            ),
+            support.HttpResponse(200, {"content-type": "text/plain; charset=utf-8"}, (second,)),
+            support.HttpResponse(
+                200, {"content-type": "text/plain; charset=utf-8"}, (b'Name\n"unclosed',)
+            ),
+        ]
+    )
+    corpus = support._corpus(
+        tmp_path / "corpus",
+        acquirer=SafeSourceArtifactAcquirer(resolver=support._public_resolver, transport=transport),
+    )
+    initial = corpus.ingest("https://example.gov/export", source_type="csv")
+    assert initial.status == "done" and initial.result is not None, initial.error
+    source_id = str(initial.result["source_id"])
+    refreshed = corpus.run(enqueue_refresh(corpus.paths.database, source_id))
+    assert refreshed.status == "done", refreshed.error
+    descriptor = json.loads(
+        corpus.rows("SELECT descriptor_json FROM source_tables ORDER BY rowid DESC LIMIT 1")[0][0]
+    )
+    assert descriptor["metadata"]["interpretation"]["encoding"] == "utf-8"
+    assert descriptor["metadata"]["requested_recipe"]["encoding"] == "auto"
+    failed = corpus.run(enqueue_refresh(corpus.paths.database, source_id))
+    assert failed.status == "failed" and "unclosed" in str(failed.error)
+    retried = corpus.run(retry_failed_job(corpus.paths.database, failed.id))
+    assert retried.status == "failed" and "unclosed" in str(retried.error)
+    assert len(transport.requests) == 3
+    assert len(corpus.rows("SELECT * FROM source_tables")) == 2
+    assert support._keyword_results(corpus.paths.database, "Roads")
+
+
 def test_publication_failure_rolls_back_tables_and_retry_retains_recipe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

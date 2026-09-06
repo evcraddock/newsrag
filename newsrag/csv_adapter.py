@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import codecs
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from email.message import Message
 
 from newsrag.adapters import (
@@ -15,7 +15,15 @@ from newsrag.adapters import (
     ExtractorIdentity,
 )
 from newsrag.sources import CSV_MEDIA_ALIASES, CSV_MEDIA_TYPE
-from newsrag.tabular import MAX_CELLS, MAX_VALUE_CHARS, Cell, Table, TableError, render_cells
+from newsrag.tabular import (
+    MAX_CELLS,
+    MAX_VALUE_CHARS,
+    RENDERER_VERSION,
+    Cell,
+    Table,
+    TableError,
+    render_cells,
+)
 from newsrag.text_adapter import read_text_lines
 
 CSV_EXTRACTOR = ExtractorIdentity("strict-csv", "1")
@@ -54,6 +62,7 @@ class CsvSourceAdapter:
     """Decode and parse a bounded rectangular CSV plane without dialect sniffing."""
 
     format_version: str = "1"
+    renderer_version: str = RENDERER_VERSION
 
     @property
     def media_types(self) -> Sequence[str]:
@@ -70,10 +79,12 @@ class CsvSourceAdapter:
                 raise AdapterError(
                     "CSV HTTP header parameter conflicts with the recipe; supply --csv-header present or absent"
                 )
-        decoding_type = artifact.media_type
-        if recipe["encoding"] != "auto":
-            decoding_type += f'; charset="{recipe["encoding"]}"'
-        lines, encoding = read_text_lines(artifact.artifact_path, decoding_type, allow_blank=True)
+        lines, encoding = read_text_lines(
+            artifact.artifact_path,
+            artifact.media_type,
+            allow_blank=True,
+            encoding=None if recipe["encoding"] == "auto" else recipe["encoding"],
+        )
         # A final terminator does not create a record; joining physical lines retains
         # real blank records, including one empty record at the end of the list.
         text = "\n".join(lines)
@@ -156,7 +167,13 @@ class CsvSourceAdapter:
             },
         )
         try:
-            table.validate()
+            from newsrag.tabular import serialized
+
+            table.validate(
+                extra_metadata_bytes=sum(
+                    len(serialized(asdict(unit)).encode("utf-8")) for unit in units
+                )
+            )
         except TableError as exc:
             raise AdapterError(str(exc)) from exc
         if not any(cell.searchable and cell.row != table.header_row for cell in cells):

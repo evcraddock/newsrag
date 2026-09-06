@@ -111,6 +111,7 @@ from newsrag.tabular import Table, TablePassage, build_table_passages
 from newsrag.tabular_storage import (
     persist_table_passage,
     persist_tables,
+    validate_bundle_metadata,
     validate_tabular_ownership,
 )
 from newsrag.text_adapter import PlainTextSourceAdapter
@@ -564,6 +565,14 @@ class SourceProcessingPipeline:
             adapter_result.units,
             generation_id=generation_id if expected_generation_id is not None else None,
         )
+        if adapter_result.tables:
+            validate_bundle_metadata(
+                document_id=document_id,
+                generation_id=generation_id,
+                tables=adapter_result.tables,
+                source_units=source_unit_rows,
+                passages=table_passages,
+            )
         chunk_rows, vector_rows = _build_chunk_and_vector_rows(
             document_id,
             chunks,

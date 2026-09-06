@@ -127,6 +127,16 @@ def test_invalid_recipes(options: dict[str, object]) -> None:
         normalize_csv_options(options)
 
 
+def test_explicit_utf16_endianness_agrees_with_generic_http_charset(tmp_path: Path) -> None:
+    result = extract(
+        tmp_path,
+        codecs.BOM_UTF16_LE + "Name\nRoads\n".encode("utf-16-le"),
+        media="text/csv; charset=utf-16",
+        options={"csv": {"encoding": "utf-16-le"}},
+    )
+    assert result.tables[0].cells[1].value == "Roads"
+
+
 def test_serialized_cell_limit_and_width_limit(tmp_path: Path) -> None:
     with pytest.raises(AdapterError, match="8192"):
         extract(tmp_path, b"a\n" + b"x" * 8193)

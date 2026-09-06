@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 MAX_CELLS = 1_000_000
@@ -43,8 +46,12 @@ def column_label(column: int) -> str:
 
 def serialized(value: object) -> str:
     """Use deterministic Unicode JSON with escaped embedded controls."""
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    return (
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
     )
 
 
@@ -99,6 +106,29 @@ class Cell:
                 raise TableError("Blank/unavailable/covered cell cannot invent a value")
         elif not isinstance(self.value, str):
             raise TableError("Stored cell requires a literal string representation")
+        if self.kind == "number":
+            try:
+                if (
+                    not isinstance(self.value, str)
+                    or re.fullmatch(
+                        r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", self.value
+                    )
+                    is None
+                    or not Decimal(self.value).is_finite()
+                ):
+                    raise TableError("Number cell requires an exact finite numeric lexeme")
+            except InvalidOperation as exc:
+                raise TableError("Invalid numeric cell representation") from exc
+        if self.kind == "date":
+            try:
+                if not isinstance(self.value, str):
+                    raise ValueError("not a string")
+                if "T" in self.value:
+                    datetime.fromisoformat(self.value)
+                else:
+                    date.fromisoformat(self.value)
+            except ValueError as exc:
+                raise TableError("Invalid stored ISO date cell") from exc
         for value in (self.value, self.raw):
             if isinstance(value, str) and len(value) > MAX_VALUE_CHARS:
                 raise TableError("Cell exceeds the 8192-character value budget")
@@ -181,10 +211,15 @@ class Table:
     def descriptor(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__ if name != "cells"}
 
-    def validate(self) -> None:
+    def validate(self, *, extra_metadata_bytes: int = 0) -> None:
         positive_integer(self.sheet_index, "sheet_index")
         if self.table_id != f"sheet-{self.sheet_index}" or self.source_type not in {"csv", "xlsx"}:
             raise TableError("Invalid canonical table identity")
+        if type(self.visible) is not bool:
+            raise TableError("Table visibility must be boolean")
+        descriptor_bytes = len(serialized(self.descriptor()).encode("utf-8")) + extra_metadata_bytes
+        if descriptor_bytes > MAX_METADATA_BYTES:
+            raise TableError("Table exceeds metadata budget")
         bounds = (self.row_start, self.row_end, self.column_start, self.column_end)
         if all(value is None for value in bounds):
             if self.cells or self.header_row is not None:
@@ -210,15 +245,43 @@ class Table:
             <= region.row_end
         ):
             raise TableError("Header is outside the table extent")
+        raw_merges = self.metadata.get("merges", [])
+        if not isinstance(raw_merges, list) or len(raw_merges) > 10_000:
+            raise TableError("Invalid bounded merge descriptors")
+        covered: dict[tuple[int, int], tuple[int, int]] = {}
+        for value in raw_merges:
+            merge = TableRegion.from_dict(value)
+            if (
+                merge.table_id != self.table_id
+                or merge.sheet_index != self.sheet_index
+                or not (
+                    region.row_start <= merge.row_start <= merge.row_end <= region.row_end
+                    and region.column_start
+                    <= merge.column_start
+                    <= merge.column_end
+                    <= region.column_end
+                )
+            ):
+                raise TableError("Merge descriptor is outside its owned table")
+            anchor = merge.row_start, merge.column_start
+            for row in range(merge.row_start, merge.row_end + 1):
+                for column in range(merge.column_start, merge.column_end + 1):
+                    if (row, column) in covered:
+                        raise TableError("Overlapping merge descriptors")
+                    covered[row, column] = anchor
         seen: set[tuple[int, int]] = set()
         value_chars = 0
-        output_bytes = len(serialized(self.descriptor()).encode("utf-8"))
+        output_bytes = descriptor_bytes
         for cell in self.cells:
             cell.validate()
             coordinate = cell.row, cell.column
             if coordinate in seen:
                 raise TableError("Table contains duplicate cells")
             seen.add(coordinate)
+            cell_anchor = covered.get(coordinate)
+            is_covered = cell_anchor is not None and coordinate != cell_anchor
+            if is_covered != (cell.kind == "merged-covered"):
+                raise TableError("Merged coverage does not match canonical cell presence")
             if (
                 not region.row_start <= cell.row <= region.row_end
                 or not region.column_start <= cell.column <= region.column_end
@@ -243,6 +306,8 @@ def validate_region(
         or table.column_end is None
     ):
         raise TableError("Empty table cannot supply evidence")
+    for name in ("sheet_index", "row_start", "row_end", "column_start", "column_end"):
+        positive_integer(getattr(table, name), f"persisted {name}")
     if not (
         table.row_start <= region.row_start <= region.row_end <= table.row_end
         and table.column_start <= region.column_start <= region.column_end <= table.column_end
@@ -324,7 +389,7 @@ class TablePassage:
             (
                 "focus (extractive table representation):",
                 self.focus_text,
-                *(f"{item.role}:\n{item.text}" for item in self.context),
+                *(f"{item.role} ({item.region.label}):\n{item.text}" for item in self.context),
             )
         )
 

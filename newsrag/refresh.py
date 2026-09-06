@@ -216,6 +216,14 @@ class RefreshPipeline:
             )
             media_type = _adapter_input_media_type(selected, candidate["reported_media_type"])
             base = payload["base"]
+            options = dict(base["options"])
+            if selected.source_type == SOURCE_TYPE_CSV:
+                from newsrag.csv_adapter import normalize_csv_options
+
+                options.pop("pdf_extractor", None)
+                options["csv"] = normalize_csv_options(options.get("csv", {}))
+            else:
+                options.pop("csv", None)
             metadata = dict(base["user_metadata"])
             metadata["source_size_bytes"] = int(artifact["byte_size"])
             provenance = json.loads(artifact["provenance_json"])
@@ -263,7 +271,7 @@ class RefreshPipeline:
                     acquired_at=str(artifact["acquired_at"]),
                     work_dir=self.ingestion.storage_paths.ocr_pdfs,
                     metadata=metadata,
-                    adapter_options=base["options"],
+                    adapter_options=options,
                     user_metadata=base["user_metadata"],
                     user_metadata_origin=base["metadata_origin"],
                 ),
