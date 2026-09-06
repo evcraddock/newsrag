@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Protocol
 
 from newsrag.sources import (
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
@@ -125,7 +126,7 @@ class SourceAdapterRegistry:
             normalized_hint = source_type_hint.strip().lower()
             for registration in self._registrations:
                 if registration.source_type == normalized_hint:
-                    _validate_text_media_evidence(registration, reported_media_type)
+                    _validate_type_evidence(registration, reported_media_type, filename)
                     return registration
             raise AdapterSelectionError(
                 f"Unsupported source type {source_type_hint!r}; expected one of: "
@@ -150,6 +151,7 @@ class SourceAdapterRegistry:
         )
         selected = _one_adapter_match(media_matches, evidence="reported media type")
         if selected is not None:
+            _validate_type_evidence(selected, reported_media_type, filename)
             return selected
 
         maximum_signature_bytes = max(
@@ -195,7 +197,7 @@ class SourceAdapterRegistry:
         )
         selected = _one_adapter_match(extension_matches, evidence="filename extension")
         if selected is not None:
-            _validate_text_media_evidence(selected, reported_media_type)
+            _validate_type_evidence(selected, reported_media_type, filename)
             return selected
 
         raise AdapterSelectionError(
@@ -203,13 +205,41 @@ class SourceAdapterRegistry:
         )
 
 
-def _validate_text_media_evidence(
+def _validate_type_evidence(
     registration: RegisteredSourceAdapter,
     reported_media_type: str | None,
+    filename: str,
 ) -> None:
+    media_type = (reported_media_type or "").partition(";")[0].strip().lower()
+    if registration.source_type == SOURCE_TYPE_DOCX:
+        if Path(filename).suffix.lower() in {
+            ".doc",
+            ".docm",
+            ".dot",
+            ".dotm",
+            ".dotx",
+            ".xlsx",
+            ".xlsm",
+            ".xls",
+            ".ppt",
+            ".pptx",
+            ".pptm",
+            ".odt",
+            ".rtf",
+        }:
+            raise AdapterSelectionError("DOCX selection conflicts with the Office filename type")
+        if media_type not in {
+            "",
+            *registration.accepted_media_types,
+            "application/octet-stream",
+            "binary/octet-stream",
+            "application/zip",
+            "application/x-zip-compressed",
+        }:
+            raise AdapterSelectionError("DOCX selection conflicts with the reported media type")
+        return
     if registration.source_type not in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
         return
-    media_type = (reported_media_type or "").partition(";")[0].strip().lower()
     if media_type not in {
         "",
         TEXT_MEDIA_TYPE,

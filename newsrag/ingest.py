@@ -39,6 +39,7 @@ from newsrag.adapters import (
     SourceAdapterRegistry,
 )
 from newsrag.config import EmbeddingConfig
+from newsrag.docx_adapter import DocxSourceAdapter
 from newsrag.embeddings import (
     ChunkEmbedding,
     EmbeddingMetadata,
@@ -80,11 +81,14 @@ from newsrag.pdf_adapter import (
 )
 from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
+    DOCX_MAX_SOURCE_BYTES,
+    DOCX_MEDIA_TYPE,
     HTML_MAX_SOURCE_BYTES,
     HTML_MEDIA_TYPES,
     MARKDOWN_MEDIA_TYPE,
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
@@ -125,6 +129,7 @@ _PDF_EXTENSIONS = (".pdf",)
 _PDF_SIGNATURES = (b"%PDF-",)
 _TEXT_EXTENSIONS = (".txt",)
 _MARKDOWN_EXTENSIONS = (".md",)
+_DOCX_EXTENSIONS = (".docx",)
 _HTML_EXTENSIONS = (".html", ".htm", ".xhtml")
 _HTML_SIGNATURES = (b"<!doctype html", b"<html", b"<?xml")
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
@@ -668,6 +673,13 @@ class IngestionPipeline:
                     signatures=(),
                     adapter=MarkdownSourceAdapter(),
                 ),
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_DOCX,
+                    media_type=DOCX_MEDIA_TYPE,
+                    extensions=_DOCX_EXTENSIONS,
+                    signatures=(),  # ZIP alone never identifies a Word document.
+                    adapter=DocxSourceAdapter(),
+                ),
             )
         )
         self.processor = SourceProcessingPipeline(
@@ -1201,6 +1213,8 @@ def _source_type_for_extension(path: Path) -> str | None:
         return SOURCE_TYPE_TEXT
     if extension in _MARKDOWN_EXTENSIONS:
         return SOURCE_TYPE_MARKDOWN
+    if extension in _DOCX_EXTENSIONS:
+        return SOURCE_TYPE_DOCX
     return None
 
 
@@ -1257,6 +1271,8 @@ def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None
         return HTML_MAX_SOURCE_BYTES
     if source_type in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
         return TEXT_MAX_SOURCE_BYTES
+    if source_type == SOURCE_TYPE_DOCX:
+        return DOCX_MAX_SOURCE_BYTES
     return None
 
 

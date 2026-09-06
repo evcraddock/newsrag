@@ -17,8 +17,10 @@ from newsrag.ingestion_identity import register_acquired_artifact
 from newsrag.jobs import Job, ensure_refresh_job_index, get_job
 from newsrag.revisions import publish_revision
 from newsrag.sources import (
+    DOCX_MAX_SOURCE_BYTES,
     HTML_MAX_SOURCE_BYTES,
     SOURCE_KIND_URL,
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
     TEXT_MAX_SOURCE_BYTES,
@@ -124,6 +126,9 @@ class RefreshPipeline:
                         if Path(filename).suffix.lower() in {".txt", ".md"}
                         or payload["base"].get("source_type")
                         in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
+                        else DOCX_MAX_SOURCE_BYTES
+                        if Path(filename).suffix.lower() == ".docx"
+                        or payload["base"].get("source_type") == SOURCE_TYPE_DOCX
                         else None
                     ),
                 )
@@ -200,7 +205,7 @@ class RefreshPipeline:
                 fallback_source_type=(
                     payload["base"].get("source_type")
                     if payload["base"].get("source_type")
-                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
+                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_DOCX}
                     else None
                 ),
             )

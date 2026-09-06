@@ -19,6 +19,8 @@ from typing import Literal, Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from newsrag.sources import (
+    DOCX_MAX_SOURCE_BYTES,
+    DOCX_MEDIA_TYPE,
     HTML_MAX_SOURCE_BYTES,
     HTML_MEDIA_TYPES,
     MARKDOWN_MEDIA_TYPE,
@@ -896,6 +898,8 @@ def _effective_source_limit(
         MARKDOWN_MEDIA_TYPE,
     }:
         limits.append(TEXT_MAX_SOURCE_BYTES)
+    if apply_reported_media_limit and normalized_media_type == DOCX_MEDIA_TYPE:
+        limits.append(DOCX_MAX_SOURCE_BYTES)
     return min(limits)
 
 

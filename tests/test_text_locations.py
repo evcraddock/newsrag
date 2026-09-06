@@ -375,9 +375,9 @@ def test_cli_source_type_help_lists_text() -> None:
     search_help = runner.invoke(app, ["search", "--help"]).stdout
     inventory_help = runner.invoke(app, ["documents", "list", "--help"]).stdout
 
-    assert "html, markdown, pdf, text" in ingest_help
-    assert "html, markdown, pdf, or text" in search_help
-    assert "html, markdown, pdf, or text" in inventory_help
+    assert "docx, html, markdown, pdf, text" in ingest_help
+    assert "docx, html, markdown, pdf, or text" in search_help
+    assert "docx, html, markdown, pdf, or text" in inventory_help
 
 
 _TEXT_LINE_ONE = "Council approved a $250,000 stormwater contract with ABC Construction."

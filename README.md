@@ -1,6 +1,6 @@
 # newsrag
 
-Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, and Markdown, with OCR, hybrid search, and cited Markdown source packets.
+Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, Markdown, and DOCX, with OCR, hybrid search, and cited Markdown source packets.
 
 ## Installation
 
@@ -83,6 +83,16 @@ newsrag packet "road budget" --source-type markdown --out packet.md
 ```
 
 The [Markdown adapter](docs/markdown.md) shares text decoding and limits, retains headings, lists, quotes, tables, and code blocks, and never renders HTML or fetches linked resources.
+
+Ingest DOCX with heading-aware paragraph, table, and footnote citations:
+
+```bash
+newsrag ingest ./meeting-notes.docx
+newsrag ingest https://example.gov/export --type docx
+newsrag search "road budget" --source-type docx
+```
+
+The [DOCX adapter](docs/docx.md) validates bounded ZIP/XML packages without an Office runtime. It never executes macros, embedded objects, or fields, never retrieves external resources, and excludes embedded-image OCR.
 
 Search indexed evidence using plain text, including hyphenated road names:
 
