@@ -17,7 +17,9 @@ from newsrag.embeddings import (
     build_embedding_provider,
     create_embedding_record,
 )
+from newsrag.source_locations import SourceLocationError, format_docx_location_range
 from newsrag.sources import (
+    DOCX_BLOCK_LOCATION_TYPE,
     HTML_BLOCK_LOCATION_TYPE,
     MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
@@ -164,6 +166,7 @@ class SearchResult:
     revision_number: int | None = None
     is_current_snapshot: bool | None = None
     processing_generation_id: str | None = None
+    location_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -632,6 +635,9 @@ def merge_search_candidates(
             revision_number=context.revision_number,
             is_current_snapshot=context.is_current_snapshot,
             processing_generation_id=context.processing_generation_id,
+            location_label=(
+                source_citation.location_label if source_citation is not None else None
+            ),
         )
 
     return sorted(
@@ -697,6 +703,7 @@ def _load_citation_details(
                 id,
                 document_id,
                 processing_generation_id,
+                ordinal,
                 location_type,
                 location_json,
                 structure_json
@@ -764,6 +771,20 @@ def _load_citation_details(
             citations[candidate.passage_id] = _CitationDetails(
                 heading_path=_heading_path(start_unit["structure_json"]),
                 location_label=_line_location_label(start_range[0], end_range[1]),
+            )
+            continue
+        if start_location_type == DOCX_BLOCK_LOCATION_TYPE:
+            if start_location.get("block_number") != int(start_unit["ordinal"]) or end_location.get(
+                "block_number"
+            ) != int(end_unit["ordinal"]):
+                continue
+            try:
+                location_label = format_docx_location_range(start_location, end_location)
+            except SourceLocationError:
+                continue
+            citations[candidate.passage_id] = _CitationDetails(
+                heading_path=_heading_path(start_unit["structure_json"]),
+                location_label=location_label,
             )
             continue
         if start_location_type != HTML_BLOCK_LOCATION_TYPE:

@@ -307,12 +307,13 @@ def test_markdown_cli_help_and_packet_filter(
 
     assert result.exit_code == 0, result.stdout
     assert captured_filters == [SearchFilters(source_type="markdown")]
-    assert "html, markdown, pdf, text" in runner.invoke(app, ["ingest", "--help"]).stdout
-    assert "html, markdown, pdf, or text" in runner.invoke(app, ["search", "--help"]).stdout
+    assert "docx, html, markdown, pdf, text" in runner.invoke(app, ["ingest", "--help"]).stdout
+    assert "docx, html, markdown, pdf, or text" in runner.invoke(app, ["search", "--help"]).stdout
     assert (
-        "html, markdown, pdf, or text" in runner.invoke(app, ["documents", "list", "--help"]).stdout
+        "docx, html, markdown, pdf, or text"
+        in runner.invoke(app, ["documents", "list", "--help"]).stdout
     )
-    assert "html, markdown, pdf, or text" in runner.invoke(app, ["packet", "--help"]).stdout
+    assert "docx, html, markdown, pdf, or text" in runner.invoke(app, ["packet", "--help"]).stdout
 
 
 _UNSAFE_HTML = "<script>alert('x')</script>"

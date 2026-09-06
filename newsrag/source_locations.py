@@ -7,9 +7,11 @@ import sqlite3
 from dataclasses import dataclass
 
 from newsrag.sources import (
+    DOCX_BLOCK_LOCATION_TYPE,
     HTML_BLOCK_LOCATION_TYPE,
     MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
@@ -50,6 +52,28 @@ class ResolvedSourceRange:
     processing_generation_id: str | None = None
 
 
+@dataclass(frozen=True)
+class _DocxLocation:
+    """Validated machine and human location details for one DOCX block."""
+
+    block_number: int
+    kind: str
+    paragraph_number: int | None = None
+    table_number: int | None = None
+    row_number: int | None = None
+    footnote_id: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.kind == "paragraph":
+            return f"paragraph {self.paragraph_number}"
+        if self.kind == "table_row":
+            return f"table {self.table_number}, row {self.row_number}"
+        if self.kind == "footnote_paragraph":
+            return f"footnote ID {self.footnote_id}, paragraph {self.paragraph_number}"
+        return f"footnote ID {self.footnote_id}, table {self.table_number}, row {self.row_number}"
+
+
 def load_document_extent(
     connection: sqlite3.Connection,
     document_id: str,
@@ -83,6 +107,9 @@ def load_document_extent(
     elif source_type == SOURCE_TYPE_MARKDOWN:
         location_type = MARKDOWN_BLOCK_LOCATION_TYPE
         extent_type = "lines"
+    elif source_type == SOURCE_TYPE_DOCX:
+        location_type = DOCX_BLOCK_LOCATION_TYPE
+        extent_type = "blocks"
     else:
         raise SourceLocationError(f"Unsupported source type for document: {document_id}")
 
@@ -204,7 +231,7 @@ def resolve_source_range(
 
     range_rows = connection.execute(
         """
-        SELECT id, location_type, normalized_text, location_json
+        SELECT id, location_type, normalized_text, location_json, ordinal, structure_json
         FROM source_units
         WHERE document_id = ?
             AND processing_generation_id IS ?
@@ -287,6 +314,22 @@ def resolve_source_range(
         structure = _load_json_object(start_unit[4])
         heading_path = _string_tuple(structure.get("heading_path"))
         location_label = " — ".join((*heading_path, _line_location_label(line_start, line_end)))
+    elif location_type == DOCX_BLOCK_LOCATION_TYPE:
+        docx_locations = []
+        heading_paths = []
+        for row in range_rows:
+            ordinal = int(row[4])
+            location = _docx_location(row[3])
+            if location.block_number != ordinal:
+                raise SourceLocationError("Evidence DOCX block_number does not match source order")
+            docx_locations.append(location)
+            heading_paths.append(_docx_heading_path(row[5], location=location))
+        location_label = " — ".join(
+            (
+                *heading_paths[0],
+                _format_docx_location_range(docx_locations[0], docx_locations[-1]),
+            )
+        )
     else:
         raise SourceLocationError(f"Unsupported evidence location type: {location_type}")
 
@@ -372,7 +415,124 @@ def _line_location_label(line_start: int, line_end: int) -> str:
     return f"lines {line_start}–{line_end}"
 
 
+def format_docx_location_range(start_location: object, end_location: object) -> str:
+    """Validate and format one DOCX block range without inventing page locations."""
+
+    return _format_docx_location_range(
+        _docx_location(start_location),
+        _docx_location(end_location),
+    )
+
+
+def _format_docx_location_range(start: _DocxLocation, end: _DocxLocation) -> str:
+    if end.block_number < start.block_number:
+        raise SourceLocationError("Evidence DOCX block range is reversed")
+    if start.block_number == end.block_number:
+        return start.label
+
+    if start.kind == end.kind == "paragraph":
+        return _numbered_docx_range(
+            "paragraph", "paragraphs", start.paragraph_number, end.paragraph_number
+        )
+    if start.kind == end.kind == "table_row" and start.table_number == end.table_number:
+        rows = _numbered_docx_range("row", "rows", start.row_number, end.row_number)
+        return f"table {start.table_number}, {rows}"
+    if start.kind == end.kind == "footnote_paragraph" and start.footnote_id == end.footnote_id:
+        paragraphs = _numbered_docx_range(
+            "paragraph", "paragraphs", start.paragraph_number, end.paragraph_number
+        )
+        return f"footnote ID {start.footnote_id}, {paragraphs}"
+    if (
+        start.kind == end.kind == "footnote_table_row"
+        and start.footnote_id == end.footnote_id
+        and start.table_number == end.table_number
+    ):
+        rows = _numbered_docx_range("row", "rows", start.row_number, end.row_number)
+        return f"footnote ID {start.footnote_id}, table {start.table_number}, {rows}"
+    return f"{start.label} – {end.label}"
+
+
+def _numbered_docx_range(
+    singular: str,
+    plural: str,
+    start: int | None,
+    end: int | None,
+) -> str:
+    if start is None or end is None:  # pragma: no cover - protected by location validation
+        raise SourceLocationError("Invalid DOCX source-unit location")
+    if end < start:
+        raise SourceLocationError(f"Evidence DOCX {singular} range is reversed")
+    if start == end:
+        return f"{singular} {start}"
+    return f"{plural} {start}–{end}"
+
+
+def _docx_location(raw_json: object) -> _DocxLocation:
+    location = _load_json_object(raw_json)
+    block_number = _positive_location_number(raw_json, "block_number")
+    keys = set(location)
+    footnote_id: str | None = None
+    if "footnote_id" in location:
+        raw_footnote_id = location["footnote_id"]
+        if not isinstance(raw_footnote_id, str) or not raw_footnote_id.strip():
+            raise SourceLocationError("Invalid source-unit footnote_id")
+        footnote_id = raw_footnote_id.strip()
+
+    if "paragraph_number" in location:
+        expected_keys = {"block_number", "paragraph_number"}
+        if footnote_id is not None:
+            expected_keys.add("footnote_id")
+        if keys != expected_keys:
+            raise SourceLocationError("Invalid DOCX paragraph source-unit location")
+        paragraph_number = _positive_location_number(raw_json, "paragraph_number")
+        return _DocxLocation(
+            block_number=block_number,
+            kind="footnote_paragraph" if footnote_id is not None else "paragraph",
+            paragraph_number=paragraph_number,
+            footnote_id=footnote_id,
+        )
+
+    expected_keys = {"block_number", "table_number", "row_number"}
+    if footnote_id is not None:
+        expected_keys.add("footnote_id")
+    if keys != expected_keys:
+        raise SourceLocationError("Invalid DOCX table-row source-unit location")
+    return _DocxLocation(
+        block_number=block_number,
+        kind="footnote_table_row" if footnote_id is not None else "table_row",
+        table_number=_positive_location_number(raw_json, "table_number"),
+        row_number=_positive_location_number(raw_json, "row_number"),
+        footnote_id=footnote_id,
+    )
+
+
+def _docx_heading_path(
+    raw_structure: object,
+    *,
+    location: _DocxLocation,
+) -> tuple[str, ...]:
+    structure = _load_json_object(raw_structure)
+    kind = structure.get("kind")
+    if not isinstance(kind, str) or not kind.strip():
+        raise SourceLocationError("Invalid DOCX source-unit structure kind")
+    expected_kinds = (
+        {"table_row"}
+        if location.kind in {"table_row", "footnote_table_row"}
+        else {"heading", "list_item", "paragraph"}
+    )
+    if kind not in expected_kinds:
+        raise SourceLocationError("DOCX source-unit structure kind conflicts with its location")
+    heading_path = structure.get("heading_path")
+    if not isinstance(heading_path, list) or any(
+        not isinstance(heading, str) or not heading.strip() for heading in heading_path
+    ):
+        raise SourceLocationError("Invalid DOCX source-unit heading_path")
+    return tuple(heading.strip() for heading in heading_path)
+
+
 def _load_json_object(raw_value: object) -> dict[str, object]:
+    if isinstance(raw_value, dict):
+        return dict(raw_value)
     try:
         value = json.loads(str(raw_value))
     except json.JSONDecodeError:

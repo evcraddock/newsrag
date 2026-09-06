@@ -333,12 +333,12 @@ def test_documents_list_rejects_unsupported_source_type(tmp_path: Path) -> None:
 
     result = runner.invoke(
         app,
-        ["--data-dir", str(data_dir), "documents", "list", "--source-type", "docx"],
+        ["--data-dir", str(data_dir), "documents", "list", "--source-type", "epub"],
     )
 
     assert result.exit_code == 1
     assert (
-        "Unsupported --source-type 'docx'; expected one of: html, markdown, pdf, text"
+        "Unsupported --source-type 'epub'; expected one of: docx, html, markdown, pdf, text"
         in result.stdout
     )
 

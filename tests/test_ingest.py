@@ -187,12 +187,12 @@ def test_ingest_rejects_unsupported_source_type_hint_before_enqueue(tmp_path: Pa
 
     result = runner.invoke(
         app,
-        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "docx"],
+        ["--data-dir", str(data_dir), "ingest", str(source_file), "--type", "unsupported"],
     )
 
     paths = initialize_storage(data_dir)
     assert result.exit_code == 1
-    assert "Unsupported source type 'docx'" in result.stdout
+    assert "Unsupported source type 'unsupported'" in result.stdout
     assert list_jobs(paths.database) == []
 
 
@@ -640,7 +640,7 @@ def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> N
         documents:
           - source: https://example.gov/packet.pdf
           - source: https://example.gov/page.html
-            type: docx
+            type: unsupported
         """.strip(),
         encoding="utf-8",
     )
@@ -651,7 +651,7 @@ def test_manifest_validation_is_atomic_for_unsupported_type(tmp_path: Path) -> N
 
     paths = initialize_storage(data_dir)
     assert result.exit_code == 1
-    assert "Unsupported source type 'docx'" in result.stdout
+    assert "Unsupported source type 'unsupported'" in result.stdout
     assert list_jobs(paths.database) == []
 
 

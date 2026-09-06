@@ -24,6 +24,7 @@ from newsrag.sources import (
     HTML_BLOCK_LOCATION_TYPE,
     MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
+    SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     TEXT_LINE_LOCATION_TYPE,
 )
@@ -146,7 +147,7 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
 
     document = brief.document
     metadata = document.metadata
-    inert_source_text = document.source_type == SOURCE_TYPE_MARKDOWN
+    inert_source_text = document.source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_MARKDOWN}
     lines = [
         "NewsRAG Document Brief",
         f"document_id: {document.id}",

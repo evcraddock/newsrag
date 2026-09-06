@@ -307,11 +307,11 @@ def test_mixed_source_search_defaults_to_all_types_and_filters_by_source_type(
 
 
 def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
-    filters = SearchFilters(source_type="docx")
+    filters = SearchFilters(source_type="epub")
 
     with pytest.raises(
         SearchError,
-        match="Unsupported --source-type 'docx'; expected one of: html, markdown, pdf, text",
+        match="Unsupported --source-type 'epub'; expected one of: docx, html, markdown, pdf, text",
     ):
         filters.validate()
 
@@ -319,12 +319,12 @@ def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
     initialize_storage(data_dir)
     result = runner.invoke(
         app,
-        ["--data-dir", str(data_dir), "search", "budget", "--source-type", "docx"],
+        ["--data-dir", str(data_dir), "search", "budget", "--source-type", "epub"],
     )
 
     assert result.exit_code == 1
     assert (
-        "Unsupported --source-type 'docx'; expected one of: html, markdown, pdf, text"
+        "Unsupported --source-type 'epub'; expected one of: docx, html, markdown, pdf, text"
         in result.stdout
     )
 
