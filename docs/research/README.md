@@ -11,6 +11,7 @@ Working notes for a RAG / evidence retrieval system over city hall PDF documents
 - [[non-pdf-source-ingestion]] — source-neutral ingestion design with static HTML as the first non-PDF adapter.
 - [[source-identity-and-repeated-ingestion]] — exact-byte source identity and duplicate-ingestion policy.
 - [[source-revisions-and-change-detection]] — approved manual refresh, revision history, and historical citation policy.
+- [[tabular-source-ingestion-and-citations]] — approved CSV/XLSX table model, cell citations, context, and safety policy.
 
 ## Core idea
 
