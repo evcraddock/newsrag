@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 from newsrag.sources import (
+    SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
@@ -50,6 +51,8 @@ class DocumentFilters:
 class DocumentSummary:
     """One row in the document inventory."""
 
+    table_descriptors: tuple[dict[str, Any], ...] = field(default=(), kw_only=True)
+
     id: str
     title: str | None
     source_path: str | None
@@ -78,6 +81,8 @@ class DocumentSummary:
 @dataclass(frozen=True)
 class DocumentDetail:
     """Detailed read-only document metadata."""
+
+    table_descriptors: tuple[dict[str, Any], ...] = field(default=(), kw_only=True)
 
     id: str
     title: str | None
@@ -262,7 +267,7 @@ def list_document_summaries(
 
     total = int(total_row["total"]) if total_row is not None else 0
     return DocumentListPage(
-        documents=tuple(_row_to_summary(row) for row in rows),
+        documents=tuple(_row_to_summary(row, database_path) for row in rows),
         total=total,
         limit=limit,
         offset=offset,
@@ -346,6 +351,7 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
 
     source_type, extent_label, extent_count = _row_source_extent(row)
     return DocumentDetail(
+        table_descriptors=_table_inventory(database_path, row),
         id=str(row["id"]),
         title=_optional_string(row["title"]),
         source_path=_optional_string(row["source_path"]),
@@ -571,6 +577,10 @@ def format_document_list(page: DocumentListPage) -> str:
             f"source={_display_value(_best_source(document.source_url, document.source_path, metadata))}",
             f"created_at={document.created_at}",
         ]
+        if document.table_descriptors:
+            parts.append(
+                f"sheets={len(document.table_descriptors)} tables={len(document.table_descriptors)} excluded_hidden=0"
+            )
         lines.append(" | ".join(parts))
 
     return "\n".join(lines)
@@ -596,6 +606,19 @@ def format_document_detail(document: DocumentDetail) -> str:
         f"source_path: {_display_value(document.source_path)}",
         f"source_hash: {_display_value(document.source_hash)}",
         f"normalized_path: {_display_value(document.normalized_path)}",
+        *(
+            [
+                f"sheets: {len(document.table_descriptors)}",
+                f"tables: {len(document.table_descriptors)}",
+                "excluded_hidden: 0",
+            ]
+            if document.table_descriptors
+            else []
+        ),
+        *(
+            f"table {table['sheet_index']}: rows {table['row_start']}–{table['row_end']}, columns {table['column_start']}–{table['column_end']}"
+            for table in document.table_descriptors
+        ),
         "metadata:",
     ]
 
@@ -728,9 +751,10 @@ def _parse_filter_date(value: str | None, *, option_name: str) -> date | None:
         raise DocumentError(f"Invalid {option_name} date: expected YYYY-MM-DD") from exc
 
 
-def _row_to_summary(row: sqlite3.Row) -> DocumentSummary:
+def _row_to_summary(row: sqlite3.Row, database_path: Path) -> DocumentSummary:
     source_type, extent_label, extent_count = _row_source_extent(row)
     return DocumentSummary(
+        table_descriptors=_table_inventory(database_path, row),
         id=str(row["id"]),
         title=_optional_string(row["title"]),
         source_path=_optional_string(row["source_path"]),
@@ -749,6 +773,17 @@ def _row_to_summary(row: sqlite3.Row) -> DocumentSummary:
     )
 
 
+def _table_inventory(database_path: Path, row: sqlite3.Row) -> tuple[dict[str, Any], ...]:
+    with sqlite3.connect(database_path) as connection:
+        return tuple(
+            json.loads(item[0])
+            for item in connection.execute(
+                "SELECT descriptor_json FROM source_tables WHERE document_id = ? AND processing_generation_id IS ? ORDER BY table_id",
+                (row["id"], row["current_processing_generation_id"]),
+            )
+        )
+
+
 def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
     media_type = _optional_string(row["media_type"])
     source_type = source_type_for_media_type(media_type)
@@ -762,6 +797,8 @@ def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
         return source_type, "lines", int(row["markdown_line_count"])
     if source_type == SOURCE_TYPE_DOCX:
         return source_type, "blocks", int(row["docx_block_count"])
+    if source_type == SOURCE_TYPE_CSV:
+        return source_type, "rows", int(row["source_unit_count"])
     return media_type or "unknown", "units", int(row["source_unit_count"])
 
 

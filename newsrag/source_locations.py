@@ -11,14 +11,23 @@ from newsrag.sources import (
     HTML_BLOCK_LOCATION_TYPE,
     MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
+    SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
+    TABLE_ROW_LOCATION_TYPE,
     TEXT_LINE_LOCATION_TYPE,
     source_type_for_media_type,
 )
+from newsrag.tabular import TableError, TableRegion
+from newsrag.tabular_evidence import (
+    TableEvidence,
+    load_passage_table_evidence,
+    validate_table_quote,
+)
+from newsrag.tabular_storage import resolve_table_region
 
 
 class SourceLocationError(Exception):
@@ -50,6 +59,7 @@ class ResolvedSourceRange:
     page_start: int | None = None
     page_end: int | None = None
     processing_generation_id: str | None = None
+    table_evidence: TableEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +120,9 @@ def load_document_extent(
     elif source_type == SOURCE_TYPE_DOCX:
         location_type = DOCX_BLOCK_LOCATION_TYPE
         extent_type = "blocks"
+    elif source_type == SOURCE_TYPE_CSV:
+        location_type = TABLE_ROW_LOCATION_TYPE
+        extent_type = "rows"
     else:
         raise SourceLocationError(f"Unsupported source type for document: {document_id}")
 
@@ -146,9 +159,58 @@ def resolve_source_range(
     source_unit_end_id: str | None = None,
     passage_id: str | None = None,
     processing_generation_id: str | None = None,
+    table_region: TableRegion | None = None,
 ) -> ResolvedSourceRange:
     """Resolve and validate a typed source-unit range, optionally through a passage."""
 
+    try:
+        table_evidence = (
+            load_passage_table_evidence(
+                connection,
+                passage_id=passage_id,
+                document_id=document_id,
+                generation_id=processing_generation_id,
+            )
+            if passage_id
+            else None
+        )
+        if table_evidence is not None:
+            focus = table_evidence.focus
+            if table_region is not None and table_region != focus.region:
+                raise TableError("Explicit selector does not match passage focus")
+            if (
+                source_unit_start_id is not None
+                and source_unit_start_id != focus.source_unit_start_id
+                or source_unit_end_id is not None
+                and source_unit_end_id != focus.source_unit_end_id
+            ):
+                raise TableError("Table focus does not match supplied row endpoints")
+            return _resolved_table_range(table_evidence, passage_id)
+        if table_region is not None:
+            generation = processing_generation_id
+            if generation is None and source_unit_start_id:
+                row = connection.execute(
+                    "SELECT processing_generation_id FROM source_units WHERE id = ? AND document_id = ?",
+                    (source_unit_start_id, document_id),
+                ).fetchone()
+                generation = str(row[0]) if row and row[0] is not None else None
+            if generation is None:
+                raise TableError(
+                    "Table evidence requires an explicit generation or owned row anchor"
+                )
+            focus = resolve_table_region(
+                connection,
+                document_id=document_id,
+                generation_id=generation,
+                region=table_region,
+                source_unit_start_id=source_unit_start_id,
+                source_unit_end_id=source_unit_end_id,
+            )
+            if passage_id is not None:
+                raise TableError("Passage has no persisted tabular selector")
+            return _resolved_table_range(TableEvidence(focus), None)
+    except TableError as exc:
+        raise SourceLocationError(str(exc)) from exc
     passage_text: str | None = None
     resolved_start_id = _optional_string(source_unit_start_id)
     resolved_end_id = _optional_string(source_unit_end_id)
@@ -348,12 +410,41 @@ def resolve_source_range(
     )
 
 
+def _resolved_table_range(evidence: TableEvidence, passage_id: str | None) -> ResolvedSourceRange:
+    focus = evidence.focus
+    return ResolvedSourceRange(
+        document_id=focus.document_id,
+        source_unit_start_id=focus.source_unit_start_id,
+        source_unit_end_id=focus.source_unit_end_id,
+        location_type="table_region",
+        location_label=focus.region.label,
+        text=focus.text,
+        passage_id=passage_id,
+        processing_generation_id=focus.processing_generation_id,
+        table_evidence=evidence,
+    )
+
+
 def validate_evidence_quote(resolved: ResolvedSourceRange, quote: str) -> None:
     """Require one quote to occur in its cited canonical source or passage text."""
 
+    if resolved.table_evidence is not None:
+        try:
+            validate_table_quote(resolved.table_evidence, quote)
+        except TableError as exc:
+            raise SourceLocationError(str(exc)) from exc
+        return
     normalized_quote = _normalize_for_match(quote)
     if not normalized_quote or normalized_quote not in _normalize_for_match(resolved.text):
         raise SourceLocationError("Evidence quote was not found in cited source text")
+
+
+def format_inert_tabular_text(value: str) -> str:
+    """Entity-escape source punctuation without normalizing literal cell whitespace."""
+    return "".join(
+        character if character.isalnum() or character == " " else f"&#{ord(character)};"
+        for character in value
+    )
 
 
 def format_inert_markdown_evidence(value: str) -> str:

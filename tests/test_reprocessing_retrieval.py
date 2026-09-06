@@ -427,7 +427,9 @@ def test_reprocess_cli_accepts_batches_without_embedding_configuration(
         document_ids: Sequence[str],
         *,
         pdf_extractor: str | None = None,
+        csv_options: dict[str, object] | None = None,
     ) -> list[Job]:
+        assert csv_options is None
         captured.append((database_path, list(document_ids), pdf_extractor))
         return [
             Job(

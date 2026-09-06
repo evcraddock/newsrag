@@ -311,7 +311,7 @@ def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
 
     with pytest.raises(
         SearchError,
-        match="Unsupported --source-type 'epub'; expected one of: docx, html, markdown, pdf, text",
+        match="Unsupported --source-type 'epub'; expected one of: csv, docx, html, markdown, pdf, text",
     ):
         filters.validate()
 
@@ -324,7 +324,7 @@ def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert (
-        "Unsupported --source-type 'epub'; expected one of: docx, html, markdown, pdf, text"
+        "Unsupported --source-type 'epub'; expected one of: csv, docx, html, markdown, pdf, text"
         in result.stdout
     )
 

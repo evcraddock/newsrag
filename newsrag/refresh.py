@@ -20,6 +20,7 @@ from newsrag.sources import (
     DOCX_MAX_SOURCE_BYTES,
     HTML_MAX_SOURCE_BYTES,
     SOURCE_KIND_URL,
+    SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
@@ -102,7 +103,11 @@ class RefreshPipeline:
                         "document_id": source["document_id"],
                         "user_metadata": json.loads(source["user_metadata_json"] or "{}"),
                         "metadata_origin": source["user_metadata_origin"] or "legacy",
-                        "options": json.loads(source["ingestion_options_json"]),
+                        "options": {
+                            **json.loads(source["ingestion_options_json"]),
+                            **json.loads(source["configuration_json"] or "{}").get("options", {}),
+                        },
+                        "processing_generation_id": source["current_processing_generation_id"],
                         "source_type": source_type_for_media_type(str(source["media_type"])),
                     }
                     _save_payload(connection, job.id, payload)
@@ -123,9 +128,9 @@ class RefreshPipeline:
                         HTML_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() in {".html", ".htm", ".xhtml"}
                         else TEXT_MAX_SOURCE_BYTES
-                        if Path(filename).suffix.lower() in {".txt", ".md"}
+                        if Path(filename).suffix.lower() in {".txt", ".md", ".csv"}
                         or payload["base"].get("source_type")
-                        in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
+                        in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}
                         else DOCX_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() == ".docx"
                         or payload["base"].get("source_type") == SOURCE_TYPE_DOCX
@@ -205,12 +210,20 @@ class RefreshPipeline:
                 fallback_source_type=(
                     payload["base"].get("source_type")
                     if payload["base"].get("source_type")
-                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_DOCX}
+                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_DOCX, SOURCE_TYPE_CSV}
                     else None
                 ),
             )
             media_type = _adapter_input_media_type(selected, candidate["reported_media_type"])
             base = payload["base"]
+            options = dict(base["options"])
+            if selected.source_type == SOURCE_TYPE_CSV:
+                from newsrag.csv_adapter import normalize_csv_options
+
+                options.pop("pdf_extractor", None)
+                options["csv"] = normalize_csv_options(options.get("csv", {}))
+            else:
+                options.pop("csv", None)
             metadata = dict(base["user_metadata"])
             metadata["source_size_bytes"] = int(artifact["byte_size"])
             provenance = json.loads(artifact["provenance_json"])
@@ -258,7 +271,7 @@ class RefreshPipeline:
                     acquired_at=str(artifact["acquired_at"]),
                     work_dir=self.ingestion.storage_paths.ocr_pdfs,
                     metadata=metadata,
-                    adapter_options=base["options"],
+                    adapter_options=options,
                     user_metadata=base["user_metadata"],
                     user_metadata_origin=base["metadata_origin"],
                 ),
@@ -368,10 +381,11 @@ def build_refresh_handler(
 def _source(connection: sqlite3.Connection, source_id: str) -> sqlite3.Row:
     cursor = connection.execute(
         "SELECT s.*, r.document_id, d.user_metadata_json, d.user_metadata_origin, "
-        "d.ingestion_options_json, a.media_type FROM sources s "
+        "d.ingestion_options_json, d.current_processing_generation_id, g.configuration_json, a.media_type FROM sources s "
         "JOIN source_revisions r ON r.id = s.current_revision_id AND r.source_id = s.id "
         "JOIN documents d ON d.id = r.document_id "
         "JOIN source_artifacts a ON a.id = d.artifact_id AND a.source_id = s.id "
+        "LEFT JOIN processing_generations g ON g.id = d.current_processing_generation_id AND g.document_id = d.id "
         "WHERE s.id = ? AND a.state = 'published'",
         (source_id,),
     )

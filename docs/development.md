@@ -125,6 +125,14 @@ make check
 
 `make check` runs formatting checks, linting, type checking, and tests through `uv`.
 
+Run the disposable CSV CLI/daemon smoke workflow with the existing development prerequisites:
+
+```bash
+uv run python scripts/smoke_csv.py
+```
+
+The smoke script starts the daemon via this repository's `make dev` target from a temporary workspace, with its own Procfile, Overmind socket, corpus, explicit configuration, and localhost mock embedding API. It verifies mixed directories/manifests, exact-cell search and packets, duplicates, no-refetch reprocessing, refresh recipe inheritance, and fail-closed inputs. It stops only its own services and removes its temporary files; installed services and corpora are not used.
+
 ## Environment variables
 
 See `.env.example` for development process variables. Installed CLI configuration is YAML at `~/.config/newsrag/config.yaml`; `.env` is not the installed application's configuration file.

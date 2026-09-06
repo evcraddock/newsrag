@@ -8,6 +8,7 @@ Reprocessing rebuilds derived evidence from saved bytes. It is different from `r
 newsrag reprocess <document-id>
 newsrag reprocess <document-id-1> <document-id-2>
 newsrag reprocess <pdf-document-id> --pdf-extractor pdfplumber
+newsrag reprocess <csv-document-id> --csv-header absent --csv-delimiter semicolon
 newsrag jobs list
 newsrag jobs retry <failed-job-id>
 newsrag documents generations <document-id>
@@ -51,8 +52,10 @@ Refresh and reprocessing share the process-held corpus worker lock. Recovery occ
 
 ## Migration and upgrade
 
-Stop all old NewsRAG daemons before upgrading a corpus to schema 7, then restart workers on the same version. Do not mix old and new worker binaries on a corpus.
+Stop all old NewsRAG daemons before upgrading a corpus to schema 8, then restart workers on the same version. Do not mix old and new worker binaries on a corpus.
 
 Migration creates one legacy processing generation per existing published document, preserves original document/source-unit/derived row IDs, text, FTS entries, embedding records, normalized paths, revision history, and staged artifacts, and assigns generation membership. It changes source-unit ordinal uniqueness without renumbering old citations. Unknown legacy processing fingerprints are marked `legacy:unknown`, not fabricated. Migration is idempotent and validates generation ownership.
+
+Schema 8 adds generation-owned tabular descriptors/cells, exact focus/context selectors, and nullable discovery fields without modifying legacy text or inventing table locations. [CSV recipes](csv.md) inherit omitted settings, validate overrides against the whole batch, and retain old selectors. Refresh captures the active generation's requested recipe; each new artifact gets its own validated observed interpretation.
 
 No automatic enrichment, source reassignment, metadata editing, retention/deletion, manual rollback, or automatic reprocessing is added. Use disposable corpora for migration and failure testing before upgrading an installed corpus.

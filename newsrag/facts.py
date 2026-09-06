@@ -19,6 +19,7 @@ from newsrag.source_locations import (
     format_evidence_location,
     resolve_source_range,
 )
+from newsrag.tabular_evidence import TableEvidence
 
 DETERMINISTIC_FACT_EXTRACTOR = "deterministic-civic-facts"
 DETERMINISTIC_FACT_PROVIDER = "rules"
@@ -144,6 +145,7 @@ class FactSource:
     source_unit_start_id: str
     source_unit_end_id: str
     passage_id: str | None = None
+    table_evidence: TableEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +182,32 @@ def extract_facts_from_sources(sources: Sequence[FactSource]) -> list[FactDraft]
     drafts: list[FactDraft] = []
     seen: set[tuple[str, str, str, str]] = set()
     for source in sources:
+        if source.table_evidence is not None:
+            focus = source.table_evidence.focus
+            if any(cell.searchable for cell in focus.cells):
+                drafts.append(
+                    FactDraft(
+                        item_type="table_values",
+                        label=focus.region.label,
+                        value={
+                            "representation": "extractive-table",
+                            "region": focus.region.to_dict(),
+                            "text": focus.text,
+                        },
+                        summary=focus.text,
+                        confidence=1.0,
+                        evidence=DiscoveryEvidenceDraft(
+                            document_id=source.document_id,
+                            source_unit_start_id=focus.source_unit_start_id,
+                            source_unit_end_id=focus.source_unit_end_id,
+                            passage_id=source.passage_id,
+                            quote=focus.text,
+                            validation_status="validated",
+                            table_region=focus.region,
+                        ),
+                    )
+                )
+            continue
         source_text = _normalize_space(source.text)
         if not source_text:
             continue
@@ -295,13 +323,21 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
             raise FactExtractionError(f"Unknown document: {document_id}")
         rows = connection.execute(
             """
-            SELECT id, processing_generation_id
+            SELECT id, processing_generation_id, NULL AS passage_id, ordinal
             FROM source_units
-            WHERE document_id = ?
-                AND processing_generation_id IS ?
+            WHERE document_id = ? AND processing_generation_id IS ? AND location_type != 'table_row'
+            UNION ALL
+            SELECT p.source_unit_start_id AS id, p.processing_generation_id, p.id AS passage_id, p.page_start AS ordinal
+            FROM passages p JOIN table_passages t ON t.passage_id = p.id
+            WHERE p.document_id = ? AND p.processing_generation_id IS ?
             ORDER BY ordinal ASC, id ASC
             """,
-            (document_id, document_row["current_processing_generation_id"]),
+            (
+                document_id,
+                document_row["current_processing_generation_id"],
+                document_id,
+                document_row["current_processing_generation_id"],
+            ),
         ).fetchall()
         sources: list[FactSource] = []
         try:
@@ -312,6 +348,7 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
                     document_id=document_id,
                     source_unit_start_id=source_unit_id,
                     source_unit_end_id=source_unit_id,
+                    passage_id=row["passage_id"],
                     processing_generation_id=(
                         str(row["processing_generation_id"])
                         if row["processing_generation_id"] is not None
@@ -324,6 +361,8 @@ def _load_document_sources(database_path: Path, document_id: str) -> tuple[FactS
                         text=resolved.text,
                         source_unit_start_id=resolved.source_unit_start_id,
                         source_unit_end_id=resolved.source_unit_end_id,
+                        passage_id=resolved.passage_id,
+                        table_evidence=resolved.table_evidence,
                     )
                 )
         except SourceLocationError as exc:

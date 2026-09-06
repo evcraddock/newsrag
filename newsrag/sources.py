@@ -13,11 +13,23 @@ SOURCE_TYPE_HTML = "html"
 SOURCE_TYPE_TEXT = "text"
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_DOCX = "docx"
+SOURCE_TYPE_CSV = "csv"
+CSV_MEDIA_TYPE = "text/csv"
+CSV_MEDIA_ALIASES = ("application/csv",)
+TABLE_ROW_LOCATION_TYPE = "table_row"
+TABLE_REGION_LOCATION_TYPE = "table_region"
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DOCX_MAX_SOURCE_BYTES = 25 * 1024 * 1024
 DOCX_BLOCK_LOCATION_TYPE = "docx_block"
 SUPPORTED_SOURCE_TYPES = frozenset(
-    {SOURCE_TYPE_HTML, SOURCE_TYPE_PDF, SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_DOCX}
+    {
+        SOURCE_TYPE_HTML,
+        SOURCE_TYPE_PDF,
+        SOURCE_TYPE_TEXT,
+        SOURCE_TYPE_MARKDOWN,
+        SOURCE_TYPE_DOCX,
+        SOURCE_TYPE_CSV,
+    }
 )
 MARKDOWN_MEDIA_TYPE = "text/markdown"
 MARKDOWN_BLOCK_LOCATION_TYPE = "markdown_block"
@@ -47,6 +59,8 @@ def source_type_for_media_type(media_type: str | None) -> str | None:
         return SOURCE_TYPE_MARKDOWN
     if normalized_media_type == DOCX_MEDIA_TYPE:
         return SOURCE_TYPE_DOCX
+    if normalized_media_type in (CSV_MEDIA_TYPE, *CSV_MEDIA_ALIASES):
+        return SOURCE_TYPE_CSV
     return None
 
 
@@ -63,6 +77,8 @@ def media_types_for_source_type(source_type: str) -> tuple[str, ...]:
         return (MARKDOWN_MEDIA_TYPE,)
     if source_type == SOURCE_TYPE_DOCX:
         return (DOCX_MEDIA_TYPE,)
+    if source_type == SOURCE_TYPE_CSV:
+        return (CSV_MEDIA_TYPE, *CSV_MEDIA_ALIASES)
     return ()
 
 

@@ -83,13 +83,17 @@ DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
     ("artifact_staging", "artifacts/staging"),
 )
 DATABASE_FILENAME = "newsrag.sqlite3"
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 REQUIRED_TABLES = {
     "sources",
     "source_artifacts",
     "source_revisions",
     "processing_generations",
     "source_units",
+    "source_tables",
+    "table_cells",
+    "table_passages",
+    "table_values_fts",
     "documents",
     "pages",
     "chunks",
@@ -730,9 +734,16 @@ def _initialize_database(database_path: Path) -> tuple[bool, tuple[str, ...]]:
         )
         _backfill_legacy_document_metadata(connection)
         _backfill_source_revisions(connection)
-        if previous_schema_version != SCHEMA_VERSION:
+        if previous_schema_version not in {"7", "8"}:
             _backfill_processing_generations(connection)
         _validate_processing_generation_ownership(connection)
+        from newsrag.tabular import TableError
+        from newsrag.tabular_storage import initialize_tabular_schema
+
+        try:
+            initialize_tabular_schema(connection)
+        except (TableError, ValueError) as exc:
+            raise StorageError(f"Invalid tabular storage ownership: {exc}") from exc
         connection.execute(
             """
             INSERT INTO passages_fts(passage_id, text)

@@ -73,14 +73,19 @@ class PlainTextSourceAdapter:
 
 
 def read_text_lines(
-    path: Path, media_type: str, *, allow_markup: bool = False
+    path: Path,
+    media_type: str,
+    *,
+    allow_markup: bool = False,
+    allow_blank: bool = False,
+    encoding: str | None = None,
 ) -> tuple[list[str], str]:
     """Validate and decode physical lines for literal text or inert Markdown parsing."""
 
     raw = _read_text(path)
     if raw.startswith(_BINARY_SIGNATURES):
         raise AdapterError("Plain-text artifact has a non-text file signature")
-    text, encoding = _decode_text(raw, media_type)
+    text, encoding = _decode_text(raw, media_type, requested_encoding=encoding)
     if len(text) > MAX_TEXT_CHARS:
         raise AdapterError(f"Plain-text artifact exceeds the {MAX_TEXT_CHARS}-character limit")
     if _DOCUMENT_SIGNATURE.match(text.lstrip()) is not None and (
@@ -94,7 +99,7 @@ def read_text_lines(
         ):
             raise AdapterError("Plain-text artifact contains unsupported control characters")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not text.strip():
+    if not allow_blank and not text.strip():
         raise AdapterError("Plain-text artifact contains no non-whitespace text")
     line_count = text.count("\n") + (not text.endswith("\n"))
     if line_count > MAX_TEXT_LINES:
@@ -120,7 +125,9 @@ def _read_text(path: Path) -> bytes:
     return raw
 
 
-def _decode_text(raw: bytes, media_type: str) -> tuple[str, str]:
+def _decode_text(
+    raw: bytes, media_type: str, *, requested_encoding: str | None = None
+) -> tuple[str, str]:
     message = Message()
     message["content-type"] = media_type
     declarations = set()
@@ -155,7 +162,15 @@ def _decode_text(raw: bytes, media_type: str) -> tuple[str, str]:
         and not (bom == declared or declared == "utf-16" and bom.startswith("utf-16-"))
     ):
         raise AdapterError("Plain-text charset conflicts with its byte-order mark")
-    encoding = bom or declared or "utf-8"
+    encoding = bom or declared or requested_encoding or "utf-8"
+    if requested_encoding is not None and not (
+        requested_encoding == encoding
+        or requested_encoding == "utf-16"
+        and encoding.startswith("utf-16-")
+    ):
+        raise AdapterError(
+            "Requested encoding conflicts with the declared charset or byte-order mark"
+        )
     if encoding.startswith("utf-16") and bom is None:
         raise AdapterError("UTF-16 plain-text artifacts require a byte-order mark")
     try:

@@ -6,12 +6,14 @@ from pathlib import Path
 from typing import Protocol
 
 from newsrag.sources import (
+    SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
     TEXT_MEDIA_TYPE,
 )
+from newsrag.tabular import Table
 
 
 class AdapterError(Exception):
@@ -63,6 +65,7 @@ class AdapterResult:
     extractor: ExtractorIdentity
     derived_artifact_path: Path | None = None
     metadata_candidates: dict[str, str] = field(default_factory=dict)
+    tables: tuple[Table, ...] = ()
 
 
 class SourceAdapter(Protocol):
@@ -135,12 +138,12 @@ class SourceAdapterRegistry:
 
         normalized_media_type = (reported_media_type or "").partition(";")[0].strip().lower()
         if (
-            fallback_source_type == SOURCE_TYPE_MARKDOWN
+            fallback_source_type in {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}
             and normalized_media_type == TEXT_MEDIA_TYPE
         ):
             return self.select(
                 artifact_path=artifact_path,
-                source_type_hint=SOURCE_TYPE_MARKDOWN,
+                source_type_hint=fallback_source_type,
                 reported_media_type=reported_media_type,
                 filename=filename,
             )
@@ -238,7 +241,7 @@ def _validate_type_evidence(
         }:
             raise AdapterSelectionError("DOCX selection conflicts with the reported media type")
         return
-    if registration.source_type not in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
+    if registration.source_type not in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}:
         return
     if media_type not in {
         "",
@@ -247,7 +250,11 @@ def _validate_type_evidence(
         "application/octet-stream",
         "binary/octet-stream",
     }:
-        label = "Markdown" if registration.source_type == SOURCE_TYPE_MARKDOWN else "Plain-text"
+        label = {
+            SOURCE_TYPE_MARKDOWN: "Markdown",
+            SOURCE_TYPE_TEXT: "Plain-text",
+            SOURCE_TYPE_CSV: "CSV",
+        }[registration.source_type]
         raise AdapterSelectionError(f"{label} selection conflicts with the reported media type")
 
 

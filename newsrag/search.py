@@ -24,9 +24,12 @@ from newsrag.sources import (
     MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
     SUPPORTED_SOURCE_TYPES,
+    TABLE_ROW_LOCATION_TYPE,
     TEXT_LINE_LOCATION_TYPE,
     source_type_for_media_type,
 )
+from newsrag.tabular import TableError
+from newsrag.tabular_evidence import TableEvidence, load_passage_table_evidence
 from newsrag.vector_tables import (
     add_vector_records,
     delete_vector_records,
@@ -136,6 +139,7 @@ class SearchCandidate:
     revision_number: int | None = None
     is_current_snapshot: bool | None = None
     processing_generation_id: str | None = None
+    keyword_match_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,8 @@ class SearchResult:
     is_current_snapshot: bool | None = None
     processing_generation_id: str | None = None
     location_label: str | None = None
+    table_evidence: TableEvidence | None = None
+    keyword_match_role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -206,6 +212,7 @@ class _EligibleDocumentSnapshot:
 class _CitationDetails:
     heading_path: tuple[str, ...]
     location_label: str
+    table_evidence: TableEvidence | None = None
 
 
 class Reranker(Protocol):
@@ -502,7 +509,11 @@ def search_keyword_candidates(
                 documents.source_path AS source_path,
                 documents.metadata_json AS metadata_json,
                 source_artifacts.media_type AS source_media_type,
-                bm25(passages_fts) AS keyword_score
+                bm25(passages_fts) AS keyword_score,
+                CASE WHEN source_artifacts.media_type = 'text/csv' THEN
+                    CASE WHEN EXISTS(SELECT 1 FROM table_values_fts
+                        WHERE passage_id = passages.id AND table_values_fts MATCH ?)
+                    THEN 'focus' ELSE 'header-context' END ELSE NULL END AS keyword_match_role
             FROM passages_fts
             JOIN passages ON passages.id = passages_fts.passage_id
             JOIN eligible
@@ -514,7 +525,7 @@ def search_keyword_candidates(
             ORDER BY bm25(passages_fts) ASC, passages.id ASC
             LIMIT ?
             """,
-            (*eligible_parameters, fts_query, limit),
+            (*eligible_parameters, f"focus : ({fts_query})", fts_query, limit),
         ).fetchall()
 
     candidates: list[SearchCandidate] = []
@@ -540,6 +551,7 @@ def search_keyword_candidates(
             source_unit_start_id=_optional_string(row["source_unit_start_id"]),
             source_unit_end_id=_optional_string(row["source_unit_end_id"]),
             keyword_score=float(row["keyword_score"]),
+            keyword_match_role=_optional_string(row["keyword_match_role"]),
             processing_generation_id=_optional_string(row["processing_generation_id"]),
         )
         revision = snapshot.revisions_by_document_id[candidate.document_id]
@@ -607,7 +619,13 @@ def merge_search_candidates(
             document_id=context.document_id,
             page_start=context.page_start,
             page_end=context.page_end,
-            text=context.text,
+            text=(
+                source_citation.table_evidence.text
+                if source_citation and source_citation.table_evidence
+                else context.text
+            ),
+            table_evidence=source_citation.table_evidence if source_citation else None,
+            keyword_match_role=context.keyword_match_role,
             citation=format_citation(
                 title=context.title,
                 meeting_date=context.meeting_date,
@@ -739,6 +757,23 @@ def _load_citation_details(
             continue
         start_location = _load_metadata(start_unit["location_json"])
         end_location = _load_metadata(end_unit["location_json"])
+        if start_location_type == TABLE_ROW_LOCATION_TYPE:
+            try:
+                with sqlite3.connect(database_path) as table_connection:
+                    evidence = load_passage_table_evidence(
+                        table_connection,
+                        passage_id=candidate.passage_id,
+                        document_id=candidate.document_id,
+                        generation_id=candidate.processing_generation_id,
+                    )
+            except TableError as exc:
+                raise SearchError(f"Invalid tabular evidence: {exc}") from exc
+            if evidence is None:
+                raise SearchError("Tabular passage is missing its persisted selector")
+            citations[candidate.passage_id] = _CitationDetails(
+                (), evidence.focus.region.label, evidence
+            )
+            continue
         if start_location_type == PAGE_LOCATION_TYPE:
             start_page = start_location.get("page_number")
             if isinstance(start_page, bool) or not isinstance(start_page, int) or start_page < 1:
@@ -832,13 +867,25 @@ def format_search_results(
     if resolved_filters.is_active:
         lines.append(f"filters: {', '.join(resolved_filters.labels())}")
     for result in results:
-        lines.append(result.citation)
+        lines.append(
+            json.dumps(result.citation) if result.table_evidence is not None else result.citation
+        )
         if include_history:
             lines.append(_format_result_revision(result))
         metadata_line = _format_result_metadata(result)
         if metadata_line is not None:
-            lines.append(metadata_line)
-        lines.append(_truncate_text(" ".join(result.text.split()), query=query))
+            lines.append(
+                json.dumps(metadata_line) if result.table_evidence is not None else metadata_line
+            )
+        if result.table_evidence is not None:
+            if result.keyword_match_role:
+                lines.append(f"keyword match: {result.keyword_match_role}")
+            lines.append(result.table_evidence.text)
+            lines.extend(
+                f"context omitted: {reason}" for reason in result.table_evidence.omitted_context
+            )
+        else:
+            lines.append(_truncate_text(" ".join(result.text.split()), query=query))
         lines.append("")
     return "\n".join(lines).rstrip()
 
@@ -1174,6 +1221,7 @@ def _load_passage_context(
             source_unit_start_id=existing.source_unit_start_id,
             source_unit_end_id=existing.source_unit_end_id,
             keyword_score=existing.keyword_score,
+            keyword_match_role=existing.keyword_match_role,
             vector_score=candidate.vector_score,
             source_id=existing.source_id,
             revision_id=existing.revision_id,
@@ -1497,6 +1545,7 @@ def _candidate_with_revision(
         source_unit_start_id=candidate.source_unit_start_id,
         source_unit_end_id=candidate.source_unit_end_id,
         keyword_score=candidate.keyword_score,
+        keyword_match_role=candidate.keyword_match_role,
         vector_score=candidate.vector_score,
         source_id=revision.source_id,
         revision_id=revision.revision_id,

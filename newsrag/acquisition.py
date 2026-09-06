@@ -19,6 +19,8 @@ from typing import Literal, Protocol
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 
 from newsrag.sources import (
+    CSV_MEDIA_ALIASES,
+    CSV_MEDIA_TYPE,
     DOCX_MAX_SOURCE_BYTES,
     DOCX_MEDIA_TYPE,
     HTML_MAX_SOURCE_BYTES,
@@ -896,6 +898,8 @@ def _effective_source_limit(
     if apply_reported_media_limit and normalized_media_type in {
         TEXT_MEDIA_TYPE,
         MARKDOWN_MEDIA_TYPE,
+        CSV_MEDIA_TYPE,
+        *CSV_MEDIA_ALIASES,
     }:
         limits.append(TEXT_MAX_SOURCE_BYTES)
     if apply_reported_media_limit and normalized_media_type == DOCX_MEDIA_TYPE:
@@ -911,7 +915,17 @@ def _reported_media_type(headers: Mapping[str, str]) -> str | None:
     media_type = media_type.strip().lower()
     if not media_type:
         return None
-    if media_type in (*HTML_MEDIA_TYPES, TEXT_MEDIA_TYPE, MARKDOWN_MEDIA_TYPE) and separator:
+    if (
+        media_type
+        in (
+            *HTML_MEDIA_TYPES,
+            TEXT_MEDIA_TYPE,
+            MARKDOWN_MEDIA_TYPE,
+            CSV_MEDIA_TYPE,
+            *CSV_MEDIA_ALIASES,
+        )
+        and separator
+    ):
         return media_type + separator + parameters
     return media_type
 

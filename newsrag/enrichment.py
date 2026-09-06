@@ -18,8 +18,11 @@ from newsrag.source_locations import (
     ResolvedSourceRange,
     SourceLocationError,
     format_evidence_location,
+    format_inert_tabular_text,
     resolve_source_range,
 )
+from newsrag.tabular import TableError, TableRegion
+from newsrag.tabular_evidence import TableEvidence, validate_table_quote
 
 ENRICHMENT_EXTRACTOR = "structured-llm-enrichment"
 SUMMARY_ITEM_TYPE = "summary"
@@ -46,6 +49,7 @@ class EvidenceContext:
     page_end: int | None = None
     page_id: str | None = None
     passage_id: str | None = None
+    table_evidence: TableEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +203,10 @@ def format_enrichment_result(result: EnrichmentResult) -> str:
                 compact_pdf=True,
             )
         lines.append(f"- {item.item_type}: {item.label}{location}")
+    if any(
+        evidence.table_region is not None for item in result.items for evidence in item.evidence
+    ):
+        return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 
 
@@ -238,6 +246,7 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
             FROM source_units
             WHERE document_id = ?
                 AND processing_generation_id IS ?
+                AND location_type != 'table_row'
             ORDER BY ordinal ASC, id ASC
             """,
             (document_id, document_row["current_processing_generation_id"]),
@@ -283,6 +292,20 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
                     ),
                 )
                 contexts.append(_resolved_to_evidence_context(resolved))
+                if resolved.table_evidence is not None:
+                    for item in resolved.table_evidence.context:
+                        selection = item.selection
+                        contexts.append(
+                            EvidenceContext(
+                                document_id=document_id,
+                                source_unit_start_id=selection.source_unit_start_id,
+                                source_unit_end_id=selection.source_unit_end_id,
+                                location_type="table_region",
+                                location_label=f"{item.role}: {selection.region.label}",
+                                text=selection.text,
+                                table_evidence=TableEvidence(selection),
+                            )
+                        )
         except SourceLocationError as exc:
             raise EnrichmentError(str(exc)) from exc
 
@@ -309,6 +332,7 @@ def _resolved_to_evidence_context(resolved: ResolvedSourceRange) -> EvidenceCont
         page_end=resolved.page_end,
         page_id=resolved.page_id,
         passage_id=resolved.passage_id,
+        table_evidence=resolved.table_evidence,
     )
 
 
@@ -333,6 +357,12 @@ def _validate_payload(
     )
     if not summary_evidence:
         raise EnrichmentError("summary_evidence must contain at least one evidence reference")
+    if any(item.table_region is not None for item in summary_evidence) and summary not in {
+        item.quote for item in summary_evidence
+    }:
+        raise EnrichmentError(
+            "Tabular summaries must be an exact extractive representation; inferred arithmetic, units, dates, and row relationships are unsupported"
+        )
 
     notable_actions = tuple(
         _validate_claim(item, request=request, field_name="notable_actions")
@@ -370,6 +400,33 @@ def _validate_claim(
     if not isinstance(evidence_raw, dict):
         raise EnrichmentError(f"{field_name} entry evidence must be an object")
     evidence = _validate_evidence_object(evidence_raw, request=request, field_name=field_name)
+    if evidence.table_region is not None:
+        if summary != evidence.quote:
+            raise EnrichmentError(
+                "Tabular claims must retain exact extractive values; inferred claims are unsupported"
+            )
+        allowed_labels = {evidence.table_region.label, evidence.quote}
+        for context in request.evidence_contexts:
+            if (
+                context.table_evidence is not None
+                and context.table_evidence.focus.region == evidence.table_region
+            ):
+                allowed_labels.update(
+                    str(cell.value)
+                    for cell in context.table_evidence.focus.cells
+                    if cell.searchable
+                )
+                allowed_labels.update(
+                    str(cell.value)
+                    for item in context.table_evidence.context
+                    if item.role == "header"
+                    for cell in item.selection.cells
+                    if cell.searchable
+                )
+        if label not in allowed_labels:
+            raise EnrichmentError(
+                "Tabular claim label must be a coordinate label or an attributed literal value/header"
+            )
     return _ValidatedClaim(label=label, summary=summary, evidence=evidence)
 
 
@@ -387,12 +444,19 @@ def _validate_evidence_object(
     passage_id = _optional_string(value.get("passage_id"))
     if source_unit_start_id is None and passage_id is None:
         raise EnrichmentError(f"{field_name} evidence requires source_unit_start_id or passage_id")
+    try:
+        table_region = (
+            TableRegion.from_dict(value["table_region"]) if "table_region" in value else None
+        )
+    except TableError as exc:
+        raise EnrichmentError(str(exc)) from exc
     context = _find_supporting_context(
         request.evidence_contexts,
         source_unit_start_id=source_unit_start_id,
         source_unit_end_id=source_unit_end_id,
         quote=quote,
         passage_id=passage_id,
+        table_region=table_region,
     )
     if context is None:
         raise EnrichmentError(
@@ -406,6 +470,7 @@ def _validate_evidence_object(
         passage_id=context.passage_id,
         quote=quote,
         validation_status=VALIDATION_STATUS_VALIDATED,
+        table_region=context.table_evidence.focus.region if context.table_evidence else None,
     )
 
 
@@ -416,6 +481,7 @@ def _find_supporting_context(
     source_unit_end_id: str | None,
     quote: str,
     passage_id: str | None,
+    table_region: TableRegion | None = None,
 ) -> EvidenceContext | None:
     normalized_quote = _normalize_for_match(quote)
     for context in contexts:
@@ -427,6 +493,16 @@ def _find_supporting_context(
         ):
             continue
         if source_unit_end_id is not None and context.source_unit_end_id != source_unit_end_id:
+            continue
+        if context.table_evidence is not None:
+            if table_region is not None and table_region != context.table_evidence.focus.region:
+                continue
+            try:
+                validate_table_quote(context.table_evidence, quote)
+            except TableError:
+                continue  # This context does not support the claim; try other exact regions.
+            return context
+        if table_region is not None:
             continue
         if normalized_quote in _normalize_for_match(context.text):
             return context

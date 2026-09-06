@@ -27,7 +27,11 @@ class ReprocessingError(Exception):
 
 
 def enqueue_reprocessing(
-    database_path: Path, document_ids: Sequence[str], *, pdf_extractor: str | None = None
+    database_path: Path,
+    document_ids: Sequence[str],
+    *,
+    pdf_extractor: str | None = None,
+    csv_options: dict[str, object] | None = None,
 ) -> list[Job]:
     """Validate and enqueue an explicit bounded batch atomically, without model access."""
 
@@ -42,6 +46,17 @@ def enqueue_reprocessing(
         "table",
     }:
         raise ReprocessingError("Unknown PDF extractor; use auto, pymupdf, pdfplumber, or table")
+    if csv_options is not None:
+        from newsrag.adapters import AdapterError
+        from newsrag.csv_adapter import normalize_csv_options
+
+        try:
+            normalized_csv = normalize_csv_options(csv_options)
+        except AdapterError as exc:
+            raise ReprocessingError(str(exc)) from exc
+        csv_options = {key: normalized_csv[key] for key in csv_options}
+        if pdf_extractor is not None:
+            raise ReprocessingError("CSV recipe options conflict with PDF options")
     job_ids = []
     with sqlite3.connect(database_path, timeout=30) as connection:
         connection.row_factory = sqlite3.Row
@@ -51,6 +66,11 @@ def enqueue_reprocessing(
             document = _document(connection, document_id)
             if pdf_extractor is not None and document["media_type"] != "application/pdf":
                 raise ReprocessingError("--pdf-extractor applies only to PDF documents")
+            if csv_options is not None and document["media_type"] not in {
+                "text/csv",
+                "application/csv",
+            }:
+                raise ReprocessingError("CSV options apply only to CSV documents")
             existing = connection.execute(
                 "SELECT id, payload_json FROM jobs WHERE kind = ? "
                 "AND status IN ('pending', 'running') "
@@ -58,7 +78,11 @@ def enqueue_reprocessing(
                 (REPROCESS_JOB_KIND, document_id),
             ).fetchone()
             if existing is not None:
-                if json.loads(existing["payload_json"]).get("pdf_extractor") != pdf_extractor:
+                saved_options = json.loads(existing["payload_json"])
+                if (
+                    saved_options.get("pdf_extractor") != pdf_extractor
+                    or saved_options.get("csv") != csv_options
+                ):
                     raise ReprocessingError(
                         f"Document {document_id} already has an active job with different options"
                     )
@@ -69,6 +93,7 @@ def enqueue_reprocessing(
                 "base_generation_id": document["current_processing_generation_id"],
                 "artifact_id": document["artifact_id"],
                 "pdf_extractor": pdf_extractor,
+                "csv": csv_options,
                 "stage": "pending",
             }
             job_id = f"job-{uuid.uuid4().hex[:8]}"
@@ -150,6 +175,12 @@ class ReprocessingPipeline:
                 options["source_media_type"] = input_media_type
                 if payload.get("pdf_extractor") is not None:
                     options["pdf_extractor"] = payload["pdf_extractor"]
+                if payload.get("csv") is not None:
+                    from newsrag.csv_adapter import normalize_csv_options
+
+                    options["csv"] = normalize_csv_options(
+                        {**options.get("csv", {}), **payload["csv"]}
+                    )
                 target = processing_configuration(
                     adapter=selected.adapter,
                     chunker=self.ingestion.processor.chunker,

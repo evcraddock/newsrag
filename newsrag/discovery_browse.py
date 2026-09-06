@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from newsrag.discovery import DiscoveryEvidenceRecord, DiscoveryItemRecord
-from newsrag.source_locations import format_evidence_location
+from newsrag.source_locations import format_evidence_location, format_inert_tabular_text
+from newsrag.tabular import TableRegion
 
 DEFAULT_DISCOVERY_LIST_LIMIT = 50
 MAX_DISCOVERY_LIST_LIMIT = 500
@@ -258,6 +259,13 @@ def format_browse_detail(
     for evidence in record.evidence:
         lines.append(f"  - {_format_evidence_reference(evidence)}")
         lines.append(f'    quote: "{evidence.quote}"')
+        if evidence.table_region is not None:
+            lines.append(
+                "    table selector: " + json.dumps(evidence.table_region.to_dict(), sort_keys=True)
+            )
+            lines.append("    table context: " + json.dumps(evidence.table_context, sort_keys=True))
+    if any(evidence.table_region is not None for evidence in record.evidence):
+        return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 
 
@@ -463,7 +471,9 @@ def _load_evidence_for_rows(
             page_end,
             quote,
             validation_status,
-            created_at
+            created_at,
+            table_region_json,
+            table_context_json
         FROM discovery_evidence
         WHERE item_id IN ({placeholders})
         ORDER BY created_at ASC, id ASC
@@ -528,6 +538,12 @@ def _row_to_evidence(row: sqlite3.Row) -> DiscoveryEvidenceRecord:
         quote=str(row["quote"]),
         validation_status=str(row["validation_status"]),
         created_at=str(row["created_at"]),
+        table_region=TableRegion.from_dict(json.loads(row["table_region_json"]))
+        if row["table_region_json"]
+        else None,
+        table_context=tuple(json.loads(row["table_context_json"]))
+        if row["table_context_json"]
+        else (),
     )
 
 

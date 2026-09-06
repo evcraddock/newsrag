@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from markdown_it import MarkdownIt
 from typer.testing import CliRunner
 
@@ -307,13 +308,15 @@ def test_markdown_cli_help_and_packet_filter(
 
     assert result.exit_code == 0, result.stdout
     assert captured_filters == [SearchFilters(source_type="markdown")]
-    assert "docx, html, markdown, pdf, text" in runner.invoke(app, ["ingest", "--help"]).stdout
-    assert "docx, html, markdown, pdf, or text" in runner.invoke(app, ["search", "--help"]).stdout
-    assert (
-        "docx, html, markdown, pdf, or text"
-        in runner.invoke(app, ["documents", "list", "--help"]).stdout
+    ingest_help = runner.invoke(app, ["ingest", "--help"]).stdout
+    assert "csv, docx, html, markdown, pdf, text" in " ".join(
+        unstyle(ingest_help).replace("│", "").split()
     )
-    assert "docx, html, markdown, pdf, or text" in runner.invoke(app, ["packet", "--help"]).stdout
+    for command in (["search"], ["documents", "list"], ["packet"]):
+        help_text = runner.invoke(app, [*command, "--help"]).stdout
+        assert "csv, docx, html, markdown, pdf, or text" in " ".join(
+            unstyle(help_text).replace("│", "").split()
+        )
 
 
 _UNSAFE_HTML = "<script>alert('x')</script>"

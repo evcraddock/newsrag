@@ -18,6 +18,7 @@ from newsrag.source_locations import (
     SourceLocationError,
     format_evidence_location,
     format_inert_markdown_evidence,
+    format_inert_tabular_text,
     load_document_extent,
 )
 from newsrag.sources import (
@@ -28,6 +29,7 @@ from newsrag.sources import (
     SOURCE_TYPE_MARKDOWN,
     TEXT_LINE_LOCATION_TYPE,
 )
+from newsrag.tabular import TableRegion
 
 BRIEF_EXTRACTOR = "deterministic-document-brief"
 BRIEF_PROVIDER = "rules"
@@ -78,6 +80,8 @@ class BriefEvidenceLine:
     page_start: int | None
     page_end: int | None
     quote: str
+    table_region: TableRegion | None = None
+    table_context: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -196,6 +200,8 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
             f"status: {brief.record.status}",
         ]
     )
+    if document.source_type == "csv":
+        return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 
 
@@ -452,6 +458,8 @@ def _item_to_evidence_line(item: DiscoveryItemRecord) -> BriefEvidenceLine:
         page_start=evidence.page_start,
         page_end=evidence.page_end,
         quote=evidence.quote,
+        table_region=evidence.table_region,
+        table_context=evidence.table_context,
     )
 
 
