@@ -10,10 +10,14 @@ SOURCE_KIND_LOCAL_PATH = "local_path"
 SOURCE_KIND_URL = "url"
 SOURCE_TYPE_PDF = "pdf"
 SOURCE_TYPE_HTML = "html"
-SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF})
+SOURCE_TYPE_TEXT = "text"
+SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF, SOURCE_TYPE_TEXT})
 PDF_MEDIA_TYPE = "application/pdf"
 HTML_MEDIA_TYPES = ("text/html", "application/xhtml+xml")
 HTML_MAX_SOURCE_BYTES = 10 * 1024 * 1024
+TEXT_MEDIA_TYPE = "text/plain"
+TEXT_MAX_SOURCE_BYTES = 10 * 1024 * 1024
+TEXT_LINE_LOCATION_TYPE = "text_line"
 PAGE_LOCATION_TYPE = "page"
 HTML_BLOCK_LOCATION_TYPE = "html_block"
 
@@ -28,6 +32,8 @@ def source_type_for_media_type(media_type: str | None) -> str | None:
         return SOURCE_TYPE_PDF
     if normalized_media_type in HTML_MEDIA_TYPES:
         return SOURCE_TYPE_HTML
+    if normalized_media_type == TEXT_MEDIA_TYPE:
+        return SOURCE_TYPE_TEXT
     return None
 
 
@@ -38,6 +44,8 @@ def media_types_for_source_type(source_type: str) -> tuple[str, ...]:
         return (PDF_MEDIA_TYPE,)
     if source_type == SOURCE_TYPE_HTML:
         return HTML_MEDIA_TYPES
+    if source_type == SOURCE_TYPE_TEXT:
+        return (TEXT_MEDIA_TYPE,)
     return ()
 
 

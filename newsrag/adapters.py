@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from newsrag.sources import SOURCE_TYPE_TEXT, TEXT_MEDIA_TYPE
+
 
 class AdapterError(Exception):
     """Raised when a source adapter cannot validate or extract an artifact."""
@@ -117,6 +119,7 @@ class SourceAdapterRegistry:
             normalized_hint = source_type_hint.strip().lower()
             for registration in self._registrations:
                 if registration.source_type == normalized_hint:
+                    _validate_text_media_evidence(registration, reported_media_type)
                     return registration
             raise AdapterSelectionError(
                 f"Unsupported source type {source_type_hint!r}; expected one of: "
@@ -165,11 +168,23 @@ class SourceAdapterRegistry:
         )
         selected = _one_adapter_match(extension_matches, evidence="filename extension")
         if selected is not None:
+            _validate_text_media_evidence(selected, reported_media_type)
             return selected
 
         raise AdapterSelectionError(
             "Unsupported source type; provide --type with one of: " + ", ".join(self.source_types)
         )
+
+
+def _validate_text_media_evidence(
+    registration: RegisteredSourceAdapter,
+    reported_media_type: str | None,
+) -> None:
+    if registration.source_type != SOURCE_TYPE_TEXT:
+        return
+    media_type = (reported_media_type or "").partition(";")[0].strip().lower()
+    if media_type not in {"", TEXT_MEDIA_TYPE, "application/octet-stream", "binary/octet-stream"}:
+        raise AdapterSelectionError("Plain-text selection conflicts with the reported media type")
 
 
 def _matches_signature(header: bytes, signature: bytes) -> bool:
