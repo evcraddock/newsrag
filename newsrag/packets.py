@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from newsrag.search import SearchFilters, SearchResult
-from newsrag.sources import SOURCE_TYPE_HTML, SOURCE_TYPE_TEXT, source_type_for_media_type
+from newsrag.source_locations import format_inert_markdown_evidence
+from newsrag.sources import (
+    SOURCE_TYPE_HTML,
+    SOURCE_TYPE_MARKDOWN,
+    SOURCE_TYPE_TEXT,
+    source_type_for_media_type,
+)
 
 
 class PacketError(Exception):
@@ -203,11 +209,16 @@ def format_source_packet(
     lines.extend(["## Key Evidence", ""])
     if results:
         for index, result in enumerate(results, start=1):
+            source_type = _result_source_type(result, source_provenance)
+            citation = _format_source_controlled_markdown(result.citation, source_type)
+            evidence_text = _format_source_controlled_markdown(
+                _normalize_text(result.text), source_type
+            )
             lines.extend(
                 [
-                    f"{index}. **{result.citation}**"
+                    f"{index}. **{citation}**"
                     + (_history_label(result) if include_history else ""),
-                    f"   > {_normalize_text(result.text)}",
+                    f"   > {evidence_text}",
                     "",
                 ]
             )
@@ -220,7 +231,12 @@ def format_source_packet(
         for result in sorted(
             dated_results, key=lambda item: (item.meeting_date or "", item.citation)
         ):
-            lines.append(f"- {result.meeting_date} — {result.citation}")
+            source_type = _result_source_type(result, source_provenance)
+            meeting_date = _format_source_controlled_markdown(
+                result.meeting_date or "", source_type
+            )
+            citation = _format_source_controlled_markdown(result.citation, source_type)
+            lines.append(f"- {meeting_date} — {citation}")
     else:
         lines.append("- No dated evidence found.")
     lines.append("")
@@ -269,8 +285,8 @@ def format_source_list_entry(
 
     source_type = provenance.source_type if provenance is not None else result.source_type
     details = []
-    if source_type == SOURCE_TYPE_TEXT:
-        details.append(_format_text_result_location(result))
+    if source_type in {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_TEXT}:
+        details.append(_format_line_result_location(result))
     elif source_type != SOURCE_TYPE_HTML:
         details.append(f"page {result.page_start}")
     for label, value in (
@@ -315,12 +331,30 @@ def format_source_list_entry(
             details.append(f"supplied path: {provenance.submitted_reference}")
         details.append(f"artifact SHA-256: {provenance.artifact_hash}")
 
-    if not details:
-        return result.citation
-    return f"{result.citation} ({'; '.join(details)})"
+    entry = result.citation
+    if details:
+        entry = f"{entry} ({'; '.join(details)})"
+    return _format_source_controlled_markdown(entry, source_type)
 
 
-def _format_text_result_location(result: SearchResult) -> str:
+def _result_source_type(
+    result: SearchResult,
+    source_provenance: Mapping[str, PacketSourceProvenance] | None,
+) -> str | None:
+    if source_provenance is not None:
+        provenance = source_provenance.get(result.document_id)
+        if provenance is not None:
+            return provenance.source_type
+    return result.source_type
+
+
+def _format_source_controlled_markdown(value: str, source_type: str | None) -> str:
+    if source_type == SOURCE_TYPE_MARKDOWN:
+        return format_inert_markdown_evidence(value)
+    return value
+
+
+def _format_line_result_location(result: SearchResult) -> str:
     if result.page_start == result.page_end:
         return f"line {result.page_start}"
     return f"lines {result.page_start}–{result.page_end}"

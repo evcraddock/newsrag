@@ -8,6 +8,7 @@ dependencies = [
     "httpx",
     "lancedb",
     "lxml>=6.1.3",
+    "markdown-it-py>=4.2.0",
     "pdfplumber",
     "pymupdf",
     "pyyaml",

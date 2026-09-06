@@ -51,29 +51,7 @@ class PlainTextSourceAdapter:
     def extract(self, artifact: AdapterInput) -> AdapterResult:
         if artifact.media_type.partition(";")[0].strip().lower() != TEXT_MEDIA_TYPE:
             raise AdapterError("Plain-text adapter requires text/plain media type")
-        raw = _read_text(artifact.artifact_path)
-        if raw.startswith(_BINARY_SIGNATURES):
-            raise AdapterError("Plain-text artifact has a non-text file signature")
-        text, encoding = _decode_text(raw, artifact.media_type)
-        if len(text) > MAX_TEXT_CHARS:
-            raise AdapterError(f"Plain-text artifact exceeds the {MAX_TEXT_CHARS}-character limit")
-        if _DOCUMENT_SIGNATURE.match(text.lstrip()) is not None:
-            raise AdapterError("Plain-text artifact has a contradictory PDF/HTML/XML signature")
-        for character in text:
-            category = unicodedata.category(character)
-            if (category == "Cc" and character not in "\t\r\n") or (
-                category == "Cf" and character not in "\u200c\u200d"
-            ):
-                raise AdapterError("Plain-text artifact contains unsupported control characters")
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
-        if not text.strip():
-            raise AdapterError("Plain-text artifact contains no non-whitespace text")
-        line_count = text.count("\n") + (not text.endswith("\n"))
-        if line_count > MAX_TEXT_LINES:
-            raise AdapterError(f"Plain-text artifact exceeds the {MAX_TEXT_LINES}-line limit")
-        lines = text.split("\n")
-        if text.endswith("\n"):
-            lines.pop()  # A terminator does not add a phantom physical line.
+        lines, encoding = read_text_lines(artifact.artifact_path, artifact.media_type)
         units = tuple(
             CanonicalSourceUnit(
                 ordinal=number,
@@ -92,6 +70,39 @@ class PlainTextSourceAdapter:
             extractor=TEXT_EXTRACTOR,
             metadata_candidates={"text_encoding": encoding},
         )
+
+
+def read_text_lines(
+    path: Path, media_type: str, *, allow_markup: bool = False
+) -> tuple[list[str], str]:
+    """Validate and decode physical lines for literal text or inert Markdown parsing."""
+
+    raw = _read_text(path)
+    if raw.startswith(_BINARY_SIGNATURES):
+        raise AdapterError("Plain-text artifact has a non-text file signature")
+    text, encoding = _decode_text(raw, media_type)
+    if len(text) > MAX_TEXT_CHARS:
+        raise AdapterError(f"Plain-text artifact exceeds the {MAX_TEXT_CHARS}-character limit")
+    if _DOCUMENT_SIGNATURE.match(text.lstrip()) is not None and (
+        not allow_markup or text.lstrip().upper().startswith("%PDF-")
+    ):
+        raise AdapterError("Plain-text artifact has a contradictory PDF/HTML/XML signature")
+    for character in text:
+        category = unicodedata.category(character)
+        if (category == "Cc" and character not in "\t\r\n") or (
+            category == "Cf" and character not in "\u200c\u200d"
+        ):
+            raise AdapterError("Plain-text artifact contains unsupported control characters")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        raise AdapterError("Plain-text artifact contains no non-whitespace text")
+    line_count = text.count("\n") + (not text.endswith("\n"))
+    if line_count > MAX_TEXT_LINES:
+        raise AdapterError(f"Plain-text artifact exceeds the {MAX_TEXT_LINES}-line limit")
+    lines = text.split("\n")
+    if text.endswith("\n"):
+        lines.pop()  # A terminator does not add a phantom physical line.
+    return lines, encoding
 
 
 def _read_text(path: Path) -> bytes:

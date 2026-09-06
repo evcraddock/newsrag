@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 
 from newsrag.sources import (
     HTML_BLOCK_LOCATION_TYPE,
+    MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
     SOURCE_TYPE_HTML,
+    SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
     TEXT_LINE_LOCATION_TYPE,
@@ -76,12 +80,20 @@ def load_document_extent(
     elif source_type == SOURCE_TYPE_TEXT:
         location_type = TEXT_LINE_LOCATION_TYPE
         extent_type = "lines"
+    elif source_type == SOURCE_TYPE_MARKDOWN:
+        location_type = MARKDOWN_BLOCK_LOCATION_TYPE
+        extent_type = "lines"
     else:
         raise SourceLocationError(f"Unsupported source type for document: {document_id}")
 
+    extent_expression = (
+        "COALESCE(MAX(json_extract(location_json, '$.line_end')), 0)"
+        if source_type == SOURCE_TYPE_MARKDOWN
+        else "COUNT(*)"
+    )
     extent_row = connection.execute(
-        """
-        SELECT COUNT(*), COALESCE(SUM(LENGTH(normalized_text)), 0)
+        f"""
+        SELECT {extent_expression}, COALESCE(SUM(LENGTH(normalized_text)), 0)
         FROM source_units
         WHERE document_id = ?
             AND location_type = ?
@@ -192,7 +204,7 @@ def resolve_source_range(
 
     range_rows = connection.execute(
         """
-        SELECT id, location_type, normalized_text
+        SELECT id, location_type, normalized_text, location_json
         FROM source_units
         WHERE document_id = ?
             AND processing_generation_id IS ?
@@ -262,9 +274,19 @@ def resolve_source_range(
         line_end = _text_line_number(end_unit[3])
         if line_end < line_start:
             raise SourceLocationError("Evidence text line range is reversed")
-        location_label = (
-            f"line {line_start}" if line_start == line_end else f"lines {line_start}–{line_end}"
-        )
+        location_label = _line_location_label(line_start, line_end)
+    elif location_type == MARKDOWN_BLOCK_LOCATION_TYPE:
+        line_ranges = [_markdown_line_range(row[3]) for row in range_rows]
+        for previous, current in zip(line_ranges, line_ranges[1:], strict=False):
+            if current[0] != previous[1] + 1:
+                raise SourceLocationError(
+                    "Evidence Markdown source-unit line ranges are not consecutive"
+                )
+        line_start = line_ranges[0][0]
+        line_end = line_ranges[-1][1]
+        structure = _load_json_object(start_unit[4])
+        heading_path = _string_tuple(structure.get("heading_path"))
+        location_label = " — ".join((*heading_path, _line_location_label(line_start, line_end)))
     else:
         raise SourceLocationError(f"Unsupported evidence location type: {location_type}")
 
@@ -289,6 +311,16 @@ def validate_evidence_quote(resolved: ResolvedSourceRange, quote: str) -> None:
     normalized_quote = _normalize_for_match(quote)
     if not normalized_quote or normalized_quote not in _normalize_for_match(resolved.text):
         raise SourceLocationError("Evidence quote was not found in cited source text")
+
+
+def format_inert_markdown_evidence(value: str) -> str:
+    """Format untrusted source evidence as inert Markdown-visible text."""
+
+    normalized = " ".join(value.split())
+    escaped_html = html.escape(normalized, quote=False)
+    escaped_inline = re.sub(r"([\\`*_{}\[\]()!])", r"\\\1", escaped_html)
+    escaped_block = re.sub(r"^(\s*)([>#+\-~])", r"\1\\\2", escaped_inline)
+    return re.sub(r"^(\s*\d+)\.", r"\1\\.", escaped_block)
 
 
 def format_evidence_location(
@@ -324,6 +356,20 @@ def _text_line_number(raw_json: object) -> int:
     if line_start != line_end:
         raise SourceLocationError("Text source units must identify one physical line")
     return line_start
+
+
+def _markdown_line_range(raw_json: object) -> tuple[int, int]:
+    line_start = _positive_location_number(raw_json, "line_start")
+    line_end = _positive_location_number(raw_json, "line_end")
+    if line_end < line_start:
+        raise SourceLocationError("Markdown source-unit line range is reversed")
+    return line_start, line_end
+
+
+def _line_location_label(line_start: int, line_end: int) -> str:
+    if line_start == line_end:
+        return f"line {line_start}"
+    return f"lines {line_start}–{line_end}"
 
 
 def _load_json_object(raw_value: object) -> dict[str, object]:

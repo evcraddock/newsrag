@@ -410,7 +410,7 @@ def test_pipeline_rejects_binary_control_and_decoding_mismatches_without_indexes
     assert _lance_rows(corpus.paths.lancedb, "passage_embeddings") == []
 
 
-def test_recursive_mixed_directory_ingests_text_html_pdf_and_skips_markdown(
+def test_recursive_mixed_directory_ingests_text_html_pdf_and_skips_unsupported_files(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / ".newsrag"
@@ -423,7 +423,7 @@ def test_recursive_mixed_directory_ingests_text_html_pdf_and_skips_markdown(
         encoding="utf-8",
     )
     (nested / "minutes.TXT").write_text("Text transit hearing.", encoding="utf-8")
-    (sources / "README.md").write_text("Markdown must not be ingested.", encoding="utf-8")
+    (sources / "README.unknown").write_text("Unknown types must not be ingested.", encoding="utf-8")
 
     queued = _RUNNER.invoke(app, ["--data-dir", str(data_dir), "ingest", str(sources)])
     corpus = _corpus(data_dir)
@@ -431,7 +431,7 @@ def test_recursive_mixed_directory_ingests_text_html_pdf_and_skips_markdown(
 
     assert queued.exit_code == 0, queued.stdout
     assert "Queued by type: html=1, pdf=1, text=1" in queued.stdout
-    assert "Skipped by type: md=1" in queued.stdout
+    assert "Skipped by type: unknown=1" in queued.stdout
     assert len(completed) == 3
     assert all(job.status == "done" for job in completed)
     assert set(corpus.rows("SELECT media_type FROM source_artifacts")) == {
@@ -454,7 +454,7 @@ def test_manifest_text_type_validation_is_atomic(tmp_path: Path) -> None:
           - source: {text_path.name}
             type: text
           - source: https://example.gov/notes.txt
-            type: markdown
+            type: unsupported
         """.strip(),
         encoding="utf-8",
     )
@@ -466,17 +466,17 @@ def test_manifest_text_type_validation_is_atomic(tmp_path: Path) -> None:
 
     paths = initialize_storage(data_dir)
     assert rejected.exit_code == 1
-    assert "Unsupported source type 'markdown'" in rejected.stdout
+    assert "Unsupported source type 'unsupported'" in rejected.stdout
     assert list_jobs(paths.database) == []
 
 
-def test_markdown_is_not_autoaccepted_but_explicit_text_handles_unknown_extension(
+def test_unknown_extension_is_not_autoaccepted_but_explicit_text_handles_it(
     tmp_path: Path,
 ) -> None:
     corpus = _corpus(tmp_path / ".newsrag")
-    markdown = tmp_path / "notes.md"
-    markdown.write_text("Markdown-looking evidence.", encoding="utf-8")
-    untyped = corpus.ingest(str(markdown))
+    unknown = tmp_path / "notes.unknown"
+    unknown.write_text("Ordinary printable evidence.", encoding="utf-8")
+    untyped = corpus.ingest(str(unknown))
     assert untyped.status == "failed"
     assert "Unsupported source type" in str(untyped.error)
     assert list_documents(corpus.paths.database) == []

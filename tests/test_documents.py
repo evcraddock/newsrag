@@ -337,7 +337,10 @@ def test_documents_list_rejects_unsupported_source_type(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert "Unsupported --source-type 'docx'; expected one of: html, pdf, text" in result.stdout
+    assert (
+        "Unsupported --source-type 'docx'; expected one of: html, markdown, pdf, text"
+        in result.stdout
+    )
 
 
 def test_documents_show_outputs_detail_and_page_count(tmp_path: Path) -> None:
