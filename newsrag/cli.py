@@ -109,7 +109,7 @@ INCLUDE_HISTORY_OPTION = typer.Option(
 )
 
 app = typer.Typer(
-    help="Local-first evidence retrieval for city hall PDFs.",
+    help="Local-first evidence retrieval for city hall source documents.",
     invoke_without_command=True,
     no_args_is_help=True,
 )
@@ -300,7 +300,7 @@ def ingest_command(
     source_type: str | None = typer.Option(
         None,
         "--type",
-        help="Explicit source type hint; currently supported: html, pdf.",
+        help="Explicit source type hint; currently supported: html, pdf, text.",
     ),
     pdf_extractor: str = PDF_EXTRACTOR_OPTION,
 ) -> None:
@@ -393,7 +393,7 @@ def search_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only search documents with this source type: html or pdf.",
+        help="Only search documents with this source type: html, pdf, or text.",
     ),
     since: str | None = typer.Option(
         None,
@@ -554,7 +554,7 @@ def documents_list_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only list documents with this source type: html or pdf.",
+        help="Only list documents with this source type: html, pdf, or text.",
     ),
     since: str | None = typer.Option(
         None,

@@ -311,7 +311,7 @@ def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
 
     with pytest.raises(
         SearchError,
-        match="Unsupported --source-type 'docx'; expected one of: html, pdf",
+        match="Unsupported --source-type 'docx'; expected one of: html, pdf, text",
     ):
         filters.validate()
 
@@ -323,7 +323,7 @@ def test_search_rejects_unsupported_source_type(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert "Unsupported --source-type 'docx'; expected one of: html, pdf" in result.stdout
+    assert "Unsupported --source-type 'docx'; expected one of: html, pdf, text" in result.stdout
 
 
 def test_search_filters_vector_candidates_without_leaking_out_of_filter_results(

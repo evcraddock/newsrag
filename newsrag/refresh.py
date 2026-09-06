@@ -16,7 +16,12 @@ from newsrag.ingest import IngestionPipeline, PreparedSourceArtifact
 from newsrag.ingestion_identity import register_acquired_artifact
 from newsrag.jobs import Job, ensure_refresh_job_index, get_job
 from newsrag.revisions import publish_revision
-from newsrag.sources import HTML_MAX_SOURCE_BYTES, SOURCE_KIND_URL, build_source_identity
+from newsrag.sources import (
+    HTML_MAX_SOURCE_BYTES,
+    SOURCE_KIND_URL,
+    TEXT_MAX_SOURCE_BYTES,
+    build_source_identity,
+)
 from newsrag.storage import initialize_storage
 
 REFRESH_JOB_KIND = "refresh-source"
@@ -111,6 +116,8 @@ class RefreshPipeline:
                     max_bytes=(
                         HTML_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() in {".html", ".htm", ".xhtml"}
+                        else TEXT_MAX_SOURCE_BYTES
+                        if Path(filename).suffix.lower() == ".txt"
                         else None
                     ),
                 )

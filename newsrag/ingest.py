@@ -85,7 +85,10 @@ from newsrag.sources import (
     PDF_MEDIA_TYPE,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_TEXT,
     SUPPORTED_SOURCE_TYPES,
+    TEXT_MAX_SOURCE_BYTES,
+    TEXT_MEDIA_TYPE,
     artifact_id_for_hash,
     build_source_identity,
     normalize_url_reference,
@@ -93,6 +96,7 @@ from newsrag.sources import (
     source_unit_id_for_page,
 )
 from newsrag.storage import StoragePaths, initialize_storage
+from newsrag.text_adapter import PlainTextSourceAdapter
 
 __all__ = [
     "ExtractedPage",
@@ -116,6 +120,7 @@ DEFAULT_CHUNK_OVERLAP_CHARS = 200
 VECTOR_TABLE_NAME = "chunk_embeddings"
 _PDF_EXTENSIONS = (".pdf",)
 _PDF_SIGNATURES = (b"%PDF-",)
+_TEXT_EXTENSIONS = (".txt",)
 _HTML_EXTENSIONS = (".html", ".htm", ".xhtml")
 _HTML_SIGNATURES = (b"<!doctype html", b"<html", b"<?xml")
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
@@ -459,6 +464,13 @@ class SourceProcessingPipeline:
         )
 
         resolved_adapter = adapter or self.adapter
+        artifact = replace(
+            artifact,
+            adapter_options={
+                **artifact.adapter_options,
+                "source_media_type": artifact.media_type,
+            },
+        )
         generation_id = processing_generation_id or f"processing-{uuid.uuid4().hex}"
         configuration = configuration or processing_configuration(
             adapter=resolved_adapter,
@@ -637,6 +649,13 @@ class IngestionPipeline:
                     extensions=_HTML_EXTENSIONS,
                     signatures=_HTML_SIGNATURES,
                     adapter=StaticHtmlSourceAdapter(),
+                ),
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_TEXT,
+                    media_type=TEXT_MEDIA_TYPE,
+                    extensions=_TEXT_EXTENSIONS,
+                    signatures=(),
+                    adapter=PlainTextSourceAdapter(),
                 ),
             )
         )
@@ -1167,6 +1186,8 @@ def _source_type_for_extension(path: Path) -> str | None:
         return SOURCE_TYPE_PDF
     if extension in _HTML_EXTENSIONS:
         return SOURCE_TYPE_HTML
+    if extension in _TEXT_EXTENSIONS:
+        return SOURCE_TYPE_TEXT
     return None
 
 
@@ -1219,7 +1240,11 @@ def _payload_source_type_hint(payload: dict[str, Any]) -> str | None:
 
 def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None:
     source_type = _payload_source_type_hint(payload) or _source_type_for_extension(path)
-    return HTML_MAX_SOURCE_BYTES if source_type == SOURCE_TYPE_HTML else None
+    if source_type == SOURCE_TYPE_HTML:
+        return HTML_MAX_SOURCE_BYTES
+    if source_type == SOURCE_TYPE_TEXT:
+        return TEXT_MAX_SOURCE_BYTES
+    return None
 
 
 def _adapter_input_media_type(

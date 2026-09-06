@@ -86,7 +86,7 @@ def test_ingest_command_enqueues_supported_local_source_jobs(tmp_path: Path) -> 
         encoding="utf-8",
     )
     (source_dir / "alias.pdf").symlink_to(source_dir / "packet-a.pdf")
-    (source_dir / "notes.txt").write_text("ignore me", encoding="utf-8")
+    (source_dir / "notes.txt").write_text("include these notes", encoding="utf-8")
     os.mkfifo(source_dir / "special.pdf")
     external_dir = tmp_path / "external"
     external_dir.mkdir()
@@ -111,10 +111,10 @@ def test_ingest_command_enqueues_supported_local_source_jobs(tmp_path: Path) -> 
     jobs = list_jobs(paths.database)
 
     assert result.exit_code == 0, result.stdout
-    assert "Enqueued 3 ingest job(s)" in result.stdout
-    assert "Queued by type: html=1, pdf=2" in result.stdout
-    assert "Skipped by type: special=1, symlink=2, txt=1" in result.stdout
-    assert len(jobs) == 3
+    assert "Enqueued 4 ingest job(s)" in result.stdout
+    assert "Queued by type: html=1, pdf=2, text=1" in result.stdout
+    assert "Skipped by type: special=1, symlink=2" in result.stdout
+    assert len(jobs) == 4
     assert all(job.kind == INGEST_JOB_KIND for job in jobs)
     assert all(job.payload["metadata"]["body"] == "City Council" for job in jobs)
     assert all(job.payload["metadata"]["document_type"] == "agenda_packet" for job in jobs)

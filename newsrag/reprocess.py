@@ -137,6 +137,17 @@ class ReprocessingPipeline:
                 # Inherit the active generation's options, not the initial run's.
                 old_config = json.loads(document["configuration_json"])
                 options.update(old_config.get("options", {}))
+                reported_type = str(document["reported_media_type"] or "")
+                canonical_type = str(document["media_type"])
+                input_media_type = str(
+                    options.get("source_media_type")
+                    or (
+                        reported_type
+                        if reported_type.partition(";")[0].strip().lower() == canonical_type
+                        else canonical_type
+                    )
+                )
+                options["source_media_type"] = input_media_type
                 if payload.get("pdf_extractor") is not None:
                     options["pdf_extractor"] = payload["pdf_extractor"]
                 target = processing_configuration(
@@ -183,7 +194,7 @@ class ReprocessingPipeline:
                         source_path=Path(document["source_path"] or document["stored_path"]),
                         artifact_path=artifact_path,
                         content_hash=str(document["content_hash"]),
-                        media_type=str(document["media_type"]),
+                        media_type=input_media_type,
                         source_url=document["source_url"],
                         acquired_at=str(document["acquired_at"]),
                         work_dir=self.ingestion.storage_paths.ocr_pdfs,
@@ -239,7 +250,8 @@ def _document(connection: sqlite3.Connection, document_id: str) -> sqlite3.Row:
     row = cursor.execute(
         "SELECT documents.*, source_artifacts.source_id, source_artifacts.media_type, "
         "source_artifacts.stored_path, source_artifacts.content_hash, source_artifacts.byte_size, "
-        "source_artifacts.acquired_at, source_revisions.id AS revision_id, "
+        "source_artifacts.acquired_at, source_artifacts.reported_media_type, "
+        "source_revisions.id AS revision_id, "
         "processing_generations.fingerprint, processing_generations.configuration_json "
         "FROM documents JOIN source_artifacts ON source_artifacts.id = documents.artifact_id "
         "JOIN source_revisions ON source_revisions.document_id = documents.id "

@@ -19,6 +19,7 @@ from newsrag.source_locations import (
     format_evidence_location,
     load_document_extent,
 )
+from newsrag.sources import HTML_BLOCK_LOCATION_TYPE, PAGE_LOCATION_TYPE, TEXT_LINE_LOCATION_TYPE
 
 BRIEF_EXTRACTOR = "deterministic-document-brief"
 BRIEF_PROVIDER = "rules"
@@ -394,12 +395,17 @@ def _labels_by_type(items: tuple[DiscoveryItemRecord, ...]) -> dict[str, tuple[s
 
 
 def _evidence_order(evidence: DiscoveryEvidenceRecord) -> tuple[int, int, str]:
-    if evidence.page_start is not None:
+    if evidence.location_type == PAGE_LOCATION_TYPE and evidence.page_start is not None:
         return (0, evidence.page_start, evidence.source_unit_start_id)
-    block_suffix = evidence.location_label.rpartition("block ")[2]
-    if block_suffix.isdigit():
-        return (1, int(block_suffix), evidence.source_unit_start_id)
-    return (2, 0, evidence.source_unit_start_id)
+    if evidence.location_type == HTML_BLOCK_LOCATION_TYPE:
+        block_suffix = evidence.location_label.rpartition("block ")[2]
+        if block_suffix.isdigit():
+            return (1, int(block_suffix), evidence.source_unit_start_id)
+    if evidence.location_type == TEXT_LINE_LOCATION_TYPE:
+        line_suffix = evidence.location_label.rpartition("line ")[2]
+        if line_suffix.isdigit():
+            return (2, int(line_suffix), evidence.source_unit_start_id)
+    return (3, 0, evidence.source_unit_start_id)
 
 
 def _item_to_evidence_line(item: DiscoveryItemRecord) -> BriefEvidenceLine:
