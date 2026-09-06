@@ -7,14 +7,28 @@ or unsupported workbook structures. It does not implement display formatting.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
+from collections import Counter
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
+from itertools import pairwise
 
 from lxml import etree  # type: ignore[import-untyped]
 
 from newsrag.adapters import AdapterError
 from newsrag.xlsx_package import REL_NS, XLSX_NS
+from newsrag.xlsx_structure_rules import (
+    CHILD_COUNTS,
+    CHILD_ORDER,
+    ENUMERATIONS,
+    HEX_LENGTHS,
+    INTEGER_RANGES,
+    PATTERNS,
+    REQUIRED_ATTRIBUTES,
+    SIMPLE_TYPES,
+)
 
 S = "{" + XLSX_NS + "}"
 R = "{" + REL_NS + "}id"
@@ -226,63 +240,16 @@ _RULES = {
 _TEXT = frozenset(
     "f v t definedName oddHeader oddFooter evenHeader evenFooter firstHeader firstFooter calculatedColumnFormula totalsRowFormula".split()
 )
-_BOOL_VAL = frozenset("b i strike outline shadow condense extend".split())
-_BOOLEAN = frozenset(
-    "syncHorizontal syncVertical transitionEvaluation transitionEntry published filterMode enableFormatConditionsCalculation auto applyStyles summaryBelow summaryRight showOutlineSymbols autoPageBreaks fitToPage windowProtection showFormulas showGridLines showRowColHeaders showZeros rightToLeft tabSelected showRuler defaultGridColor showWhiteSpace customHeight zeroHeight thickTop thickBottom hidden bestFit customWidth phonetic collapsed customFormat thickBot ph aca ca bx sheet objects scenarios formatCells formatColumns formatRows insertColumns insertRows insertHyperlinks deleteColumns deleteRows selectLockedCells sort autoFilter pivotTables selectUnlockedCells hiddenButton showButton blank percent and cellColor columnSort caseSensitive descending horizontalCentered verticalCentered headings gridLines gridLinesSet usePrinterDefaults blackAndWhite draft useFirstPageNumber differentOddEven differentFirst scaleWithDoc alignWithMargins man pt evalError twoDigitTextYear numberStoredAsText formula formulaRange unlockedFormula emptyCellReference listDataValidation calculatedColumn date1904 showBorderUnselectedTables filterPrivacy promptedSolutions showInk backupFile saveExternalLinkValues hidePivotFieldList showPivotChartFilter allowRefreshQuery autoCompressPictures refreshAllConnections lockStructure lockWindows lockRevision minimized showHorizontalScroll showVerticalScroll showSheetTabs autoFilterDateGrouping function vbProcedure xlm publishToServer workbookParameter fullCalcOnLoad iterate fullPrecision calcCompleted calcOnSave concurrentCalc forceFullCalc diagonalUp diagonalDown outline quotePrefix pivotButton applyNumberFormat applyFont applyFill applyBorder applyAlignment applyProtection wrapText shrinkToFit justifyLastLine locked customBuiltin pivot table insertRow insertRowShift totalsRowShown array showFirstColumn showLastColumn showRowStripes showColumnStripes".split()
-)
-_UNSIGNED = frozenset(
-    "indexed theme colorId zoomScale zoomScaleNormal zoomScaleSheetLayoutView zoomScalePageLayoutView workbookViewId activeCellId baseColWidth outlineLevelRow outlineLevelCol min max outlineLevel s cm vm si sb eb fontId spinCount colId year month day hour minute second dxfId iconId count paperSize scale firstPageNumber fitToWidth fitToHeight horizontalDpi verticalDpi copies manualBreakCount id defaultThemeVersion revisionsSpinCount workbookSpinCount windowWidth windowHeight tabRatio firstSheet activeTab sheetId localSheetId functionGroupId calcId iterateCount concurrentManualCount uniqueCount numFmtId fillId borderId xfId textRotation indent readingOrder builtinId iLevel size headerRowCount totalsRowCount headerRowDxfId dataDxfId totalsRowDxfId headerRowBorderDxfId tableBorderDxfId totalsRowBorderDxfId connectionId".split()
-)
-_DECIMAL = frozenset(
-    "tint xSplit ySplit defaultColWidth defaultRowHeight width ht left right top bottom header footer filterVal maxVal iterateDelta degree position".split()
-)
+# Native identity is explicit even where the general XML standard permits defaults.
 _REQUIRED = {
-    "dimension": {"ref"},
-    "sheetView": {"workbookViewId"},
-    "sheetFormatPr": {"defaultRowHeight"},
-    "col": {"min", "max"},
     "row": {"r"},
     "c": {"r"},
-    "mergeCell": {"ref"},
-    "hyperlink": {"ref"},
-    "filterColumn": {"colId"},
     "autoFilter": {"ref"},
-    "sortState": {"ref"},
-    "sortCondition": {"ref"},
     "brk": {"id"},
-    "ignoredError": {"sqref"},
     "tablePart": {R},
-    "sheet": {"name", "sheetId", R},
-    "pageMargins": {"left", "right", "top", "bottom", "header", "footer"},
+    "sheet": {R},
 }
-_ENUMS = {
-    ("sheetView", "view"): {"normal", "pageBreakPreview", "pageLayout"},
-    ("pane", "state"): {"split", "frozen", "frozenSplit"},
-    ("pane", "activePane"): {"bottomRight", "topRight", "bottomLeft", "topLeft"},
-    ("selection", "pane"): {"bottomRight", "topRight", "bottomLeft", "topLeft"},
-    ("pageSetup", "orientation"): {"default", "portrait", "landscape"},
-    ("pageSetup", "pageOrder"): {"downThenOver", "overThenDown"},
-    ("pageSetup", "cellComments"): {"none", "asDisplayed", "atEnd"},
-    ("pageSetup", "errors"): {"displayed", "blank", "dash", "NA"},
-    ("dateGroupItem", "dateTimeGrouping"): {"year", "month", "day", "hour", "minute", "second"},
-    ("sortState", "sortMethod"): {"stroke", "pinYin", "none"},
-    ("sortCondition", "sortBy"): {"value", "cellColor", "fontColor", "icon"},
-    ("customFilter", "operator"): {
-        "equal",
-        "lessThan",
-        "lessThanOrEqual",
-        "notEqual",
-        "greaterThanOrEqual",
-        "greaterThan",
-    },
-    ("workbookView", "visibility"): {"visible", "hidden", "veryHidden"},
-    ("calcPr", "calcMode"): {"manual", "auto", "autoNoTable"},
-    ("calcPr", "refMode"): {"A1", "R1C1"},
-    ("u", "val"): {"single", "double", "singleAccounting", "doubleAccounting", "none"},
-    ("vertAlign", "val"): {"baseline", "superscript", "subscript"},
-    ("scheme", "val"): {"major", "minor", "none"},
-    ("t", SPACE): {"default", "preserve"},
-}
+_IGNORABLE = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable"
 
 
 def validate_structure(
@@ -300,62 +267,18 @@ def validate_structure(
         children, attributes = rule
         actual = set(element.attrib)
         # mc:Ignorable is an inert declaration; actual unknown extensions still fail.
-        actual.discard("{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable")
-        if actual - attributes or not _REQUIRED.get(tag, set()) <= actual:
+        actual.discard(_IGNORABLE)
+        required = set(REQUIRED_ATTRIBUTES.get(tag, ())) | _REQUIRED.get(tag, set())
+        if actual - attributes or not required <= actual:
             raise AdapterError(f"XLSX {tag} has missing or unsupported attributes")
         if tag not in _TEXT and (element.text or "").strip():
             raise AdapterError(f"XLSX {tag} contains unsupported mixed text")
-        for child in element:
-            if child.tag not in {S + name for name in children} or (child.tail or "").strip():
-                raise AdapterError(f"XLSX {tag} contains unsupported nested content")
+        _validate_children(element, tag, children)
         if element.get("count") is not None and tag != "sst":
             if _unsigned(element.get("count"), "count") != len(element):
                 raise AdapterError(f"XLSX {tag} count does not match its children")
-        if tag in {
-            "sheetPr",
-            "sheetView",
-            "sheetFormatPr",
-            "headerFooter",
-            "xf",
-            "dxf",
-            "colors",
-            "gradientFill",
-            "autoFilter",
-        }:
-            repeatable = {"selection", "stop", "filterColumn"}
-            tags = [
-                child.tag for child in element if etree.QName(child).localname not in repeatable
-            ]
-            if len(tags) != len(set(tags)):
-                raise AdapterError(f"XLSX {tag} duplicates singleton metadata")
-        if tag in {"filterColumn", "fill"} and len(element) > 1:
-            raise AdapterError(f"XLSX {tag} has conflicting metadata representations")
-        if tag == "customFilters" and len(element) > 2:
-            raise AdapterError("XLSX customFilters exceeds its two-filter limit")
         for attribute, value in element.attrib.items():
-            if len(value) > 8192:
-                raise AdapterError("XLSX metadata attribute exceeds its character limit")
-            if (
-                attribute in _BOOLEAN
-                or (attribute == "val" and tag in _BOOL_VAL)
-                or (tag == "top10" and attribute == "top")
-            ):
-                if value not in {"0", "1", "false", "true"}:
-                    raise AdapterError(f"XLSX {tag}.{attribute} requires a boolean")
-            elif (
-                attribute in _UNSIGNED
-                or (attribute == "style" and tag == "col")
-                or (attribute == "r" and tag == "row")
-                or (attribute == "val" and tag in {"family", "charset"})
-            ):
-                _unsigned(value, f"{tag}.{attribute}")
-            elif attribute in _DECIMAL or (
-                attribute == "val" and tag in {"sz", "top10", "dynamicFilter"}
-            ):
-                _decimal(value, f"{tag}.{attribute}")
-            elif attribute in {"xWindow", "yWindow", "relativeIndent"}:
-                if re.fullmatch(r"-?[0-9]{1,10}", value) is None:
-                    raise AdapterError(f"XLSX {tag}.{attribute} requires an integer")
+            _validate_attribute(tag, attribute, value)
             if attribute in {"ref", "syncRef"}:
                 bounds(value)
             elif attribute in {"activeCell", "topLeftCell"} or (tag == "c" and attribute == "r"):
@@ -365,11 +288,6 @@ def validate_structure(
                     raise AdapterError("XLSX sqref cannot be empty")
                 for reference in value.split():
                     bounds(reference)
-            allowed_values = _ENUMS.get((tag, attribute))
-            if allowed_values is not None and value not in allowed_values:
-                raise AdapterError(f"XLSX {tag}.{attribute} has an unsupported value")
-            if attribute == "rgb" and re.fullmatch(r"[0-9A-Fa-f]{8}", value) is None:
-                raise AdapterError("XLSX color requires an eight-digit ARGB value")
         if tag == "sheetFormatPr" and element.get("zeroHeight") in {"1", "true"}:
             raise AdapterError(
                 "XLSX default-hidden rows (zeroHeight) are unsupported; explicit hidden rows are supported"
@@ -396,6 +314,76 @@ def validate_structure(
                     and not minimum <= _unsigned(element.get(attribute), attribute) <= maximum
                 ):
                     raise AdapterError(f"XLSX date-group {attribute} is outside its bounds")
+
+
+def _validate_children(element: etree._Element, tag: str, allowed: frozenset[str]) -> None:
+    names = []
+    allowed_tags = {S + name for name in allowed}
+    for child in element:
+        if child.tag not in allowed_tags or (child.tail or "").strip():
+            raise AdapterError(f"XLSX {tag} contains unsupported nested content")
+        names.append(etree.QName(child).localname)
+    counts = Counter(names)
+    for child, (minimum, maximum) in CHILD_COUNTS.get(tag, {}).items():
+        if counts[child] < minimum or (maximum is not None and counts[child] > maximum):
+            raise AdapterError(f"XLSX {tag}.{child} violates required child cardinality")
+    order = CHILD_ORDER.get(tag)
+    if order is not None:
+        positions = [order.index(name) for name in names]
+        if any(left > right for left, right in pairwise(positions)):
+            raise AdapterError(f"XLSX {tag} has invalid child order")
+    if tag in {"filterColumn", "fill"} and len(element) > 1:
+        raise AdapterError(f"XLSX {tag} has conflicting metadata representations")
+
+
+def _validate_attribute(tag: str, attribute: str, value: str) -> None:
+    if len(value) > 8192:
+        raise AdapterError("XLSX metadata attribute exceeds its character limit")
+    key = (tag, attribute)
+    label = {
+        ("c", "t"): "stored cell type",
+        ("f", "t"): "formula type",
+        ("sheet", "state"): "worksheet visibility state",
+    }.get(key, f"{tag}.{attribute}")
+    if attribute in {R, _IGNORABLE}:
+        return
+    if attribute == SPACE:
+        if value not in {"default", "preserve"}:
+            raise AdapterError("XLSX xml:space has an unsupported value")
+        return
+    kind = SIMPLE_TYPES.get(key)
+    if kind == "boolean":
+        if value not in {"0", "1", "false", "true"}:
+            raise AdapterError(f"XLSX {label} requires a boolean")
+    elif kind in {"unsignedInt", "unsignedShort", "unsignedByte"}:
+        number = _unsigned(value, label)
+        maximum = {"unsignedInt": 2**32 - 1, "unsignedShort": 65535, "unsignedByte": 255}[kind]
+        if number > maximum:
+            raise AdapterError(f"XLSX {label} exceeds its integer range")
+    elif kind in {"int", "integer"}:
+        if re.fullmatch(r"-?[0-9]{1,10}", value) is None:
+            raise AdapterError(f"XLSX {label} requires a bounded integer")
+        minimum, maximum = INTEGER_RANGES.get(key, (-(2**31), 2**31 - 1))
+        if not minimum <= int(value) <= maximum:
+            raise AdapterError(f"XLSX {label} exceeds its integer range")
+    elif kind == "double":
+        _decimal(value, label)
+    elif kind == "hexBinary":
+        if re.fullmatch(r"[0-9a-fA-F]{" + str(HEX_LENGTHS[key] * 2) + r"}", value) is None:
+            raise AdapterError(f"XLSX {label} requires fixed-length hexadecimal data")
+    elif kind == "base64Binary":
+        try:
+            base64.b64decode("".join(value.split()), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise AdapterError(f"XLSX {label} requires base64 data") from exc
+    elif kind not in {"string", "token", "ST_Sqref", "ST_CellSpans"}:
+        raise AdapterError(f"XLSX {label} has no supported validation rule")
+    allowed_values = ENUMERATIONS.get(key)
+    if allowed_values is not None and value not in allowed_values:
+        raise AdapterError(f"XLSX {label} has an unsupported value")
+    pattern = PATTERNS.get(key)
+    if pattern is not None and re.fullmatch(pattern, value) is None:
+        raise AdapterError(f"XLSX {label} does not match its required pattern")
 
 
 def _unsigned(value: str | None, label: str) -> int:
