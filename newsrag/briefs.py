@@ -17,9 +17,16 @@ from newsrag.facts import extract_document_facts
 from newsrag.source_locations import (
     SourceLocationError,
     format_evidence_location,
+    format_inert_markdown_evidence,
     load_document_extent,
 )
-from newsrag.sources import HTML_BLOCK_LOCATION_TYPE, PAGE_LOCATION_TYPE, TEXT_LINE_LOCATION_TYPE
+from newsrag.sources import (
+    HTML_BLOCK_LOCATION_TYPE,
+    MARKDOWN_BLOCK_LOCATION_TYPE,
+    PAGE_LOCATION_TYPE,
+    SOURCE_TYPE_MARKDOWN,
+    TEXT_LINE_LOCATION_TYPE,
+)
 
 BRIEF_EXTRACTOR = "deterministic-document-brief"
 BRIEF_PROVIDER = "rules"
@@ -139,20 +146,25 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
 
     document = brief.document
     metadata = document.metadata
+    inert_source_text = document.source_type == SOURCE_TYPE_MARKDOWN
     lines = [
         "NewsRAG Document Brief",
         f"document_id: {document.id}",
-        f"title: {_display_value(document.title)}",
-        f"meeting_date: {_display_value(_metadata_string(metadata, 'meeting_date'))}",
-        f"body: {_display_value(_metadata_string(metadata, 'body'))}",
+        f"title: {_format_brief_text(_display_value(document.title), inert_source_text)}",
+        "meeting_date: "
+        + _format_brief_text(
+            _display_value(_metadata_string(metadata, "meeting_date")), inert_source_text
+        ),
+        "body: "
+        + _format_brief_text(_display_value(_metadata_string(metadata, "body")), inert_source_text),
         f"source_type: {document.source_type}",
         f"{document.extent_type}: {document.extent_count}",
         "",
         "Summary:",
-        brief.record.summary,
+        _format_brief_text(brief.record.summary, inert_source_text),
         "",
         "Significance:",
-        brief.record.significance,
+        _format_brief_text(brief.record.significance, inert_source_text),
         "",
         "Notable Evidence:",
     ]
@@ -164,12 +176,13 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
             page_start=line.page_start,
             page_end=line.page_end,
         )
-        lines.append(f"- {line.item_type}: {line.label} — {location_label} — {line.quote}")
+        evidence_text = f"{line.item_type}: {line.label} — {location_label} — {line.quote}"
+        lines.append(f"- {_format_brief_text(evidence_text, inert_source_text)}")
 
     lines.extend(["", "Open Questions:"])
     if brief.record.open_questions:
         for question in brief.record.open_questions:
-            lines.append(f"- {question}")
+            lines.append(f"- {_format_brief_text(question, inert_source_text)}")
     else:
         lines.append("- none")
 
@@ -401,11 +414,30 @@ def _evidence_order(evidence: DiscoveryEvidenceRecord) -> tuple[int, int, str]:
         block_suffix = evidence.location_label.rpartition("block ")[2]
         if block_suffix.isdigit():
             return (1, int(block_suffix), evidence.source_unit_start_id)
+    if evidence.location_type == MARKDOWN_BLOCK_LOCATION_TYPE:
+        line_start = _line_start_from_location_label(evidence.location_label)
+        if line_start is not None:
+            return (2, line_start, evidence.source_unit_start_id)
     if evidence.location_type == TEXT_LINE_LOCATION_TYPE:
-        line_suffix = evidence.location_label.rpartition("line ")[2]
-        if line_suffix.isdigit():
-            return (2, int(line_suffix), evidence.source_unit_start_id)
-    return (3, 0, evidence.source_unit_start_id)
+        line_start = _line_start_from_location_label(evidence.location_label)
+        if line_start is not None:
+            return (3, line_start, evidence.source_unit_start_id)
+    return (4, 0, evidence.source_unit_start_id)
+
+
+def _format_brief_text(value: str, inert_source_text: bool) -> str:
+    if inert_source_text:
+        return format_inert_markdown_evidence(value)
+    return value
+
+
+def _line_start_from_location_label(location_label: str) -> int | None:
+    for marker in ("lines ", "line "):
+        suffix = location_label.rpartition(marker)[2]
+        start = suffix.partition("–")[0]
+        if start.isdigit():
+            return int(start)
+    return None
 
 
 def _item_to_evidence_line(item: DiscoveryItemRecord) -> BriefEvidenceLine:

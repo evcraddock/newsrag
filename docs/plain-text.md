@@ -55,7 +55,7 @@ For example, `first\r\n\r\nthird\r\n` contains three lines: text at lines 1 and 
 
 The adapter records the actual decoding choice as `text_encoding`. It does not infer a title, meeting date, civic body, or jurisdiction from text contents. Existing explicit user metadata takes precedence. Search, facts, briefs, enrichment, discovery browsing, and packets use typed line locations and retain artifact hashes and source/revision/processing-generation provenance.
 
-Markdown parsing is outside this adapter. `.md` files are not automatically scanned as text. Markdown-like characters inside an accepted plain-text artifact remain literal; headings, lists, links, and code blocks are not interpreted.
+Markdown parsing is handled by the separate [Markdown adapter](markdown.md). `.md` files are scanned as Markdown, not as text. Markdown-like characters inside an accepted plain-text artifact remain literal; headings, lists, links, and code blocks are not interpreted.
 
 ## Lifecycle behavior
 

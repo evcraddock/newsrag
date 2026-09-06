@@ -19,6 +19,7 @@ from newsrag.embeddings import (
 )
 from newsrag.sources import (
     HTML_BLOCK_LOCATION_TYPE,
+    MARKDOWN_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
     SUPPORTED_SOURCE_TYPES,
     TEXT_LINE_LOCATION_TYPE,
@@ -745,12 +746,24 @@ def _load_citation_details(
             end_line = _single_text_line_number(end_location)
             if start_line is None or end_line is None or end_line < start_line:
                 continue
-            location_label = (
-                f"line {start_line}" if start_line == end_line else f"lines {start_line}–{end_line}"
-            )
             citations[candidate.passage_id] = _CitationDetails(
                 heading_path=(),
-                location_label=location_label,
+                location_label=_line_location_label(start_line, end_line),
+            )
+            continue
+        if start_location_type == MARKDOWN_BLOCK_LOCATION_TYPE:
+            start_range = _markdown_line_range(start_location)
+            end_range = _markdown_line_range(end_location)
+            if (
+                start_range is None
+                or end_range is None
+                or end_range[0] < start_range[0]
+                or end_range[1] < start_range[1]
+            ):
+                continue
+            citations[candidate.passage_id] = _CitationDetails(
+                heading_path=_heading_path(start_unit["structure_json"]),
+                location_label=_line_location_label(start_range[0], end_range[1]),
             )
             continue
         if start_location_type != HTML_BLOCK_LOCATION_TYPE:
@@ -766,17 +779,7 @@ def _load_citation_details(
             or end_block < start_block
         ):
             continue
-        structure = _load_metadata(start_unit["structure_json"])
-        raw_heading_path = structure.get("heading_path")
-        heading_path = (
-            tuple(
-                heading.strip()
-                for heading in raw_heading_path
-                if isinstance(heading, str) and heading.strip()
-            )
-            if isinstance(raw_heading_path, list)
-            else ()
-        )
+        heading_path = _heading_path(start_unit["structure_json"])
         location_label = (
             f"block {start_block}"
             if start_block == end_block
@@ -1596,6 +1599,39 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _heading_path(raw_structure: object) -> tuple[str, ...]:
+    structure = _load_metadata(raw_structure)
+    raw_heading_path = structure.get("heading_path")
+    if not isinstance(raw_heading_path, list):
+        return ()
+    return tuple(
+        heading.strip()
+        for heading in raw_heading_path
+        if isinstance(heading, str) and heading.strip()
+    )
+
+
+def _line_location_label(line_start: int, line_end: int) -> str:
+    if line_start == line_end:
+        return f"line {line_start}"
+    return f"lines {line_start}–{line_end}"
+
+
+def _markdown_line_range(location: Mapping[str, object]) -> tuple[int, int] | None:
+    line_start = location.get("line_start")
+    line_end = location.get("line_end")
+    if (
+        isinstance(line_start, bool)
+        or not isinstance(line_start, int)
+        or isinstance(line_end, bool)
+        or not isinstance(line_end, int)
+        or line_start < 1
+        or line_end < line_start
+    ):
+        return None
+    return line_start, line_end
 
 
 def _single_text_line_number(location: Mapping[str, object]) -> int | None:

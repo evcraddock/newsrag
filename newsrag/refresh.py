@@ -12,13 +12,14 @@ from urllib.parse import urlsplit
 
 from newsrag.acquisition import AcquisitionRequest, StagedSourceArtifact, preserve_staged_artifact
 from newsrag.config import EmbeddingConfig
-from newsrag.ingest import IngestionPipeline, PreparedSourceArtifact
+from newsrag.ingest import IngestionPipeline, PreparedSourceArtifact, _adapter_input_media_type
 from newsrag.ingestion_identity import register_acquired_artifact
 from newsrag.jobs import Job, ensure_refresh_job_index, get_job
 from newsrag.revisions import publish_revision
 from newsrag.sources import (
     HTML_MAX_SOURCE_BYTES,
     SOURCE_KIND_URL,
+    SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
     TEXT_MAX_SOURCE_BYTES,
     build_source_identity,
@@ -120,8 +121,9 @@ class RefreshPipeline:
                         HTML_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() in {".html", ".htm", ".xhtml"}
                         else TEXT_MAX_SOURCE_BYTES
-                        if Path(filename).suffix.lower() == ".txt"
-                        or payload["base"].get("source_type") == SOURCE_TYPE_TEXT
+                        if Path(filename).suffix.lower() in {".txt", ".md"}
+                        or payload["base"].get("source_type")
+                        in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
                         else None
                     ),
                 )
@@ -196,17 +198,13 @@ class RefreshPipeline:
                 reported_media_type=candidate["reported_media_type"],
                 filename=_filename(str(source["submitted_reference"])),
                 fallback_source_type=(
-                    SOURCE_TYPE_TEXT
-                    if payload["base"].get("source_type") == SOURCE_TYPE_TEXT
+                    payload["base"].get("source_type")
+                    if payload["base"].get("source_type")
+                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
                     else None
                 ),
             )
-            reported = str(candidate["reported_media_type"] or "")
-            media_type = (
-                reported
-                if reported.partition(";")[0].strip().lower() in selected.accepted_media_types
-                else selected.media_type
-            )
+            media_type = _adapter_input_media_type(selected, candidate["reported_media_type"])
             base = payload["base"]
             metadata = dict(base["user_metadata"])
             metadata["source_size_bytes"] = int(artifact["byte_size"])

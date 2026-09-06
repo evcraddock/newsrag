@@ -55,6 +55,7 @@ from newsrag.ingestion_identity import (
     register_acquired_artifact,
 )
 from newsrag.jobs import Job, create_jobs
+from newsrag.markdown_adapter import MarkdownSourceAdapter
 from newsrag.passages import build_passage_rows
 from newsrag.pdf_adapter import (
     PDF_EXTRACTOR_AUTO,
@@ -81,9 +82,11 @@ from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
     HTML_MAX_SOURCE_BYTES,
     HTML_MEDIA_TYPES,
+    MARKDOWN_MEDIA_TYPE,
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
     SOURCE_TYPE_HTML,
+    SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
     SUPPORTED_SOURCE_TYPES,
@@ -121,6 +124,7 @@ VECTOR_TABLE_NAME = "chunk_embeddings"
 _PDF_EXTENSIONS = (".pdf",)
 _PDF_SIGNATURES = (b"%PDF-",)
 _TEXT_EXTENSIONS = (".txt",)
+_MARKDOWN_EXTENSIONS = (".md",)
 _HTML_EXTENSIONS = (".html", ".htm", ".xhtml")
 _HTML_SIGNATURES = (b"<!doctype html", b"<html", b"<?xml")
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
@@ -657,6 +661,13 @@ class IngestionPipeline:
                     signatures=(),
                     adapter=PlainTextSourceAdapter(),
                 ),
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_MARKDOWN,
+                    media_type=MARKDOWN_MEDIA_TYPE,
+                    extensions=_MARKDOWN_EXTENSIONS,
+                    signatures=(),
+                    adapter=MarkdownSourceAdapter(),
+                ),
             )
         )
         self.processor = SourceProcessingPipeline(
@@ -1188,6 +1199,8 @@ def _source_type_for_extension(path: Path) -> str | None:
         return SOURCE_TYPE_HTML
     if extension in _TEXT_EXTENSIONS:
         return SOURCE_TYPE_TEXT
+    if extension in _MARKDOWN_EXTENSIONS:
+        return SOURCE_TYPE_MARKDOWN
     return None
 
 
@@ -1242,7 +1255,7 @@ def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None
     source_type = _payload_source_type_hint(payload) or _source_type_for_extension(path)
     if source_type == SOURCE_TYPE_HTML:
         return HTML_MAX_SOURCE_BYTES
-    if source_type == SOURCE_TYPE_TEXT:
+    if source_type in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
         return TEXT_MAX_SOURCE_BYTES
     return None
 
@@ -1254,6 +1267,12 @@ def _adapter_input_media_type(
     normalized_reported_type = (reported_media_type or "").partition(";")[0].strip().lower()
     if normalized_reported_type in registration.accepted_media_types:
         return str(reported_media_type)
+    if (
+        registration.source_type == SOURCE_TYPE_MARKDOWN
+        and normalized_reported_type == TEXT_MEDIA_TYPE
+    ):
+        _, separator, parameters = str(reported_media_type).partition(";")
+        return registration.media_type + separator + parameters
     return registration.media_type
 
 

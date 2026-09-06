@@ -21,6 +21,7 @@ from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 from newsrag.sources import (
     HTML_MAX_SOURCE_BYTES,
     HTML_MEDIA_TYPES,
+    MARKDOWN_MEDIA_TYPE,
     TEXT_MAX_SOURCE_BYTES,
     TEXT_MEDIA_TYPE,
     normalize_url_reference,
@@ -890,7 +891,10 @@ def _effective_source_limit(
     normalized_media_type = (reported_media_type or "").partition(";")[0].strip().lower()
     if apply_reported_media_limit and normalized_media_type in HTML_MEDIA_TYPES:
         limits.append(HTML_MAX_SOURCE_BYTES)
-    if apply_reported_media_limit and normalized_media_type == TEXT_MEDIA_TYPE:
+    if apply_reported_media_limit and normalized_media_type in {
+        TEXT_MEDIA_TYPE,
+        MARKDOWN_MEDIA_TYPE,
+    }:
         limits.append(TEXT_MAX_SOURCE_BYTES)
     return min(limits)
 
@@ -903,7 +907,7 @@ def _reported_media_type(headers: Mapping[str, str]) -> str | None:
     media_type = media_type.strip().lower()
     if not media_type:
         return None
-    if media_type in (*HTML_MEDIA_TYPES, TEXT_MEDIA_TYPE) and separator:
+    if media_type in (*HTML_MEDIA_TYPES, TEXT_MEDIA_TYPE, MARKDOWN_MEDIA_TYPE) and separator:
         return media_type + separator + parameters
     return media_type
 

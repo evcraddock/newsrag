@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from newsrag.sources import SOURCE_TYPE_TEXT, TEXT_MEDIA_TYPE
+from newsrag.sources import (
+    SOURCE_TYPE_HTML,
+    SOURCE_TYPE_MARKDOWN,
+    SOURCE_TYPE_TEXT,
+    TEXT_MEDIA_TYPE,
+)
 
 
 class AdapterError(Exception):
@@ -128,6 +133,16 @@ class SourceAdapterRegistry:
             )
 
         normalized_media_type = (reported_media_type or "").partition(";")[0].strip().lower()
+        if (
+            fallback_source_type == SOURCE_TYPE_MARKDOWN
+            and normalized_media_type == TEXT_MEDIA_TYPE
+        ):
+            return self.select(
+                artifact_path=artifact_path,
+                source_type_hint=SOURCE_TYPE_MARKDOWN,
+                reported_media_type=reported_media_type,
+                filename=filename,
+            )
         media_matches = tuple(
             registration
             for registration in self._registrations
@@ -158,8 +173,11 @@ class SourceAdapterRegistry:
             if any(_matches_signature(header, signature) for signature in registration.signatures)
         )
         selected = _one_adapter_match(signature_matches, evidence="content signature")
-        if selected is not None:
-            return selected
+        if selected is not None and not (
+            fallback_source_type == SOURCE_TYPE_MARKDOWN
+            and selected.source_type == SOURCE_TYPE_HTML
+        ):
+            return selected  # HTML is valid literal content in a known Markdown source.
 
         if fallback_source_type is not None:
             return self.select(
@@ -189,11 +207,18 @@ def _validate_text_media_evidence(
     registration: RegisteredSourceAdapter,
     reported_media_type: str | None,
 ) -> None:
-    if registration.source_type != SOURCE_TYPE_TEXT:
+    if registration.source_type not in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
         return
     media_type = (reported_media_type or "").partition(";")[0].strip().lower()
-    if media_type not in {"", TEXT_MEDIA_TYPE, "application/octet-stream", "binary/octet-stream"}:
-        raise AdapterSelectionError("Plain-text selection conflicts with the reported media type")
+    if media_type not in {
+        "",
+        TEXT_MEDIA_TYPE,
+        *registration.accepted_media_types,
+        "application/octet-stream",
+        "binary/octet-stream",
+    }:
+        label = "Markdown" if registration.source_type == SOURCE_TYPE_MARKDOWN else "Plain-text"
+        raise AdapterSelectionError(f"{label} selection conflicts with the reported media type")
 
 
 def _matches_signature(header: bytes, signature: bytes) -> bool:

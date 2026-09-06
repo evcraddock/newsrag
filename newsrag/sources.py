@@ -11,7 +11,12 @@ SOURCE_KIND_URL = "url"
 SOURCE_TYPE_PDF = "pdf"
 SOURCE_TYPE_HTML = "html"
 SOURCE_TYPE_TEXT = "text"
-SUPPORTED_SOURCE_TYPES = frozenset({SOURCE_TYPE_HTML, SOURCE_TYPE_PDF, SOURCE_TYPE_TEXT})
+SOURCE_TYPE_MARKDOWN = "markdown"
+SUPPORTED_SOURCE_TYPES = frozenset(
+    {SOURCE_TYPE_HTML, SOURCE_TYPE_PDF, SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}
+)
+MARKDOWN_MEDIA_TYPE = "text/markdown"
+MARKDOWN_BLOCK_LOCATION_TYPE = "markdown_block"
 PDF_MEDIA_TYPE = "application/pdf"
 HTML_MEDIA_TYPES = ("text/html", "application/xhtml+xml")
 HTML_MAX_SOURCE_BYTES = 10 * 1024 * 1024
@@ -34,6 +39,8 @@ def source_type_for_media_type(media_type: str | None) -> str | None:
         return SOURCE_TYPE_HTML
     if normalized_media_type == TEXT_MEDIA_TYPE:
         return SOURCE_TYPE_TEXT
+    if normalized_media_type == MARKDOWN_MEDIA_TYPE:
+        return SOURCE_TYPE_MARKDOWN
     return None
 
 
@@ -46,6 +53,8 @@ def media_types_for_source_type(source_type: str) -> tuple[str, ...]:
         return HTML_MEDIA_TYPES
     if source_type == SOURCE_TYPE_TEXT:
         return (TEXT_MEDIA_TYPE,)
+    if source_type == SOURCE_TYPE_MARKDOWN:
+        return (MARKDOWN_MEDIA_TYPE,)
     return ()
 
 

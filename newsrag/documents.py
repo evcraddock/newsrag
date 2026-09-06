@@ -9,6 +9,7 @@ from typing import Any
 
 from newsrag.sources import (
     SOURCE_TYPE_HTML,
+    SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
     SUPPORTED_SOURCE_TYPES,
@@ -225,6 +226,14 @@ def list_document_summaries(
                         AND source_units.location_type = 'html_block'
                 ) AS html_block_count,
                 (
+                    SELECT COALESCE(MAX(json_extract(location_json, '$.line_end')), 0)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
+                        AND source_units.location_type = 'markdown_block'
+                ) AS markdown_line_count,
+                (
                     SELECT COUNT(*)
                     FROM source_units
                     WHERE source_units.document_id = documents.id
@@ -290,6 +299,14 @@ def get_document_detail(database_path: Path, document_id: str) -> DocumentDetail
                             IS documents.current_processing_generation_id
                         AND source_units.location_type = 'html_block'
                 ) AS html_block_count,
+                (
+                    SELECT COALESCE(MAX(json_extract(location_json, '$.line_end')), 0)
+                    FROM source_units
+                    WHERE source_units.document_id = documents.id
+                        AND source_units.processing_generation_id
+                            IS documents.current_processing_generation_id
+                        AND source_units.location_type = 'markdown_block'
+                ) AS markdown_line_count,
                 (
                     SELECT COUNT(*)
                     FROM source_units
@@ -724,6 +741,8 @@ def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
         return source_type, "blocks", int(row["html_block_count"])
     if source_type == SOURCE_TYPE_TEXT:
         return source_type, "lines", int(row["source_unit_count"])
+    if source_type == SOURCE_TYPE_MARKDOWN:
+        return source_type, "lines", int(row["markdown_line_count"])
     return media_type or "unknown", "units", int(row["source_unit_count"])
 
 
