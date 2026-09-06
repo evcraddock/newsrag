@@ -10,6 +10,7 @@ from typing import Any
 from newsrag.sources import (
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_TEXT,
     SUPPORTED_SOURCE_TYPES,
     media_types_for_source_type,
     source_type_for_media_type,
@@ -594,7 +595,14 @@ def _build_filter_query(filters: DocumentFilters) -> _QueryParts:
     if source_type is not None:
         media_types = media_types_for_source_type(source_type.lower())
         placeholders = ", ".join("?" for _ in media_types)
-        clauses.append(f"source_artifacts.media_type IN ({placeholders})")
+        clauses.append(
+            "lower(trim(CASE "
+            "WHEN instr(source_artifacts.media_type, ';') > 0 "
+            "THEN substr(source_artifacts.media_type, 1, "
+            "instr(source_artifacts.media_type, ';') - 1) "
+            "ELSE source_artifacts.media_type END)) "
+            f"IN ({placeholders})"
+        )
         parameters.extend(media_types)
 
     source_url = _normalized_optional_string(filters.source_url)
@@ -714,6 +722,8 @@ def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
         return source_type, "pages", int(row["page_count"])
     if source_type == SOURCE_TYPE_HTML:
         return source_type, "blocks", int(row["html_block_count"])
+    if source_type == SOURCE_TYPE_TEXT:
+        return source_type, "lines", int(row["source_unit_count"])
     return media_type or "unknown", "units", int(row["source_unit_count"])
 
 

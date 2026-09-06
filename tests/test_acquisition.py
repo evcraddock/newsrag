@@ -69,6 +69,59 @@ def test_html_acquisition_applies_ten_mib_limit_to_local_and_remote_sources(
     assert response.closed is True
 
 
+def test_plain_text_acquisition_limits_local_input_and_preserves_remote_charset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(acquisition_module, "TEXT_MAX_SOURCE_BYTES", 16)
+    local = tmp_path / "large.txt"
+    local.write_bytes(b"x" * 17)
+    with pytest.raises(AcquisitionError, match="local_size_limit"):
+        SafeSourceArtifactAcquirer().acquire(
+            AcquisitionRequest(kind=SOURCE_KIND_LOCAL_PATH, reference=str(local)),
+            tmp_path / "local-staging",
+        )
+    url = "https://example.gov/text"
+    response = FakeHttpResponse(
+        status_code=200,
+        headers={"content-type": "Text/Plain; charset=windows-1252"},
+        chunks=(b"caf\xe9",),
+    )
+    artifact = SafeSourceArtifactAcquirer(
+        resolver=RecordingResolver(addresses={"example.gov": (PUBLIC_IP,)}),
+        transport=FakeHttpTransport(responses={url: [response]}),
+    ).acquire(AcquisitionRequest(kind=SOURCE_KIND_URL, reference=url), tmp_path / "remote-staging")
+    assert artifact.reported_media_type == "text/plain; charset=windows-1252"
+    assert artifact.staged_path.read_bytes() == b"caf\xe9"
+    assert response.closed
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_plain_text_response_limit_applies_to_streamed_decoded_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compressed: bool,
+) -> None:
+    monkeypatch.setattr(acquisition_module, "TEXT_MAX_SOURCE_BYTES", 128)
+    url = "https://example.gov/text"
+    body = b"x" * 129
+    response = FakeHttpResponse(
+        status_code=200,
+        headers={
+            "content-type": "text/plain; charset=utf-8",
+            **({"content-encoding": "gzip"} if compressed else {}),
+        },
+        chunks=(gzip.compress(body) if compressed else body,),
+    )
+    with pytest.raises(AcquisitionError, match="size_limit"):
+        SafeSourceArtifactAcquirer(
+            resolver=RecordingResolver(addresses={"example.gov": (PUBLIC_IP,)}),
+            transport=FakeHttpTransport(responses={url: [response]}),
+        ).acquire(AcquisitionRequest(kind=SOURCE_KIND_URL, reference=url), tmp_path / "staging")
+    assert response.closed
+    assert list((tmp_path / "staging").iterdir()) == []
+
+
 def test_local_acquisition_stages_exact_bytes_and_provenance(tmp_path: Path) -> None:
     source_path = tmp_path / "packet.pdf"
     content = b"%PDF-1.4\nlocal"

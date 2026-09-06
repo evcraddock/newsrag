@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from newsrag.search import SearchFilters, SearchResult
-from newsrag.sources import SOURCE_TYPE_HTML, source_type_for_media_type
+from newsrag.sources import SOURCE_TYPE_HTML, SOURCE_TYPE_TEXT, source_type_for_media_type
 
 
 class PacketError(Exception):
@@ -269,7 +269,9 @@ def format_source_list_entry(
 
     source_type = provenance.source_type if provenance is not None else result.source_type
     details = []
-    if source_type != SOURCE_TYPE_HTML:
+    if source_type == SOURCE_TYPE_TEXT:
+        details.append(_format_text_result_location(result))
+    elif source_type != SOURCE_TYPE_HTML:
         details.append(f"page {result.page_start}")
     for label, value in (
         ("title", result.title),
@@ -316,6 +318,12 @@ def format_source_list_entry(
     if not details:
         return result.citation
     return f"{result.citation} ({'; '.join(details)})"
+
+
+def _format_text_result_location(result: SearchResult) -> str:
+    if result.page_start == result.page_end:
+        return f"line {result.page_start}"
+    return f"lines {result.page_start}–{result.page_end}"
 
 
 def _history_label(result: SearchResult) -> str:

@@ -43,7 +43,7 @@ NewsRAG is organized around a small set of durable entities rather than a server
 - **Source artifact**: the immutable raw bytes acquired from a source, identified by content hash and retaining media type, byte size, acquisition time, and stored path.
 - **Document**: the searchable representation of one source artifact plus user-supplied civic metadata, such as title, meeting date, body or committee, document type, and jurisdiction.
 - **Normalized PDF artifact**: the OCR-normalized/searchable PDF derived from a raw PDF source artifact and used for text extraction.
-- **Source unit**: one ordered canonical text unit with a typed machine location, human label, normalized text, structure metadata, and extractor identity. PDF pages are represented as page source units; future formats may use blocks, lines, cells, or timestamps.
+- **Source unit**: one ordered canonical text unit with a typed machine location, human label, normalized text, structure metadata, and extractor identity. PDF pages, static HTML blocks, and plain-text lines use typed source units; future formats may use cells or timestamps.
 - **Page**: the PDF-specific compatibility record linked one-to-one to a page source unit. Existing page numbers and page citations remain the source of citation truth for PDFs.
 - **Chunk**: searchable text derived from source units. Chunks retain both the existing PDF page span and a source-unit range for source-neutral retrieval.
 - **Embedding**: a vector representation of a chunk or passage stored in LanceDB, linked back to its source record, source-unit range, and embedding provider/model/version.
@@ -80,9 +80,9 @@ Search, packets, and corpus discovery default to current published documents and
 
 Raw bytes are retained as immutable, content-addressed source artifacts. Acquisition runs in the daemon before format extraction. One acquisition accepts either an explicitly submitted local regular file or a public HTTP(S) URL, stages bytes while hashing, applies the duplicate decision, and durably promotes bytes that must be retained before invoking an adapter.
 
-Remote acquisition resolves and pins a validated public address for each request, revalidates every redirect destination, follows at most five redirects, and applies a 30-second request timeout. URL credentials, localhost, non-public addresses, unsafe redirects, ambient proxy or cookie state, and unsupported content encodings are rejected. HTTP bodies are streamed with separate 250 MiB compressed and decompressed limits, reduced to 10 MiB when an HTML hint, extension, or response media type identifies static HTML. Only the submitted resource and required HTTP redirects are fetched; linked and embedded resources are not retrieved.
+Remote acquisition resolves and pins a validated public address for each request, revalidates every redirect destination, follows at most five redirects, and applies a 30-second request timeout. URL credentials, localhost, non-public addresses, unsafe redirects, ambient proxy or cookie state, and unsupported content encodings are rejected. HTTP bodies are streamed with separate 250 MiB compressed and decompressed limits, reduced to 10 MiB when a supported HTML or plain-text hint, extension, or response media type identifies that format. Only the submitted resource and required HTTP redirects are fetched; linked and embedded resources are not retrieved.
 
-Local acquisition has a 250 MiB limit, reduced to 10 MiB for recognized HTML input, and accepts only regular files. An explicitly submitted symlink is allowed only when its resolved regular-file target remains stable. Directory scans skip symlinks. Device/inode, size, modification time, resolved target, and bytes read are checked around the read so missing, special, changed, or oversized inputs fail without preserving a partial artifact.
+Local acquisition has a 250 MiB limit, reduced to 10 MiB for recognized HTML or plain-text input, and accepts only regular files. An explicitly submitted symlink is allowed only when its resolved regular-file target remains stable. Directory scans skip symlinks. Device/inode, size, modification time, resolved target, and bytes read are checked around the read so missing, special, changed, or oversized inputs fail without preserving a partial artifact.
 
 Acquisition provenance stores submitted and resolved references, redirects, retrieval or file-read timestamps, reported media type, exact byte size and SHA-256, and the durable artifact path. Diagnostics use stage-specific errors and omit URL credentials, query data, response bodies, and ambient secrets.
 
@@ -90,7 +90,7 @@ Each PDF is normalized through OCR, then text is extracted from the normalized P
 
 ## Source adapter contract
 
-A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, metadata candidates, and any derived artifact used for extraction. The adapter registry selects a supported adapter from an optional `--type` hint, reported media type, conservative content signature, and filename extension, in that order. A hint selects an adapter but never bypasses that adapter's validation. PDF and static HTML are currently registered.
+A format adapter receives an `AdapterInput` identifying one immutable raw artifact, its validated media type and content hash, an isolated work directory, and format-specific options. Its `extract` method must validate the artifact and return an `AdapterResult` containing ordered `CanonicalSourceUnit` values, extractor identity, validated media type, metadata candidates, and any derived artifact used for extraction. The adapter registry selects a supported adapter from an optional `--type` hint, reported media type, conservative content signature, and filename extension, in that order. A hint selects an adapter but never bypasses that adapter's validation. PDF, static HTML, and plain text are currently registered.
 
 Each canonical source unit has a contiguous one-based ordinal, typed machine location, human-readable location label, normalized text, structure metadata, and extractor name/version. Adapters do not chunk, embed, index, publish documents, or modify source identity. Those stages belong to the shared ingestion pipeline.
 
@@ -100,9 +100,11 @@ The static HTML adapter accepts `text/html` and `application/xhtml+xml` artifact
 
 Static HTML extraction fails rather than truncating when input exceeds 10 MiB, the parsed tree exceeds 100,000 elements or 256 levels, or retained text exceeds 10 MiB. It also rejects unsupported or conflicting encodings, unsafe external declarations, malformed input, ambiguous content roots, and empty evidentiary output.
 
+The plain-text adapter accepts `text/plain` with explicit, deterministic charset/BOM rules and UTF-8 by default. It rejects unsupported/conflicting encodings, invalid binary/control input, whitespace-only content, more than 10 MiB of bytes or decoded characters, and more than 100,000 lines. One `text_line` unit is retained for each original physical line, including blanks, with typed line-range locations. Actual input media type/charset is pinned in processing options for safe reprocessing. No Markdown structure or civic metadata is inferred. See [Plain-text sources](plain-text.md).
+
 ## Chunking and citations
 
-PDF uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. HTML uses block-first chunking, keeping each source unit tied to its stable block ordinal and heading path. Shared chunks and passages retain authoritative source-unit start/end IDs for either format.
+PDF uses page-first chunking. Each page is stored as canonical extracted text. Short pages may produce one chunk; long pages are split into overlapping passages while preserving page start/end. HTML uses block-first chunking, keeping each source unit tied to its stable block ordinal and heading path. Plain text uses the same non-page chunker, retaining original line numbers through blank lines and same-line splits. Shared chunks and passages retain authoritative source-unit start/end IDs for all formats.
 
 The data model allows further structure-aware chunking without changing the retrieval contract. Optional chunk metadata can include section title, heading path, agenda item, table marker, and bounding box.
 
@@ -132,9 +134,9 @@ The MVP retrieval pipeline uses hybrid search:
 5. A reranker interface exists in the pipeline, but the MVP implementation is a no-op.
 6. Final results are returned as cited passages.
 
-Search filters should use user-supplied civic metadata, including body, document type, meeting date ranges, jurisdiction/source, and source URL where useful. Search spans every indexed source type by default; the optional `--source-type` filter on `newsrag search` and `newsrag documents list` narrows results to `pdf` or `html` while composing with the existing filters.
+Search filters should use user-supplied civic metadata, including body, document type, meeting date ranges, jurisdiction/source, and source URL where useful. Search spans every indexed source type by default; the optional `--source-type` filter on `newsrag search` and `newsrag documents list` narrows results to `pdf`, `html`, or `text` while composing with the existing filters.
 
-Document inventory derives source type from the published artifact and reports typed extents rather than treating every document as paginated: PDFs show page counts and HTML documents show canonical block counts. Search citations likewise resolve persisted typed source-unit locations, preserving PDF page citations and HTML heading/block citations.
+Document inventory derives source type from the published artifact and reports typed extents rather than treating every document as paginated: PDFs show page counts, HTML documents show canonical block counts, and plain text shows original line counts including blanks. Search citations likewise resolve persisted typed source-unit locations, preserving PDF page, HTML heading/block, and plain-text line citations.
 
 ## Embeddings
 
@@ -160,7 +162,7 @@ The daemon uses filesystem notifications through `watchfiles` and an async worke
 
 Discovery evidence uses source-unit start/end IDs as its canonical location for every format. PDF evidence also records derived page IDs and page ranges so existing page-oriented output remains unchanged; HTML evidence records heading/block labels without inventing page values. Optional passage IDs provide narrower quote-validation context. Evidence is persisted only after the cited source-unit range belongs to the document and the quote is found in the canonical source text or cited passage.
 
-Deterministic fact extraction, document briefs, structured enrichment, topics, timelines, and story leads operate over canonical source units. Document profiles store `source_type`, `extent_type`, and `extent_count`; PDF profiles use pages and HTML profiles use blocks. Terminal discovery output formats each typed location as a PDF page citation or HTML heading/block citation.
+Deterministic fact extraction, document briefs, structured enrichment, topics, timelines, and story leads operate over canonical source units. Document profiles store `source_type`, `extent_type`, and `extent_count`; PDF profiles use pages, HTML profiles use blocks, and plain-text profiles use lines. Terminal discovery output formats each typed location as the corresponding page, heading/block, or line citation.
 
 Schema version 5 replaces the previously unused page-only discovery schema. Upgrading from schema versions 1–4 resets only regenerable document profiles, briefs, discovery items/evidence, and their FTS tables rather than converting old derived records. Sources, artifacts, documents, source units, chunks, passages, embeddings, and search indexes are not reset.
 
@@ -188,7 +190,7 @@ Default packet structure:
 ## Source List
 ```
 
-The MVP packet is templated and evidence-based. It quotes retrieved passages without generating new claims and preserves each search result's typed citation, so one packet can contain PDF page evidence and HTML heading/block evidence without inventing HTML pages. Source-list entries retain the existing descriptive metadata and add authoritative provenance from the published source artifact: source type, submitted URL or path, a differing final URL, remote retrieval time, and exact-byte SHA-256. This ties packet evidence to the immutable ingested artifact.
+The MVP packet is templated and evidence-based. It quotes retrieved passages without generating new claims and preserves each search result's typed citation, so one packet can contain PDF page, HTML heading/block, and plain-text line evidence without inventing non-PDF pages. Source-list entries retain the existing descriptive metadata and add authoritative provenance from the published source artifact: source type, submitted URL or path, a differing final URL, remote retrieval time, and exact-byte SHA-256. This ties packet evidence to the immutable ingested artifact.
 
 ## Implementation guidance
 

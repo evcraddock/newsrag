@@ -16,7 +16,14 @@ from newsrag.ingest import IngestionPipeline, PreparedSourceArtifact
 from newsrag.ingestion_identity import register_acquired_artifact
 from newsrag.jobs import Job, ensure_refresh_job_index, get_job
 from newsrag.revisions import publish_revision
-from newsrag.sources import HTML_MAX_SOURCE_BYTES, SOURCE_KIND_URL, build_source_identity
+from newsrag.sources import (
+    HTML_MAX_SOURCE_BYTES,
+    SOURCE_KIND_URL,
+    SOURCE_TYPE_TEXT,
+    TEXT_MAX_SOURCE_BYTES,
+    build_source_identity,
+    source_type_for_media_type,
+)
 from newsrag.storage import initialize_storage
 
 REFRESH_JOB_KIND = "refresh-source"
@@ -93,6 +100,7 @@ class RefreshPipeline:
                         "user_metadata": json.loads(source["user_metadata_json"] or "{}"),
                         "metadata_origin": source["user_metadata_origin"] or "legacy",
                         "options": json.loads(source["ingestion_options_json"]),
+                        "source_type": source_type_for_media_type(str(source["media_type"])),
                     }
                     _save_payload(connection, job.id, payload)
                 _check_generation(connection, source_id, payload["base"])
@@ -111,6 +119,9 @@ class RefreshPipeline:
                     max_bytes=(
                         HTML_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() in {".html", ".htm", ".xhtml"}
+                        else TEXT_MAX_SOURCE_BYTES
+                        if Path(filename).suffix.lower() == ".txt"
+                        or payload["base"].get("source_type") == SOURCE_TYPE_TEXT
                         else None
                     ),
                 )
@@ -184,6 +195,11 @@ class RefreshPipeline:
                 source_type_hint=None,
                 reported_media_type=candidate["reported_media_type"],
                 filename=_filename(str(source["submitted_reference"])),
+                fallback_source_type=(
+                    SOURCE_TYPE_TEXT
+                    if payload["base"].get("source_type") == SOURCE_TYPE_TEXT
+                    else None
+                ),
             )
             reported = str(candidate["reported_media_type"] or "")
             media_type = (
@@ -349,7 +365,7 @@ def build_refresh_handler(
 def _source(connection: sqlite3.Connection, source_id: str) -> sqlite3.Row:
     cursor = connection.execute(
         "SELECT s.*, r.document_id, d.user_metadata_json, d.user_metadata_origin, "
-        "d.ingestion_options_json FROM sources s "
+        "d.ingestion_options_json, a.media_type FROM sources s "
         "JOIN source_revisions r ON r.id = s.current_revision_id AND r.source_id = s.id "
         "JOIN documents d ON d.id = r.document_id "
         "JOIN source_artifacts a ON a.id = d.artifact_id AND a.source_id = s.id "

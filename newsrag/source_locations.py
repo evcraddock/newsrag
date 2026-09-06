@@ -9,6 +9,8 @@ from newsrag.sources import (
     PAGE_LOCATION_TYPE,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_PDF,
+    SOURCE_TYPE_TEXT,
+    TEXT_LINE_LOCATION_TYPE,
     source_type_for_media_type,
 )
 
@@ -71,6 +73,9 @@ def load_document_extent(
     elif source_type == SOURCE_TYPE_HTML:
         location_type = HTML_BLOCK_LOCATION_TYPE
         extent_type = "blocks"
+    elif source_type == SOURCE_TYPE_TEXT:
+        location_type = TEXT_LINE_LOCATION_TYPE
+        extent_type = "lines"
     else:
         raise SourceLocationError(f"Unsupported source type for document: {document_id}")
 
@@ -196,7 +201,10 @@ def resolve_source_range(
         """,
         (document_id, resolved_generation_id, start_ordinal, end_ordinal),
     ).fetchall()
-    if not range_rows or any(str(row[1]) != location_type for row in range_rows):
+    expected_unit_count = end_ordinal - start_ordinal + 1
+    if len(range_rows) != expected_unit_count or any(
+        str(row[1]) != location_type for row in range_rows
+    ):
         raise SourceLocationError("Evidence source-unit range is incomplete")
     range_text = "\n".join(str(row[2]) for row in range_rows)
 
@@ -249,6 +257,14 @@ def resolve_source_range(
             else f"blocks {block_start}–{block_end}"
         )
         location_label = " — ".join((*heading_path, block_label))
+    elif location_type == TEXT_LINE_LOCATION_TYPE:
+        line_start = _text_line_number(start_unit[3])
+        line_end = _text_line_number(end_unit[3])
+        if line_end < line_start:
+            raise SourceLocationError("Evidence text line range is reversed")
+        location_label = (
+            f"line {line_start}" if line_start == line_end else f"lines {line_start}–{line_end}"
+        )
     else:
         raise SourceLocationError(f"Unsupported evidence location type: {location_type}")
 
@@ -300,6 +316,14 @@ def _positive_location_number(raw_json: object, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise SourceLocationError(f"Invalid source-unit {key}")
     return value
+
+
+def _text_line_number(raw_json: object) -> int:
+    line_start = _positive_location_number(raw_json, "line_start")
+    line_end = _positive_location_number(raw_json, "line_end")
+    if line_start != line_end:
+        raise SourceLocationError("Text source units must identify one physical line")
+    return line_start
 
 
 def _load_json_object(raw_value: object) -> dict[str, object]:

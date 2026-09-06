@@ -21,6 +21,7 @@ from newsrag.sources import (
     HTML_BLOCK_LOCATION_TYPE,
     PAGE_LOCATION_TYPE,
     SUPPORTED_SOURCE_TYPES,
+    TEXT_LINE_LOCATION_TYPE,
     source_type_for_media_type,
 )
 from newsrag.vector_tables import (
@@ -691,7 +692,13 @@ def _load_citation_details(
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             f"""
-            SELECT id, location_type, location_json, structure_json
+            SELECT
+                id,
+                document_id,
+                processing_generation_id,
+                location_type,
+                location_json,
+                structure_json
             FROM source_units
             WHERE id IN ({placeholders})
             """,
@@ -707,6 +714,18 @@ def _load_citation_details(
         end_unit = units.get(candidate.source_unit_end_id or candidate.source_unit_start_id)
         if start_unit is None or end_unit is None:
             continue
+        if (
+            str(start_unit["document_id"]) != candidate.document_id
+            or str(end_unit["document_id"]) != candidate.document_id
+        ):
+            continue
+        if candidate.processing_generation_id is not None and (
+            _optional_string(start_unit["processing_generation_id"])
+            != candidate.processing_generation_id
+            or _optional_string(end_unit["processing_generation_id"])
+            != candidate.processing_generation_id
+        ):
+            continue
         start_location_type = str(start_unit["location_type"])
         if start_location_type != str(end_unit["location_type"]):
             continue
@@ -719,6 +738,19 @@ def _load_citation_details(
             citations[candidate.passage_id] = _CitationDetails(
                 heading_path=(),
                 location_label=f"p. {start_page}",
+            )
+            continue
+        if start_location_type == TEXT_LINE_LOCATION_TYPE:
+            start_line = _single_text_line_number(start_location)
+            end_line = _single_text_line_number(end_location)
+            if start_line is None or end_line is None or end_line < start_line:
+                continue
+            location_label = (
+                f"line {start_line}" if start_line == end_line else f"lines {start_line}–{end_line}"
+            )
+            citations[candidate.passage_id] = _CitationDetails(
+                heading_path=(),
+                location_label=location_label,
             )
             continue
         if start_location_type != HTML_BLOCK_LOCATION_TYPE:
@@ -1564,6 +1596,21 @@ def _optional_string(value: object) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _single_text_line_number(location: Mapping[str, object]) -> int | None:
+    line_start = location.get("line_start")
+    line_end = location.get("line_end")
+    if (
+        isinstance(line_start, bool)
+        or not isinstance(line_start, int)
+        or isinstance(line_end, bool)
+        or not isinstance(line_end, int)
+        or line_start < 1
+        or line_start != line_end
+    ):
+        return None
+    return line_start
 
 
 def _required_integer(value: object, field_name: str) -> int:
