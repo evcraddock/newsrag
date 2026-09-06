@@ -4,20 +4,24 @@ import os
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
+from yaml.nodes import MappingNode
 
 from newsrag.acquisition import AcquisitionError, safe_url_reference, validate_url_submission
 from newsrag.adapters import AdapterError
 from newsrag.csv_adapter import normalize_csv_options
 from newsrag.ingest import IngestError, normalize_source_type_hint
 from newsrag.sources import normalize_url_reference
+from newsrag.xlsx_adapter import normalize_xlsx_options
 
 ALLOWED_DOCUMENT_FIELDS = {
     "source",
     "type",
     "csv",
+    "xlsx",
     "title",
     "meeting_date",
     "body",
@@ -35,6 +39,7 @@ class ManifestDocument:
     is_url: bool
     metadata: dict[str, str]
     csv_options: dict[str, object] | None = None
+    xlsx_options: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,16 @@ class ManifestError(IngestError):
     """Raised when a YAML ingest manifest is invalid."""
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    def construct_mapping(self, node: MappingNode, deep: bool = False) -> dict[Any, Any]:
+        mapping = super().construct_mapping(node, deep=deep)
+        if len(mapping) != len(node.value):
+            raise yaml.constructor.ConstructorError(
+                None, None, "Duplicate manifest mapping keys are not allowed", node.start_mark
+            )
+        return mapping
+
+
 def load_manifest(path: Path) -> Manifest:
     """Load and validate one YAML ingest manifest."""
 
@@ -59,7 +74,7 @@ def load_manifest(path: Path) -> Manifest:
 
     raw_content = resolved_path.read_text(encoding="utf-8")
     try:
-        loaded = yaml.safe_load(raw_content)
+        loaded = yaml.load(raw_content, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as exc:
         raise ManifestError(f"Invalid YAML in {resolved_path}: {exc}") from exc
 
@@ -142,6 +157,17 @@ def _validate_document(
         except AdapterError as exc:
             raise ManifestError(f"Manifest document #{index}: {exc}") from exc
         source_type = "csv"
+    xlsx_options: dict[str, object] | None = None
+    if "xlsx" in raw_document:
+        if source_type not in {None, "xlsx"}:
+            raise ManifestError(
+                f"Manifest document #{index}: XLSX options conflict with source type"
+            )
+        try:
+            xlsx_options = normalize_xlsx_options(raw_document["xlsx"])
+        except AdapterError as exc:
+            raise ManifestError(f"Manifest document #{index}: {exc}") from exc
+        source_type = "xlsx"
     metadata: dict[str, str] = {}
     for key in ("title", "body", "document_type", "jurisdiction"):
         value = raw_document.get(key)
@@ -178,6 +204,7 @@ def _validate_document(
         is_url=is_url,
         metadata=metadata,
         csv_options=csv_options,
+        xlsx_options=xlsx_options,
     )
 
 

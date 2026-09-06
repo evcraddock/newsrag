@@ -71,6 +71,29 @@ def test_stripes_do_not_split_cells_or_lose_empty_positions() -> None:
     assert sum(p.focus.cell_count for p in passages) == 130
 
 
+def test_csv_retains_empty_stripes_and_original_neighbor_context() -> None:
+    wide = Table(
+        "sheet-1",
+        1,
+        "csv",
+        1,
+        2,
+        1,
+        65,
+        cells=tuple(
+            Cell(row, column, value="literal" if column == 1 else "")
+            for row in (1, 2)
+            for column in range(1, 66)
+        ),
+    )
+    passages = build_table_passages((wide,))
+    assert len(passages) == 4
+    empty_stripe = passages[1]
+    assert empty_stripe.focus.column_start == 65
+    assert empty_stripe.context[0].role == "following"
+    assert empty_stripe.context[0].text == 'BM2=string:""'
+
+
 def test_context_omitted_whole_with_reason() -> None:
     original = table()
     large = replace(

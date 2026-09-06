@@ -15,6 +15,7 @@ from newsrag.sources import (
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     source_type_for_media_type,
 )
 
@@ -215,9 +216,25 @@ def format_source_packet(
         for index, result in enumerate(results, start=1):
             source_type = _result_source_type(result, source_provenance)
             citation = _format_source_controlled_markdown(result.citation, source_type)
-            if source_type == SOURCE_TYPE_CSV:
+            if source_type in {SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
                 if result.table_evidence is None:
-                    raise PacketError("CSV packet requires a validated typed evidence snapshot")
+                    raise PacketError("Tabular packet requires a validated typed evidence snapshot")
+                focus = result.table_evidence.focus
+                if focus.document_id != result.document_id or (
+                    result.processing_generation_id is not None
+                    and focus.processing_generation_id != result.processing_generation_id
+                ):
+                    raise PacketError(
+                        "Tabular packet snapshot has mismatched document/generation ownership"
+                    )
+                if any(
+                    item.selection.document_id != focus.document_id
+                    or item.selection.processing_generation_id != focus.processing_generation_id
+                    or item.selection.region.table_id != focus.region.table_id
+                    or item.selection.region.sheet_index != focus.region.sheet_index
+                    for item in result.table_evidence.context
+                ):
+                    raise PacketError("Tabular packet context has mismatched ownership")
                 evidence_text = "\n   > ".join(
                     _inert_table_line(line) for line in result.table_evidence.text.splitlines()
                 )
@@ -323,7 +340,7 @@ def format_source_list_entry(
         )
     if source_type in {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_TEXT}:
         details.append(_format_line_result_location(result))
-    elif source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_CSV}:
+    elif source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
         details.append(result.location_label or _format_block_result_location(result))
     elif source_type != SOURCE_TYPE_HTML:
         details.append(f"page {result.page_start}")
@@ -387,7 +404,7 @@ def _result_source_type(
 
 
 def _format_source_controlled_markdown(value: str, source_type: str | None) -> str:
-    if source_type == SOURCE_TYPE_CSV:
+    if source_type in {SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
         return _inert_table_line(value)
     if source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_MARKDOWN}:
         return format_inert_markdown_evidence(value)

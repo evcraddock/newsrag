@@ -17,6 +17,7 @@ from newsrag.sources import (
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     TABLE_ROW_LOCATION_TYPE,
     TEXT_LINE_LOCATION_TYPE,
     source_type_for_media_type,
@@ -120,7 +121,7 @@ def load_document_extent(
     elif source_type == SOURCE_TYPE_DOCX:
         location_type = DOCX_BLOCK_LOCATION_TYPE
         extent_type = "blocks"
-    elif source_type == SOURCE_TYPE_CSV:
+    elif source_type in {SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
         location_type = TABLE_ROW_LOCATION_TYPE
         extent_type = "rows"
     else:
@@ -417,7 +418,7 @@ def _resolved_table_range(evidence: TableEvidence, passage_id: str | None) -> Re
         source_unit_start_id=focus.source_unit_start_id,
         source_unit_end_id=focus.source_unit_end_id,
         location_type="table_region",
-        location_label=focus.region.label,
+        location_label=focus.location_label or focus.region.label,
         text=focus.text,
         passage_id=passage_id,
         processing_generation_id=focus.processing_generation_id,

@@ -771,7 +771,7 @@ def _load_citation_details(
             if evidence is None:
                 raise SearchError("Tabular passage is missing its persisted selector")
             citations[candidate.passage_id] = _CitationDetails(
-                (), evidence.focus.region.label, evidence
+                (), evidence.focus.location_label or evidence.focus.region.label, evidence
             )
             continue
         if start_location_type == PAGE_LOCATION_TYPE:

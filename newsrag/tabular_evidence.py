@@ -7,7 +7,14 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from newsrag.tabular import MAX_ITEM_CELLS, MAX_ITEM_CHARS, TableError, TableRegion
+from newsrag.tabular import (
+    MAX_ITEM_CELLS,
+    MAX_ITEM_CHARS,
+    Table,
+    TableError,
+    TableRegion,
+    context_row_allowed,
+)
 from newsrag.tabular_storage import ResolvedTableRegion, resolve_table_region
 
 
@@ -34,7 +41,7 @@ class TableEvidence:
                 self.focus.text,
                 *self.focus.annotations,
                 *(
-                    f"{item.role} ({item.selection.region.label}):\n{item.selection.text}"
+                    f"{item.role} ({item.selection.location_label or item.selection.region.label}):\n{item.selection.text}"
                     + (
                         "\n" + "\n".join(item.selection.annotations)
                         if item.selection.annotations
@@ -82,7 +89,7 @@ def resolve_contexts(
     if descriptor_row is None:
         raise TableError("Missing focus descriptor")
     descriptor = json.loads(descriptor_row[0])
-    header_row = descriptor.get("header_row")
+    table = Table(**descriptor)
     roles = {"header": 0, "preceding": 1, "following": 2, "merge-anchor": 3}
     previous = -1
     contexts: list[ContextEvidence] = []
@@ -128,7 +135,15 @@ def resolve_contexts(
                     or merge.column_start > focus.region.column_end
                 )
             ]
-            if region.cell_count != 1 or len(matching) != 1 or not selection.cells[0].searchable:
+            if (
+                region.cell_count != 1
+                or len(matching) != 1
+                or not selection.cells[0].searchable
+                or (
+                    focus.region.row_start <= region.row_start <= focus.region.row_end
+                    and focus.region.column_start <= region.column_start <= focus.region.column_end
+                )
+            ):
                 raise TableError(
                     "Merge-anchor context must select the stored anchor of an intersecting persisted merge"
                 )
@@ -142,14 +157,30 @@ def resolve_contexts(
             contexts.append(ContextEvidence(role, selection))
             continue
         expected_row = {
-            "header": header_row,
+            "header": region.row_start,
             "preceding": focus.region.row_start - 1,
             "following": focus.region.row_end + 1,
         }[role]
-        if region.row_start != expected_row or region.row_end != expected_row:
-            raise TableError("Context role does not match its declared header/immediate neighbor")
-        if role != "header" and region.row_start == header_row:
-            raise TableError("A header cannot masquerade as neighbor context")
+        if (
+            region.row_start != expected_row
+            or region.row_end != expected_row
+            or (
+                role == "header"
+                and focus.region.row_start <= region.row_start <= focus.region.row_end
+            )
+            or not context_row_allowed(
+                table, focus.region, region.row_start, header=role == "header"
+            )
+        ):
+            raise TableError(
+                "Context role crosses a native boundary or declared header/immediate neighbor"
+            )
+        if (
+            role != "header"
+            and table.source_type == "xlsx"
+            and not any(cell.searchable for cell in selection.cells)
+        ):
+            raise TableError("Blank/error/unavailable rows cannot supply neighbor context")
         if (region.column_start, region.column_end) != (
             focus.region.column_start,
             focus.region.column_end,

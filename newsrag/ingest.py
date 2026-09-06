@@ -97,9 +97,12 @@ from newsrag.sources import (
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     SUPPORTED_SOURCE_TYPES,
     TEXT_MAX_SOURCE_BYTES,
     TEXT_MEDIA_TYPE,
+    XLSX_MAX_SOURCE_BYTES,
+    XLSX_MEDIA_TYPE,
     artifact_id_for_hash,
     build_source_identity,
     normalize_url_reference,
@@ -115,6 +118,7 @@ from newsrag.tabular_storage import (
     validate_tabular_ownership,
 )
 from newsrag.text_adapter import PlainTextSourceAdapter
+from newsrag.xlsx_adapter import XlsxSourceAdapter, normalize_xlsx_options
 
 __all__ = [
     "ExtractedPage",
@@ -515,7 +519,9 @@ class SourceProcessingPipeline:
             table_passages = (
                 build_table_passages(adapter_result.tables) if adapter_result.tables else ()
             )
-            if table_passages:
+            if adapter_result.tables:
+                if not table_passages:
+                    raise IngestError("Table source has no searchable evidence")
                 row_ordinals = {
                     (
                         str(unit.location["table_id"]),
@@ -731,6 +737,13 @@ class IngestionPipeline:
                     adapter=DocxSourceAdapter(),
                 ),
                 RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_XLSX,
+                    media_type=XLSX_MEDIA_TYPE,
+                    extensions=(".xlsx",),
+                    signatures=(),  # ZIP magic is not workbook evidence.
+                    adapter=XlsxSourceAdapter(),
+                ),
+                RegisteredSourceAdapter(
                     source_type=SOURCE_TYPE_CSV,
                     media_type=CSV_MEDIA_TYPE,
                     media_type_aliases=CSV_MEDIA_ALIASES,
@@ -860,6 +873,8 @@ class IngestionPipeline:
                         adapter_options=(
                             {"csv": normalize_csv_options(job.payload.get("csv", {}))}
                             if selected_adapter.source_type == SOURCE_TYPE_CSV
+                            else {"xlsx": normalize_xlsx_options(job.payload.get("xlsx", {}))}
+                            if selected_adapter.source_type == SOURCE_TYPE_XLSX
                             else {"pdf_extractor": _payload_pdf_extractor_mode(job.payload)}
                         ),
                         user_metadata=metadata,
@@ -928,6 +943,7 @@ def prepare_ingest_source(
     source_type: str | None = None,
     pdf_extractor: str | None = None,
     csv_options: dict[str, object] | None = None,
+    xlsx_options: dict[str, object] | None = None,
     origin: str = "cli",
     base_dir: Path | None = None,
     require_existing: bool = False,
@@ -938,6 +954,18 @@ def prepare_ingest_source(
     if not reference:
         raise IngestError("Source must not be empty")
     normalized_source_type = normalize_source_type_hint(source_type)
+    if xlsx_options is not None:
+        if (
+            normalized_source_type not in {None, SOURCE_TYPE_XLSX}
+            or csv_options is not None
+            or pdf_extractor is not None
+        ):
+            raise IngestError("XLSX options conflict with non-XLSX source type or recipe options")
+        normalized_source_type = SOURCE_TYPE_XLSX
+        try:
+            xlsx_options = normalize_xlsx_options(xlsx_options)
+        except AdapterError as exc:
+            raise IngestError(str(exc)) from exc
     if csv_options is not None:
         if normalized_source_type not in {None, SOURCE_TYPE_CSV} or pdf_extractor is not None:
             raise IngestError("CSV options conflict with non-CSV source type or PDF options")
@@ -954,6 +982,8 @@ def prepare_ingest_source(
         base_payload["source_type"] = normalized_source_type
     if csv_options is not None:
         base_payload["csv"] = csv_options
+    if xlsx_options is not None:
+        base_payload["xlsx"] = xlsx_options
     if pdf_extractor is not None:
         base_payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
 
@@ -963,8 +993,8 @@ def prepare_ingest_source(
     except ValueError as exc:
         raise IngestError("Source URL is malformed") from exc
     selected_recipe_type = normalized_source_type or _source_type_for_extension(Path(parsed.path))
-    if pdf_extractor is not None and selected_recipe_type == SOURCE_TYPE_CSV:
-        raise IngestError("PDF extractor options conflict with CSV ingestion")
+    if pdf_extractor is not None and selected_recipe_type in {SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
+        raise IngestError("PDF extractor options conflict with CSV/XLSX ingestion")
     if parsed.scheme.lower() in {"http", "https"}:
         try:
             submitted_url = validate_url_submission(reference)
@@ -991,8 +1021,10 @@ def prepare_ingest_source(
         raise IngestError(f"Local source path does not exist: {absolute_path}")
 
     if absolute_path.is_dir() and not absolute_path.is_symlink():
-        if csv_options is not None:
-            raise IngestError("CSV recipe flags cannot apply to directory scans; use a manifest")
+        if csv_options is not None or xlsx_options is not None:
+            raise IngestError(
+                "CSV/XLSX recipe flags cannot apply to directory scans; use a manifest"
+            )
         paths, queued_by_type, skipped_by_type = _scan_ingest_directory(
             absolute_path,
             source_type=normalized_source_type,
@@ -1045,6 +1077,7 @@ def enqueue_ingest_source(
     source_type: str | None = None,
     pdf_extractor: str | None = None,
     csv_options: dict[str, object] | None = None,
+    xlsx_options: dict[str, object] | None = None,
 ) -> IngestEnqueueResult:
     """Validate and enqueue one URL, local file, or local directory."""
 
@@ -1054,6 +1087,7 @@ def enqueue_ingest_source(
         source_type=source_type,
         pdf_extractor=pdf_extractor,
         csv_options=csv_options,
+        xlsx_options=xlsx_options,
     )
     return enqueue_prepared_ingest_batches(database_path, (batch,))
 
@@ -1287,6 +1321,8 @@ def _source_type_for_extension(path: Path) -> str | None:
     extension = path.suffix.lower()
     if extension == ".csv":
         return SOURCE_TYPE_CSV
+    if extension == ".xlsx":
+        return SOURCE_TYPE_XLSX
     if extension in _PDF_EXTENSIONS:
         return SOURCE_TYPE_PDF
     if extension in _HTML_EXTENSIONS:
@@ -1355,6 +1391,8 @@ def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None
         return TEXT_MAX_SOURCE_BYTES
     if source_type == SOURCE_TYPE_DOCX:
         return DOCX_MAX_SOURCE_BYTES
+    if source_type == SOURCE_TYPE_XLSX:
+        return XLSX_MAX_SOURCE_BYTES
     return None
 
 

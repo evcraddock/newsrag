@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from newsrag.ingest import IngestionPipeline
 
 from newsrag.jobs import Job, ensure_reprocessing_job_index, get_job
+from newsrag.sources import XLSX_MEDIA_TYPE
 
 REPROCESS_JOB_KIND = "reprocess-document"
 MAX_REPROCESS_DOCUMENTS = 20
@@ -32,6 +33,7 @@ def enqueue_reprocessing(
     *,
     pdf_extractor: str | None = None,
     csv_options: dict[str, object] | None = None,
+    xlsx_options: dict[str, object] | None = None,
 ) -> list[Job]:
     """Validate and enqueue an explicit bounded batch atomically, without model access."""
 
@@ -46,6 +48,17 @@ def enqueue_reprocessing(
         "table",
     }:
         raise ReprocessingError("Unknown PDF extractor; use auto, pymupdf, pdfplumber, or table")
+    if xlsx_options is not None:
+        from newsrag.adapters import AdapterError
+        from newsrag.xlsx_adapter import normalize_xlsx_options
+
+        if csv_options is not None or pdf_extractor is not None:
+            raise ReprocessingError("XLSX recipe options conflict with CSV/PDF options")
+        try:
+            normalized_xlsx = normalize_xlsx_options(xlsx_options)
+        except AdapterError as exc:
+            raise ReprocessingError(str(exc)) from exc
+        xlsx_options = {key: normalized_xlsx[key] for key in xlsx_options}
     if csv_options is not None:
         from newsrag.adapters import AdapterError
         from newsrag.csv_adapter import normalize_csv_options
@@ -71,6 +84,8 @@ def enqueue_reprocessing(
                 "application/csv",
             }:
                 raise ReprocessingError("CSV options apply only to CSV documents")
+            if xlsx_options is not None and document["media_type"] != XLSX_MEDIA_TYPE:
+                raise ReprocessingError("XLSX options apply only to XLSX documents")
             existing = connection.execute(
                 "SELECT id, payload_json FROM jobs WHERE kind = ? "
                 "AND status IN ('pending', 'running') "
@@ -82,6 +97,7 @@ def enqueue_reprocessing(
                 if (
                     saved_options.get("pdf_extractor") != pdf_extractor
                     or saved_options.get("csv") != csv_options
+                    or saved_options.get("xlsx") != xlsx_options
                 ):
                     raise ReprocessingError(
                         f"Document {document_id} already has an active job with different options"
@@ -94,6 +110,7 @@ def enqueue_reprocessing(
                 "artifact_id": document["artifact_id"],
                 "pdf_extractor": pdf_extractor,
                 "csv": csv_options,
+                "xlsx": xlsx_options,
                 "stage": "pending",
             }
             job_id = f"job-{uuid.uuid4().hex[:8]}"
@@ -180,6 +197,12 @@ class ReprocessingPipeline:
 
                     options["csv"] = normalize_csv_options(
                         {**options.get("csv", {}), **payload["csv"]}
+                    )
+                if payload.get("xlsx") is not None:
+                    from newsrag.xlsx_adapter import normalize_xlsx_options
+
+                    options["xlsx"] = normalize_xlsx_options(
+                        {**options.get("xlsx", {}), **payload["xlsx"]}
                     )
                 target = processing_configuration(
                     adapter=selected.adapter,

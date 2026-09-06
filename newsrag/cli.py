@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -277,6 +278,7 @@ def daemon_run(
         raise typer.Exit(code=1) from exc
 
 
+@app.command("ingest-url", hidden=True)
 @app.command("ingest")
 def ingest_command(
     ctx: typer.Context,
@@ -300,7 +302,7 @@ def ingest_command(
     source_type: str | None = typer.Option(
         None,
         "--type",
-        help="Explicit source type hint; currently supported: csv, docx, html, markdown, pdf, text.",
+        help="Explicit source type hint; currently supported: csv, docx, html, markdown, pdf, text, xlsx.",
     ),
     pdf_extractor: str | None = PDF_EXTRACTOR_OPTION,
     csv_delimiter: str | None = typer.Option(
@@ -309,6 +311,9 @@ def ingest_command(
     csv_header: str | None = typer.Option(None, help="CSV header: present or absent."),
     csv_encoding: str | None = typer.Option(
         None, help="CSV encoding: auto or a supported strict charset."
+    ),
+    xlsx_header_rows: str | None = typer.Option(
+        None, help="XLSX JSON object mapping exact sheet names to positive header row numbers."
     ),
 ) -> None:
     """Enqueue one URL, local file, or local directory for ingestion."""
@@ -334,6 +339,7 @@ def ingest_command(
             source_type=source_type,
             pdf_extractor=pdf_extractor,
             csv_options=_csv_recipe_flags(csv_delimiter, csv_header, csv_encoding),
+            xlsx_options=_xlsx_recipe_flags(xlsx_header_rows),
         )
     except IngestError as exc:
         typer.echo(str(exc))
@@ -366,6 +372,7 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
                 metadata=document.metadata,
                 source_type=document.source_type,
                 csv_options=document.csv_options,
+                xlsx_options=document.xlsx_options,
                 origin="manifest",
                 base_dir=manifest_directory,
                 require_existing=not document.is_url,
@@ -402,7 +409,7 @@ def search_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only search documents with this source type: csv, docx, html, markdown, pdf, or text.",
+        help="Only search documents with this source type: csv, docx, html, markdown, pdf, text, or xlsx.",
     ),
     since: str | None = typer.Option(
         None,
@@ -483,7 +490,7 @@ def packet_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only search documents with this source type: csv, docx, html, markdown, pdf, or text.",
+        help="Only search documents with this source type: csv, docx, html, markdown, pdf, text, or xlsx.",
     ),
     since: str | None = typer.Option(
         None,
@@ -568,7 +575,7 @@ def documents_list_command(
     source_type: str | None = typer.Option(
         None,
         "--source-type",
-        help="Only list documents with this source type: csv, docx, html, markdown, pdf, or text.",
+        help="Only list documents with this source type: csv, docx, html, markdown, pdf, text, or xlsx.",
     ),
     since: str | None = typer.Option(
         None,
@@ -710,6 +717,25 @@ def _csv_recipe_flags(
     return values or None
 
 
+def _xlsx_recipe_flags(header_rows: str | None) -> dict[str, object] | None:
+    if header_rows is None:
+        return None
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate sheet name in XLSX header map")
+            result[key] = value
+        return result
+
+    try:
+        return {"header_rows": json.loads(header_rows, object_pairs_hook=unique_object)}
+    except ValueError as exc:
+        typer.echo(f"Invalid --xlsx-header-rows JSON object: {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("reprocess")
 def reprocess_command(
     ctx: typer.Context,
@@ -718,6 +744,9 @@ def reprocess_command(
     csv_delimiter: str | None = typer.Option(None, help="Override the CSV delimiter."),
     csv_header: str | None = typer.Option(None, help="Override the CSV header policy."),
     csv_encoding: str | None = typer.Option(None, help="Override the CSV encoding policy."),
+    xlsx_header_rows: str | None = typer.Option(
+        None, help="Replace XLSX header rows with a JSON sheet-name map; {} clears overrides."
+    ),
 ) -> None:
     """Enqueue manual rebuilding of retained document processing outputs."""
 
@@ -735,6 +764,7 @@ def reprocess_command(
             document_ids,
             pdf_extractor=pdf_extractor,
             csv_options=_csv_recipe_flags(csv_delimiter, csv_header, csv_encoding),
+            xlsx_options=_xlsx_recipe_flags(xlsx_header_rows),
         )
     except ReprocessingError as exc:
         typer.echo(str(exc))

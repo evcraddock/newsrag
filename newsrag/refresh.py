@@ -24,7 +24,9 @@ from newsrag.sources import (
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     TEXT_MAX_SOURCE_BYTES,
+    XLSX_MAX_SOURCE_BYTES,
     build_source_identity,
     source_type_for_media_type,
 )
@@ -131,6 +133,9 @@ class RefreshPipeline:
                         if Path(filename).suffix.lower() in {".txt", ".md", ".csv"}
                         or payload["base"].get("source_type")
                         in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}
+                        else XLSX_MAX_SOURCE_BYTES
+                        if Path(filename).suffix.lower() == ".xlsx"
+                        or payload["base"].get("source_type") == SOURCE_TYPE_XLSX
                         else DOCX_MAX_SOURCE_BYTES
                         if Path(filename).suffix.lower() == ".docx"
                         or payload["base"].get("source_type") == SOURCE_TYPE_DOCX
@@ -210,7 +215,13 @@ class RefreshPipeline:
                 fallback_source_type=(
                     payload["base"].get("source_type")
                     if payload["base"].get("source_type")
-                    in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_DOCX, SOURCE_TYPE_CSV}
+                    in {
+                        SOURCE_TYPE_TEXT,
+                        SOURCE_TYPE_MARKDOWN,
+                        SOURCE_TYPE_DOCX,
+                        SOURCE_TYPE_CSV,
+                        SOURCE_TYPE_XLSX,
+                    }
                     else None
                 ),
             )
@@ -224,6 +235,13 @@ class RefreshPipeline:
                 options["csv"] = normalize_csv_options(options.get("csv", {}))
             else:
                 options.pop("csv", None)
+            if selected.source_type == SOURCE_TYPE_XLSX:
+                from newsrag.xlsx_adapter import normalize_xlsx_options
+
+                options.pop("pdf_extractor", None)
+                options["xlsx"] = normalize_xlsx_options(options.get("xlsx", {}))
+            else:
+                options.pop("xlsx", None)
             metadata = dict(base["user_metadata"])
             metadata["source_size_bytes"] = int(artifact["byte_size"])
             provenance = json.loads(artifact["provenance_json"])

@@ -14,6 +14,9 @@ SOURCE_TYPE_TEXT = "text"
 SOURCE_TYPE_MARKDOWN = "markdown"
 SOURCE_TYPE_DOCX = "docx"
 SOURCE_TYPE_CSV = "csv"
+SOURCE_TYPE_XLSX = "xlsx"
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+XLSX_MAX_SOURCE_BYTES = 25 * 1024 * 1024
 CSV_MEDIA_TYPE = "text/csv"
 CSV_MEDIA_ALIASES = ("application/csv",)
 TABLE_ROW_LOCATION_TYPE = "table_row"
@@ -29,6 +32,7 @@ SUPPORTED_SOURCE_TYPES = frozenset(
         SOURCE_TYPE_MARKDOWN,
         SOURCE_TYPE_DOCX,
         SOURCE_TYPE_CSV,
+        SOURCE_TYPE_XLSX,
     }
 )
 MARKDOWN_MEDIA_TYPE = "text/markdown"
@@ -59,6 +63,8 @@ def source_type_for_media_type(media_type: str | None) -> str | None:
         return SOURCE_TYPE_MARKDOWN
     if normalized_media_type == DOCX_MEDIA_TYPE:
         return SOURCE_TYPE_DOCX
+    if normalized_media_type == XLSX_MEDIA_TYPE:
+        return SOURCE_TYPE_XLSX
     if normalized_media_type in (CSV_MEDIA_TYPE, *CSV_MEDIA_ALIASES):
         return SOURCE_TYPE_CSV
     return None
@@ -77,6 +83,8 @@ def media_types_for_source_type(source_type: str) -> tuple[str, ...]:
         return (MARKDOWN_MEDIA_TYPE,)
     if source_type == SOURCE_TYPE_DOCX:
         return (DOCX_MEDIA_TYPE,)
+    if source_type == SOURCE_TYPE_XLSX:
+        return (XLSX_MEDIA_TYPE,)
     if source_type == SOURCE_TYPE_CSV:
         return (CSV_MEDIA_TYPE, *CSV_MEDIA_ALIASES)
     return ()

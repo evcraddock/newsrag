@@ -464,7 +464,11 @@ def create_discovery_item(
                     resolved.source_unit_start_id,
                     resolved.source_unit_end_id,
                     resolved.location_type,
-                    resolved.location_label,
+                    " — ".join(
+                        (resolved.location_label, *resolved.table_evidence.focus.qualifications)
+                    )
+                    if resolved.table_evidence
+                    else resolved.location_label,
                     resolved.page_id,
                     resolved.passage_id,
                     resolved.page_start,

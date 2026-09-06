@@ -301,8 +301,8 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
                                 source_unit_start_id=selection.source_unit_start_id,
                                 source_unit_end_id=selection.source_unit_end_id,
                                 location_type="table_region",
-                                location_label=f"{item.role}: {selection.region.label}",
-                                text=selection.text,
+                                location_label=f"{item.role}: {selection.location_label or selection.region.label}",
+                                text="\n".join((selection.text, *selection.annotations)),
                                 table_evidence=TableEvidence(selection),
                             )
                         )
@@ -327,7 +327,11 @@ def _resolved_to_evidence_context(resolved: ResolvedSourceRange) -> EvidenceCont
         source_unit_end_id=resolved.source_unit_end_id,
         location_type=resolved.location_type,
         location_label=resolved.location_label,
-        text=resolved.text,
+        text=(
+            "\n".join((resolved.text, *resolved.table_evidence.focus.annotations))
+            if resolved.table_evidence is not None
+            else resolved.text
+        ),
         page_start=resolved.page_start,
         page_end=resolved.page_end,
         page_id=resolved.page_id,
