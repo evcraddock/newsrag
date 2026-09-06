@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from newsrag.briefs import format_generated_brief, generate_document_brief
@@ -375,10 +376,12 @@ def test_cli_source_type_help_lists_text() -> None:
     search_help = runner.invoke(app, ["search", "--help"]).stdout
     inventory_help = runner.invoke(app, ["documents", "list", "--help"]).stdout
 
-    assert "csv, docx, html, markdown, pdf, text" in " ".join(ingest_help.replace("│", "").split())
+    assert "csv, docx, html, markdown, pdf, text" in " ".join(
+        unstyle(ingest_help).replace("│", "").split()
+    )
     for help_text in (search_help, inventory_help):
         assert "csv, docx, html, markdown, pdf, or text" in " ".join(
-            help_text.replace("│", "").split()
+            unstyle(help_text).replace("│", "").split()
         )
 
 
