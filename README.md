@@ -1,6 +1,6 @@
 # newsrag
 
-Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, Markdown, DOCX, and CSV, with OCR, hybrid search, and cited Markdown source packets.
+Local-first CLI evidence retrieval for city hall PDFs, static HTML, plain text, Markdown, DOCX, CSV, and XLSX, with OCR, hybrid search, and cited Markdown source packets.
 
 ## Installation
 
@@ -103,7 +103,18 @@ newsrag search "Roads" --source-type csv
 newsrag reprocess <csv-document-id> --csv-header absent
 ```
 
-The [CSV adapter](docs/csv.md) preserves literal strings, leading zeros, whitespace, and logical records. It supports strict encoding/dialect/header recipes, mixed directories and manifests, and generation-retaining refresh/reprocessing. It never calculates formulas or infers arithmetic, units, currency, or civic dates. XLSX parsing is not implemented.
+The [CSV adapter](docs/csv.md) preserves literal strings, leading zeros, whitespace, and logical records. It supports strict encoding/dialect/header recipes, mixed directories and manifests, and generation-retaining refresh/reprocessing. It never calculates formulas or infers arithmetic, units, currency, or civic dates.
+
+Ingest XLSX with original worksheet/cell coordinates and qualified stored formula caches:
+
+```bash
+newsrag ingest ./budget.xlsx --xlsx-header-rows '{"FY 2026":4}'
+newsrag search "Roads" --source-type xlsx
+newsrag packet "Roads" --source-type xlsx --out packets/roads.md
+newsrag reprocess <xlsx-document-id> --xlsx-header-rows '{}'
+```
+
+The [XLSX adapter](docs/xlsx.md) reuses the shared tabular model with bounded ZIP/XML validation, native headers, exact stored types, merges, and workbook order. Hidden cells remain canonical but never enter new evidence. Formulas are never evaluated; caches are marked as unverified. Unsupported or active workbook features fail atomically.
 
 Search indexed evidence using plain text, including hyphenated road names:
 

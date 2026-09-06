@@ -125,13 +125,14 @@ make check
 
 `make check` runs formatting checks, linting, type checking, and tests through `uv`.
 
-Run the disposable CSV CLI/daemon smoke workflow with the existing development prerequisites:
+Run the disposable tabular CLI/daemon smoke workflows with the existing development prerequisites:
 
 ```bash
 uv run python scripts/smoke_csv.py
+uv run python scripts/smoke_xlsx.py
 ```
 
-The smoke script starts the daemon via this repository's `make dev` target from a temporary workspace, with its own Procfile, Overmind socket, corpus, explicit configuration, and localhost mock embedding API. It verifies mixed directories/manifests, exact-cell search and packets, duplicates, no-refetch reprocessing, refresh recipe inheritance, and fail-closed inputs. It stops only its own services and removes its temporary files; installed services and corpora are not used.
+Each smoke script starts the daemon via this repository's `make dev` target from a temporary workspace, with its own Procfile, Overmind socket, corpus, explicit configuration, and localhost mock embedding API. They verify mixed directories/manifests, exact-cell search and packets, duplicates, no-refetch reprocessing, refresh recipe inheritance, and fail-closed inputs. The XLSX workflow also checks worksheet coordinates, hidden-value exclusion, and formula-cache qualifications without sending expressions to embeddings. Each stops only its own services and removes its temporary files; installed services and corpora are not used.
 
 ## Environment variables
 
