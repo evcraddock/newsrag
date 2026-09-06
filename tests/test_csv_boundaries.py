@@ -33,6 +33,7 @@ from newsrag.tabular import Cell, TableError, build_table_passages
         (b"h\n" + b"\x1b[31mred", "control"),
         (b"h\n" + b"\xff\xfe", "valid utf-8"),
     ],
+    ids=["raw-bytes", "physical-lines", "rectangular-positions", "controls", "encoding"],
 )
 def test_csv_raw_physical_geometry_and_control_limits(
     tmp_path: Path, data: bytes, error: str
