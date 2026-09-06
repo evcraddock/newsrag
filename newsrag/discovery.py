@@ -15,6 +15,8 @@ from newsrag.source_locations import (
     resolve_source_range,
     validate_evidence_quote,
 )
+from newsrag.tabular import TableError, TableRegion
+from newsrag.tabular_evidence import resolve_contexts
 
 
 class DiscoveryError(Exception):
@@ -66,6 +68,8 @@ class DiscoveryEvidenceDraft:
     quote: str
     validation_status: str
     passage_id: str | None = None
+    table_region: TableRegion | None = None
+    table_context: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,8 @@ class DiscoveryEvidenceRecord:
     quote: str
     validation_status: str
     created_at: str
+    table_region: TableRegion | None = None
+    table_context: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,10 +381,22 @@ def create_discovery_item(
                     source_unit_start_id=draft.source_unit_start_id,
                     source_unit_end_id=draft.source_unit_end_id,
                     passage_id=draft.passage_id,
+                    table_region=draft.table_region,
                 )
+                if draft.table_context:
+                    if resolved.table_evidence is None:
+                        raise SourceLocationError("Table context requires tabular focus evidence")
+                    from dataclasses import replace
+
+                    contexts = resolve_contexts(
+                        connection, resolved.table_evidence.focus, list(draft.table_context)
+                    )
+                    resolved = replace(
+                        resolved, table_evidence=replace(resolved.table_evidence, context=contexts)
+                    )
                 validate_evidence_quote(resolved, draft.quote)
                 resolved_evidence.append(resolved)
-        except SourceLocationError as exc:
+        except (SourceLocationError, TableError) as exc:
             raise DiscoveryError(str(exc)) from exc
 
         connection.execute(
@@ -432,9 +450,11 @@ def create_discovery_item(
                 page_start,
                 page_end,
                 quote,
-                validation_status
+                validation_status,
+                table_region_json,
+                table_context_json
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -451,6 +471,12 @@ def create_discovery_item(
                     resolved.page_end,
                     draft.quote,
                     draft.validation_status.strip(),
+                    json.dumps(resolved.table_evidence.focus.region.to_dict())
+                    if resolved.table_evidence
+                    else None,
+                    json.dumps([item.reference() for item in resolved.table_evidence.context])
+                    if resolved.table_evidence
+                    else None,
                 )
                 for draft, resolved in zip(evidence, resolved_evidence, strict=True)
             ],
@@ -535,7 +561,9 @@ def list_discovery_items(
                     page_end,
                     quote,
                     validation_status,
-                    created_at
+                    created_at,
+                    table_region_json,
+                    table_context_json
                 FROM discovery_evidence
                 WHERE item_id IN ({placeholders})
                 ORDER BY created_at ASC, id ASC
@@ -670,6 +698,12 @@ def _row_to_discovery_evidence(row: sqlite3.Row) -> DiscoveryEvidenceRecord:
         quote=str(row["quote"]),
         validation_status=str(row["validation_status"]),
         created_at=str(row["created_at"]),
+        table_region=TableRegion.from_dict(json.loads(row["table_region_json"]))
+        if row["table_region_json"]
+        else None,
+        table_context=tuple(json.loads(row["table_context_json"]))
+        if row["table_context_json"]
+        else (),
     )
 
 

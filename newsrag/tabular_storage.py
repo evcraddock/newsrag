@@ -326,4 +326,3 @@ def persist_table_passage(
             ),
         ),
     )
-    validate_tabular_ownership(connection)

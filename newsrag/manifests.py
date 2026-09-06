@@ -9,12 +9,15 @@ from urllib.parse import urlsplit
 import yaml
 
 from newsrag.acquisition import AcquisitionError, safe_url_reference, validate_url_submission
+from newsrag.adapters import AdapterError
+from newsrag.csv_adapter import normalize_csv_options
 from newsrag.ingest import IngestError, normalize_source_type_hint
 from newsrag.sources import normalize_url_reference
 
 ALLOWED_DOCUMENT_FIELDS = {
     "source",
     "type",
+    "csv",
     "title",
     "meeting_date",
     "body",
@@ -31,6 +34,7 @@ class ManifestDocument:
     source_type: str | None
     is_url: bool
     metadata: dict[str, str]
+    csv_options: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,17 @@ def _validate_document(
     except IngestError as exc:
         raise ManifestError(f"Manifest document #{index}: {exc}") from exc
 
+    csv_options: dict[str, object] | None = None
+    if "csv" in raw_document:
+        if source_type not in {None, "csv"}:
+            raise ManifestError(
+                f"Manifest document #{index}: CSV options conflict with source type"
+            )
+        try:
+            csv_options = dict(normalize_csv_options(raw_document["csv"]))
+        except AdapterError as exc:
+            raise ManifestError(f"Manifest document #{index}: {exc}") from exc
+        source_type = "csv"
     metadata: dict[str, str] = {}
     for key in ("title", "body", "document_type", "jurisdiction"):
         value = raw_document.get(key)
@@ -162,6 +177,7 @@ def _validate_document(
         source_type=source_type,
         is_url=is_url,
         metadata=metadata,
+        csv_options=csv_options,
     )
 
 

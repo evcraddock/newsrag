@@ -311,7 +311,12 @@ class TablePassage:
 
     @property
     def keyword_text(self) -> str:
-        return "\n".join(filter(None, (self.focus_text, self.header_text)))
+        return "\n".join(
+            str(value)
+            for text in (self.focus_text, self.header_text)
+            for line in text.splitlines()
+            if (value := json.loads(line.partition(":")[2])) not in {None, ""}
+        )
 
     @property
     def text(self) -> str:

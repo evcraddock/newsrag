@@ -20,6 +20,8 @@ from newsrag.source_locations import (
     format_evidence_location,
     resolve_source_range,
 )
+from newsrag.tabular import TableError, TableRegion
+from newsrag.tabular_evidence import TableEvidence, validate_table_quote
 
 ENRICHMENT_EXTRACTOR = "structured-llm-enrichment"
 SUMMARY_ITEM_TYPE = "summary"
@@ -46,6 +48,7 @@ class EvidenceContext:
     page_end: int | None = None
     page_id: str | None = None
     passage_id: str | None = None
+    table_evidence: TableEvidence | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +241,7 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
             FROM source_units
             WHERE document_id = ?
                 AND processing_generation_id IS ?
+                AND location_type != 'table_row'
             ORDER BY ordinal ASC, id ASC
             """,
             (document_id, document_row["current_processing_generation_id"]),
@@ -283,6 +287,20 @@ def _build_enrichment_request(database_path: Path, document_id: str) -> Enrichme
                     ),
                 )
                 contexts.append(_resolved_to_evidence_context(resolved))
+                if resolved.table_evidence is not None:
+                    for item in resolved.table_evidence.context:
+                        selection = item.selection
+                        contexts.append(
+                            EvidenceContext(
+                                document_id=document_id,
+                                source_unit_start_id=selection.source_unit_start_id,
+                                source_unit_end_id=selection.source_unit_end_id,
+                                location_type="table_region",
+                                location_label=f"{item.role}: {selection.region.label}",
+                                text=selection.text,
+                                table_evidence=TableEvidence(selection),
+                            )
+                        )
         except SourceLocationError as exc:
             raise EnrichmentError(str(exc)) from exc
 
@@ -309,6 +327,7 @@ def _resolved_to_evidence_context(resolved: ResolvedSourceRange) -> EvidenceCont
         page_end=resolved.page_end,
         page_id=resolved.page_id,
         passage_id=resolved.passage_id,
+        table_evidence=resolved.table_evidence,
     )
 
 
@@ -387,12 +406,19 @@ def _validate_evidence_object(
     passage_id = _optional_string(value.get("passage_id"))
     if source_unit_start_id is None and passage_id is None:
         raise EnrichmentError(f"{field_name} evidence requires source_unit_start_id or passage_id")
+    try:
+        table_region = (
+            TableRegion.from_dict(value["table_region"]) if "table_region" in value else None
+        )
+    except TableError as exc:
+        raise EnrichmentError(str(exc)) from exc
     context = _find_supporting_context(
         request.evidence_contexts,
         source_unit_start_id=source_unit_start_id,
         source_unit_end_id=source_unit_end_id,
         quote=quote,
         passage_id=passage_id,
+        table_region=table_region,
     )
     if context is None:
         raise EnrichmentError(
@@ -406,6 +432,7 @@ def _validate_evidence_object(
         passage_id=context.passage_id,
         quote=quote,
         validation_status=VALIDATION_STATUS_VALIDATED,
+        table_region=context.table_evidence.focus.region if context.table_evidence else None,
     )
 
 
@@ -416,6 +443,7 @@ def _find_supporting_context(
     source_unit_end_id: str | None,
     quote: str,
     passage_id: str | None,
+    table_region: TableRegion | None = None,
 ) -> EvidenceContext | None:
     normalized_quote = _normalize_for_match(quote)
     for context in contexts:
@@ -427,6 +455,16 @@ def _find_supporting_context(
         ):
             continue
         if source_unit_end_id is not None and context.source_unit_end_id != source_unit_end_id:
+            continue
+        if context.table_evidence is not None:
+            if table_region is not None and table_region != context.table_evidence.focus.region:
+                continue
+            try:
+                validate_table_quote(context.table_evidence, quote)
+            except TableError:
+                continue  # This context does not support the claim; try other exact regions.
+            return context
+        if table_region is not None:
             continue
         if normalized_quote in _normalize_for_match(context.text):
             return context

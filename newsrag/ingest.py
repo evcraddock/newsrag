@@ -39,6 +39,7 @@ from newsrag.adapters import (
     SourceAdapterRegistry,
 )
 from newsrag.config import EmbeddingConfig
+from newsrag.csv_adapter import CsvSourceAdapter, normalize_csv_options
 from newsrag.docx_adapter import DocxSourceAdapter
 from newsrag.embeddings import (
     ChunkEmbedding,
@@ -81,6 +82,8 @@ from newsrag.pdf_adapter import (
 )
 from newsrag.search import LanceDbPassageVectorStore, PassageVectorRecord
 from newsrag.sources import (
+    CSV_MEDIA_ALIASES,
+    CSV_MEDIA_TYPE,
     DOCX_MAX_SOURCE_BYTES,
     DOCX_MEDIA_TYPE,
     HTML_MAX_SOURCE_BYTES,
@@ -88,6 +91,7 @@ from newsrag.sources import (
     MARKDOWN_MEDIA_TYPE,
     PAGE_LOCATION_TYPE,
     PDF_MEDIA_TYPE,
+    SOURCE_TYPE_CSV,
     SOURCE_TYPE_DOCX,
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
@@ -103,6 +107,12 @@ from newsrag.sources import (
     source_unit_id_for_page,
 )
 from newsrag.storage import StoragePaths, initialize_storage
+from newsrag.tabular import Table, TablePassage, build_table_passages
+from newsrag.tabular_storage import (
+    persist_table_passage,
+    persist_tables,
+    validate_tabular_ownership,
+)
 from newsrag.text_adapter import PlainTextSourceAdapter
 
 __all__ = [
@@ -167,6 +177,7 @@ class ChunkDraft:
     page_end: int
     source_unit_start_ordinal: int | None = None
     source_unit_end_ordinal: int | None = None
+    table_passage: TablePassage | None = None
 
 
 @dataclass(frozen=True)
@@ -500,7 +511,28 @@ class SourceProcessingPipeline:
         )
 
         with _ingest_stage(job_id, "chunking", artifact.source_path, on_stage=on_stage):
-            chunks = self.chunker.chunk_units(adapter_result.units)
+            table_passages = (
+                build_table_passages(adapter_result.tables) if adapter_result.tables else ()
+            )
+            if table_passages:
+                row_ordinals = {
+                    (
+                        str(unit.location["table_id"]),
+                        int(str(unit.location["row_start"])),
+                    ): unit.ordinal
+                    for unit in adapter_result.units
+                }
+                chunks = [
+                    ChunkDraft(
+                        text=passage.text,
+                        page_start=row_ordinals[(passage.focus.table_id, passage.focus.row_start)],
+                        page_end=row_ordinals[(passage.focus.table_id, passage.focus.row_end)],
+                        table_passage=passage,
+                    )
+                    for passage in table_passages
+                ]
+            else:
+                chunks = self.chunker.chunk_units(adapter_result.units)
         LOGGER.info(
             "ingest_chunks_ready job_id=%s source_path=%r chunks=%d",
             job_id,
@@ -538,7 +570,14 @@ class SourceProcessingPipeline:
             chunk_embeddings,
             source_unit_ids=source_unit_ids,
         )
-        passage_rows = _build_passage_rows_from_chunks(chunk_rows)
+        passage_rows = (
+            [
+                (f"passage-{row[0]}-001", row[0], row[1], row[2], row[3], row[4], row[5], 1, row[6])
+                for row in chunk_rows
+            ]
+            if table_passages
+            else _build_passage_rows_from_chunks(chunk_rows)
+        )
         with _ingest_stage(job_id, "passage_embeddings", artifact.source_path, on_stage=on_stage):
             passage_embeddings = self.embedding_provider.embed_chunks(
                 [passage_row[8] for passage_row in passage_rows]
@@ -584,6 +623,8 @@ class SourceProcessingPipeline:
                 expected_generation_id=expected_generation_id,
                 configuration=configuration,
                 fingerprint=configuration_fingerprint(configuration),
+                tables=adapter_result.tables,
+                table_passages=table_passages,
             )
         LOGGER.info(
             "ingest_published job_id=%s source_path=%r document_id=%s pages=%d chunks=%d "
@@ -679,6 +720,14 @@ class IngestionPipeline:
                     extensions=_DOCX_EXTENSIONS,
                     signatures=(),  # ZIP alone never identifies a Word document.
                     adapter=DocxSourceAdapter(),
+                ),
+                RegisteredSourceAdapter(
+                    source_type=SOURCE_TYPE_CSV,
+                    media_type=CSV_MEDIA_TYPE,
+                    media_type_aliases=CSV_MEDIA_ALIASES,
+                    extensions=(".csv",),
+                    signatures=(),
+                    adapter=CsvSourceAdapter(),
                 ),
             )
         )
@@ -799,7 +848,11 @@ class IngestionPipeline:
                         acquired_at=decision.acquired_at,
                         work_dir=self.storage_paths.ocr_pdfs,
                         metadata=document_metadata,
-                        adapter_options={"pdf_extractor": _payload_pdf_extractor_mode(job.payload)},
+                        adapter_options=(
+                            {"csv": normalize_csv_options(job.payload.get("csv", {}))}
+                            if selected_adapter.source_type == SOURCE_TYPE_CSV
+                            else {"pdf_extractor": _payload_pdf_extractor_mode(job.payload)}
+                        ),
                         user_metadata=metadata,
                     ),
                     job_id=job.id,
@@ -865,6 +918,7 @@ def prepare_ingest_source(
     metadata: dict[str, Any] | None = None,
     source_type: str | None = None,
     pdf_extractor: str | None = None,
+    csv_options: dict[str, object] | None = None,
     origin: str = "cli",
     base_dir: Path | None = None,
     require_existing: bool = False,
@@ -875,12 +929,22 @@ def prepare_ingest_source(
     if not reference:
         raise IngestError("Source must not be empty")
     normalized_source_type = normalize_source_type_hint(source_type)
+    if csv_options is not None:
+        if normalized_source_type not in {None, SOURCE_TYPE_CSV} or pdf_extractor is not None:
+            raise IngestError("CSV options conflict with non-CSV source type or PDF options")
+        normalized_source_type = SOURCE_TYPE_CSV
+        try:
+            csv_options = dict(normalize_csv_options(csv_options))
+        except AdapterError as exc:
+            raise IngestError(str(exc)) from exc
     base_payload: dict[str, Any] = {
         "metadata": dict(metadata or {}),
         "source": origin,
     }
     if normalized_source_type is not None:
         base_payload["source_type"] = normalized_source_type
+    if csv_options is not None:
+        base_payload["csv"] = csv_options
     if pdf_extractor is not None:
         base_payload["pdf_extractor"] = normalize_pdf_extractor_mode(pdf_extractor)
 
@@ -889,6 +953,9 @@ def prepare_ingest_source(
         _ = parsed.port
     except ValueError as exc:
         raise IngestError("Source URL is malformed") from exc
+    selected_recipe_type = normalized_source_type or _source_type_for_extension(Path(parsed.path))
+    if pdf_extractor is not None and selected_recipe_type == SOURCE_TYPE_CSV:
+        raise IngestError("PDF extractor options conflict with CSV ingestion")
     if parsed.scheme.lower() in {"http", "https"}:
         try:
             submitted_url = validate_url_submission(reference)
@@ -915,6 +982,8 @@ def prepare_ingest_source(
         raise IngestError(f"Local source path does not exist: {absolute_path}")
 
     if absolute_path.is_dir() and not absolute_path.is_symlink():
+        if csv_options is not None:
+            raise IngestError("CSV recipe flags cannot apply to directory scans; use a manifest")
         paths, queued_by_type, skipped_by_type = _scan_ingest_directory(
             absolute_path,
             source_type=normalized_source_type,
@@ -966,6 +1035,7 @@ def enqueue_ingest_source(
     metadata: dict[str, Any] | None = None,
     source_type: str | None = None,
     pdf_extractor: str | None = None,
+    csv_options: dict[str, object] | None = None,
 ) -> IngestEnqueueResult:
     """Validate and enqueue one URL, local file, or local directory."""
 
@@ -974,6 +1044,7 @@ def enqueue_ingest_source(
         metadata=metadata,
         source_type=source_type,
         pdf_extractor=pdf_extractor,
+        csv_options=csv_options,
     )
     return enqueue_prepared_ingest_batches(database_path, (batch,))
 
@@ -1205,6 +1276,8 @@ def _scan_ingest_directory(
 
 def _source_type_for_extension(path: Path) -> str | None:
     extension = path.suffix.lower()
+    if extension == ".csv":
+        return SOURCE_TYPE_CSV
     if extension in _PDF_EXTENSIONS:
         return SOURCE_TYPE_PDF
     if extension in _HTML_EXTENSIONS:
@@ -1269,7 +1342,7 @@ def _payload_source_max_bytes(payload: dict[str, Any], path: Path) -> int | None
     source_type = _payload_source_type_hint(payload) or _source_type_for_extension(path)
     if source_type == SOURCE_TYPE_HTML:
         return HTML_MAX_SOURCE_BYTES
-    if source_type in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN}:
+    if source_type in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}:
         return TEXT_MAX_SOURCE_BYTES
     if source_type == SOURCE_TYPE_DOCX:
         return DOCX_MAX_SOURCE_BYTES
@@ -1284,7 +1357,7 @@ def _adapter_input_media_type(
     if normalized_reported_type in registration.accepted_media_types:
         return str(reported_media_type)
     if (
-        registration.source_type == SOURCE_TYPE_MARKDOWN
+        registration.source_type in {SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}
         and normalized_reported_type == TEXT_MEDIA_TYPE
     ):
         _, separator, parameters = str(reported_media_type).partition(";")
@@ -1625,6 +1698,8 @@ def _publish_document_bundle(
     expected_generation_id: str | None,
     configuration: dict[str, Any],
     fingerprint: str,
+    tables: tuple[Table, ...] = (),
+    table_passages: tuple[TablePassage, ...] = (),
 ) -> None:
     from newsrag.processing_generations import publish_processing_generation
     from newsrag.revisions import publish_revision
@@ -1632,6 +1707,12 @@ def _publish_document_bundle(
     metadata_json = json.dumps(metadata, sort_keys=True)
     attempted_chunk_ids: list[str] = []
     attempted_passage_ids: list[str] = []
+    tabular_keywords = (
+        {row[0]: draft.keyword_text for row, draft in zip(passages, table_passages, strict=True)}
+        if tables
+        else {}
+    )
+    chunk_keywords = {row[1]: tabular_keywords[row[0]] for row in passages} if tables else {}
 
     with _publication_transaction(
         database_path,
@@ -1741,7 +1822,10 @@ def _publish_document_bundle(
             INSERT INTO chunks_fts(chunk_id, text)
             VALUES(?, ?)
             """,
-            [(chunk_id, text) for chunk_id, _, _, _, _, _, text in chunks],
+            [
+                (chunk_id, chunk_keywords.get(chunk_id, text))
+                for chunk_id, _, _, _, _, _, text in chunks
+            ],
         )
         connection.executemany(
             """
@@ -1765,7 +1849,10 @@ def _publish_document_bundle(
             INSERT INTO passages_fts(passage_id, text)
             VALUES(?, ?)
             """,
-            [(passage_id, text) for passage_id, _, _, _, _, _, _, _, text in passages],
+            [
+                (passage_id, tabular_keywords.get(passage_id, text))
+                for passage_id, _, _, _, _, _, _, _, text in passages
+            ],
         )
         _insert_embedding_rows(
             connection,
@@ -1795,6 +1882,24 @@ def _publish_document_bundle(
                 f"UPDATE {table} SET processing_generation_id = ? WHERE id = ?",
                 [(processing_generation_id, row[0]) for row in rows],
             )
+        if tables:
+            persist_tables(
+                connection,
+                document_id=document_id,
+                generation_id=processing_generation_id,
+                tables=tables,
+                source_unit_ids={row[3]: row[0] for row in source_units},
+            )
+            for row, table_passage in zip(passages, table_passages, strict=True):
+                persist_table_passage(
+                    connection,
+                    document_id=document_id,
+                    generation_id=processing_generation_id,
+                    passage_id=row[0],
+                    chunk_id=row[1],
+                    passage=table_passage,
+                )
+            validate_tabular_ownership(connection)
         # SQLite has now established that every ID belongs to this attempt.
         # Track writes before calling each store, including partial failures,
         # but never compensate an ID rejected by a SQLite uniqueness check.

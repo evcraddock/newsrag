@@ -73,7 +73,7 @@ class PlainTextSourceAdapter:
 
 
 def read_text_lines(
-    path: Path, media_type: str, *, allow_markup: bool = False
+    path: Path, media_type: str, *, allow_markup: bool = False, allow_blank: bool = False
 ) -> tuple[list[str], str]:
     """Validate and decode physical lines for literal text or inert Markdown parsing."""
 
@@ -94,7 +94,7 @@ def read_text_lines(
         ):
             raise AdapterError("Plain-text artifact contains unsupported control characters")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    if not text.strip():
+    if not allow_blank and not text.strip():
         raise AdapterError("Plain-text artifact contains no non-whitespace text")
     line_count = text.count("\n") + (not text.endswith("\n"))
     if line_count > MAX_TEXT_LINES:

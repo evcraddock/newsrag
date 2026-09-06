@@ -45,7 +45,7 @@ PACKET_OUT_OPTION = typer.Option(
     resolve_path=False,
 )
 PDF_EXTRACTOR_OPTION = typer.Option(
-    "auto",
+    None,
     "--pdf-extractor",
     help="PDF text extractor mode: auto, pymupdf, pdfplumber, or table.",
 )
@@ -302,7 +302,14 @@ def ingest_command(
         "--type",
         help="Explicit source type hint; currently supported: docx, html, markdown, pdf, text.",
     ),
-    pdf_extractor: str = PDF_EXTRACTOR_OPTION,
+    pdf_extractor: str | None = PDF_EXTRACTOR_OPTION,
+    csv_delimiter: str | None = typer.Option(
+        None, help="CSV delimiter: comma, semicolon, tab, pipe."
+    ),
+    csv_header: str | None = typer.Option(None, help="CSV header: present or absent."),
+    csv_encoding: str | None = typer.Option(
+        None, help="CSV encoding: auto or a supported strict charset."
+    ),
 ) -> None:
     """Enqueue one URL, local file, or local directory for ingestion."""
 
@@ -326,6 +333,7 @@ def ingest_command(
             metadata=metadata,
             source_type=source_type,
             pdf_extractor=pdf_extractor,
+            csv_options=_csv_recipe_flags(csv_delimiter, csv_header, csv_encoding),
         )
     except IngestError as exc:
         typer.echo(str(exc))
@@ -357,6 +365,7 @@ def ingest_manifest_command(ctx: typer.Context, path: Path) -> None:
                 source=document.source,
                 metadata=document.metadata,
                 source_type=document.source_type,
+                csv_options=document.csv_options,
                 origin="manifest",
                 base_dir=manifest_directory,
                 require_existing=not document.is_url,
@@ -690,11 +699,25 @@ def documents_versions_command(ctx: typer.Context, document_id: str) -> None:
     typer.echo(format_document_versions(history))
 
 
+def _csv_recipe_flags(
+    delimiter: str | None, header: str | None, encoding: str | None
+) -> dict[str, object] | None:
+    values: dict[str, object] = {
+        key: value
+        for key, value in (("delimiter", delimiter), ("header", header), ("encoding", encoding))
+        if value is not None
+    }
+    return values or None
+
+
 @app.command("reprocess")
 def reprocess_command(
     ctx: typer.Context,
     document_ids: list[str] = REPROCESS_DOCUMENT_IDS_ARGUMENT,
     pdf_extractor: str | None = REPROCESS_PDF_EXTRACTOR_OPTION,
+    csv_delimiter: str | None = typer.Option(None, help="Override the CSV delimiter."),
+    csv_header: str | None = typer.Option(None, help="Override the CSV header policy."),
+    csv_encoding: str | None = typer.Option(None, help="Override the CSV encoding policy."),
 ) -> None:
     """Enqueue manual rebuilding of retained document processing outputs."""
 
@@ -711,6 +734,7 @@ def reprocess_command(
             database_path,
             document_ids,
             pdf_extractor=pdf_extractor,
+            csv_options=_csv_recipe_flags(csv_delimiter, csv_header, csv_encoding),
         )
     except ReprocessingError as exc:
         typer.echo(str(exc))
