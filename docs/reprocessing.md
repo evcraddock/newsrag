@@ -52,6 +52,8 @@ Publication uses SQLite as the authoritative visibility boundary. A transaction 
 
 Refresh and reprocessing share the process-held corpus worker lock. Recovery occurs only after acquiring that lock, and cancellation retains ownership until outstanding processing finishes. A crashed worker releases the lock; a later worker marks unfinished jobs failed/retryable. Committed receipts are authoritative: replay and late failure acknowledgements cannot republish a generation or erase success. Ordinary ingestion retains its existing concurrency.
 
+PDF reprocessing uses the [OCR recovery policy](pdf.md): exit status 4 permits extracting existing text from the saved original PDF, but other OCR failures remain errors. Original-text recovery leaves the new generation's normalized-artifact path empty, without changing prior generations or their normalized artifacts. The PDF adapter format version distinguishes this behavior in processing fingerprints.
+
 ## Migration and upgrade
 
 Stop all old NewsRAG daemons before upgrading a corpus to schema 8, then restart workers on the same version. Do not mix old and new worker binaries on a corpus.

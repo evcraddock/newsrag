@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -31,6 +32,15 @@ PDF_EXTRACTOR_MODES = frozenset(
     }
 )
 PdfExtractorMode = Literal["auto", "pymupdf", "pdfplumber", "table"]
+LOGGER = logging.getLogger(__name__)
+
+
+class OcrNormalizationError(AdapterError):
+    """An OCRmyPDF process failure with its original exit status preserved."""
+
+    def __init__(self, source_path: Path, returncode: int, detail: str) -> None:
+        self.returncode = returncode
+        super().__init__(f"ocrmypdf failed for {source_path} (exit status {returncode}): {detail}")
 
 
 @dataclass(frozen=True)
@@ -77,7 +87,7 @@ class SubprocessOcrRunner:
             )
         except subprocess.CalledProcessError as exc:
             detail = (exc.stderr or exc.stdout or str(exc)).strip()
-            raise AdapterError(f"ocrmypdf failed for {source_path}: {detail}") from exc
+            raise OcrNormalizationError(source_path, exc.returncode, detail) from exc
 
 
 @dataclass(frozen=True)
@@ -139,18 +149,32 @@ class FallbackTextExtractor:
         return f"{_extractor_name(self.primary)}+{_extractor_name(self.fallback)}"
 
     def extract_pages(self, pdf_path: Path) -> list[ExtractedPage]:
-        primary_pages = _extract_with_stage_context(
-            self.primary,
-            pdf_path,
-            stage="primary",
+        try:
+            primary_pages = _extract_with_stage_context(self.primary, pdf_path, stage="primary")
+        except AdapterError as exc:
+            primary_failure = str(exc)
+            reason = "primary_error"
+        else:
+            if _has_usable_page_text(primary_pages):
+                return primary_pages
+            primary_failure = f"primary PDF text extraction with {_extractor_name(self.primary)} returned no usable text"
+            reason = "no_usable_text"
+        LOGGER.warning(
+            "pdf_text_fallback source_path=%r primary=%s fallback=%s reason=%s",
+            str(pdf_path),
+            _extractor_name(self.primary),
+            _extractor_name(self.fallback),
+            reason,
         )
-        if not _has_usable_page_text(primary_pages):
-            return _extract_with_stage_context(
-                self.fallback,
-                pdf_path,
-                stage="fallback",
-            )
-        return primary_pages
+        try:
+            fallback_pages = _extract_with_stage_context(self.fallback, pdf_path, stage="fallback")
+            if not _has_usable_page_text(fallback_pages):
+                raise AdapterError(
+                    f"fallback PDF text extraction with {_extractor_name(self.fallback)} returned no usable text"
+                )
+        except AdapterError as exc:
+            raise AdapterError(f"{primary_failure}; {exc}") from exc
+        return fallback_pages
 
 
 def build_pdf_text_extractor(mode: PdfExtractorMode = PDF_EXTRACTOR_AUTO) -> TextExtractor:
@@ -191,6 +215,7 @@ class PdfSourceAdapter:
 
     ocr_runner: OcrRunner = field(default_factory=SubprocessOcrRunner)
     text_extractor: TextExtractor | None = None
+    format_version: str = "2"
 
     @property
     def media_types(self) -> Sequence[str]:
@@ -199,8 +224,22 @@ class PdfSourceAdapter:
     def extract(self, artifact: AdapterInput) -> AdapterResult:
         _validate_pdf_artifact(artifact)
         normalized_path = artifact.work_dir / f"{artifact.content_hash}.pdf"
+        extractor = self.text_extractor or build_pdf_text_extractor(
+            _extractor_mode_from_options(artifact.options)
+        )
+        ocr_failure: OcrNormalizationError | None = None
         try:
             self.ocr_runner.normalize_pdf(artifact.artifact_path, normalized_path)
+        except OcrNormalizationError as exc:
+            if exc.returncode != 4:
+                raise
+            ocr_failure = exc
+            LOGGER.warning(
+                "pdf_ocr_fallback source_path=%r exit_code=4 extractor=%s; "
+                "extracting existing original text without OCR; image-only pages may remain empty",
+                str(artifact.artifact_path),
+                _extractor_name(extractor),
+            )
         except AdapterError:
             raise
         except Exception as exc:
@@ -208,17 +247,22 @@ class PdfSourceAdapter:
                 f"PDF OCR normalization failed for {artifact.artifact_path}: {exc}"
             ) from exc
 
-        extractor = self.text_extractor or build_pdf_text_extractor(
-            _extractor_mode_from_options(artifact.options)
-        )
+        extraction_path = artifact.artifact_path if ocr_failure is not None else normalized_path
         try:
-            pages = extractor.extract_pages(normalized_path)
-        except AdapterError as exc:
-            raise AdapterError(f"Failed extracting PDF text from {normalized_path}: {exc}") from exc
+            pages = extractor.extract_pages(extraction_path)
+            if ocr_failure is not None and not _has_usable_page_text(pages):
+                raise AdapterError("direct extraction returned no usable text")
+            _validate_page_order(pages)
         except Exception as exc:
-            raise AdapterError(f"Failed extracting PDF text from {normalized_path}: {exc}") from exc
+            if ocr_failure is not None:
+                raise AdapterError(
+                    f"{ocr_failure}; direct extraction from the original PDF with "
+                    f"{_extractor_name(extractor)} also failed: {exc}. "
+                    "Repair/re-export the PDF or resolve the OCR error, then retry; "
+                    "image-only PDFs require working OCR."
+                ) from exc
+            raise AdapterError(f"Failed extracting PDF text from {extraction_path}: {exc}") from exc
 
-        _validate_page_order(pages)
         units = tuple(
             CanonicalSourceUnit(
                 ordinal=page.page_number,
@@ -226,7 +270,9 @@ class PdfSourceAdapter:
                 location={"page_number": page.page_number},
                 human_label=f"p. {page.page_number}",
                 normalized_text=page.text,
-                structure={},
+                structure={"text_source": "original", "ocr_exit_code": 4}
+                if ocr_failure is not None
+                else {},
                 extractor=ExtractorIdentity(name=page.extractor),
             )
             for page in pages
@@ -235,7 +281,7 @@ class PdfSourceAdapter:
             media_type=PDF_MEDIA_TYPE,
             units=units,
             extractor=ExtractorIdentity(name=_extractor_name(extractor)),
-            derived_artifact_path=normalized_path,
+            derived_artifact_path=None if ocr_failure is not None else normalized_path,
         )
 
 

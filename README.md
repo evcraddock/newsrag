@@ -62,6 +62,15 @@ newsrag doctor
 newsrag status --initialize
 ```
 
+Ingest PDFs with page citations and automatic recovery for OCRmyPDF exit status 4:
+
+```bash
+newsrag ingest ./agenda.pdf
+newsrag ingest ./agenda.pdf --pdf-extractor pdfplumber
+```
+
+See [PDF extraction and OCR recovery](docs/pdf.md) for extractor selection, fallback limits, and retry guidance.
+
 Ingest plain-text sources with stable line citations:
 
 ```bash
