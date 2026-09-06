@@ -1,6 +1,6 @@
 # CSV sources and exact cell evidence
 
-CSV ingestion follows the [approved tabular contract](research/tabular-source-ingestion-and-citations.md). CSV is supported; XLSX parsing, calculation, joins, aggregation, hidden-content overrides, and executable spreadsheet export are not implemented.
+CSV ingestion follows the [approved tabular contract](research/tabular-source-ingestion-and-citations.md). CSV and [XLSX](xlsx.md) share generation-owned tables, cells, and exact evidence selectors. Calculation, joins, aggregation, hidden-content overrides, and executable spreadsheet export are not implemented.
 
 ## Ingest and search
 
@@ -17,7 +17,7 @@ newsrag packet "Roads" --source-type csv --out roads.md
 
 Case-insensitive `.csv`, `text/csv`, and `application/csv` select the adapter. Generic transport requires explicit or filename evidence; printable text and ZIP signatures do not identify CSV. `text/plain` stays plain text unless explicitly selected as CSV (or refreshing an already accepted CSV source). An explicit CSV hint preserves text charset parameters but cannot override contradictory non-text media or invalid source bytes. Public HTTP(S) acquisition retains the existing redirect, DNS, private-address, timeout, and size protections.
 
-Recipe flags select CSV when `--type` is omitted. Conflicting type/PDF options and invalid recipe values fail before enqueueing. Recipe flags cannot apply to a directory scan: use a manifest for per-file settings. Recursive directories include CSV alongside existing formats; mixed-source retrieval remains the default.
+Recipe flags select CSV when `--type` is omitted. Conflicting type/PDF/XLSX options and invalid recipe values fail before enqueueing. Recipe flags cannot apply to a directory scan: use a manifest for per-file settings. Recursive directories include CSV alongside existing formats; mixed-source retrieval remains the default.
 
 ```yaml
 documents:

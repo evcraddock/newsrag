@@ -376,11 +376,11 @@ def test_cli_source_type_help_lists_text() -> None:
     search_help = runner.invoke(app, ["search", "--help"]).stdout
     inventory_help = runner.invoke(app, ["documents", "list", "--help"]).stdout
 
-    assert "csv, docx, html, markdown, pdf, text" in " ".join(
+    assert "csv, docx, html, markdown, pdf, text, xlsx" in " ".join(
         unstyle(ingest_help).replace("│", "").split()
     )
     for help_text in (search_help, inventory_help):
-        assert "csv, docx, html, markdown, pdf, or text" in " ".join(
+        assert "csv, docx, html, markdown, pdf, text, or xlsx" in " ".join(
             unstyle(help_text).replace("│", "").split()
         )
 

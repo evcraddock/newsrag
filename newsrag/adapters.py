@@ -11,6 +11,7 @@ from newsrag.sources import (
     SOURCE_TYPE_HTML,
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     TEXT_MEDIA_TYPE,
 )
 from newsrag.tabular import Table
@@ -214,23 +215,43 @@ def _validate_type_evidence(
     filename: str,
 ) -> None:
     media_type = (reported_media_type or "").partition(";")[0].strip().lower()
-    if registration.source_type == SOURCE_TYPE_DOCX:
-        if Path(filename).suffix.lower() in {
+    if registration.source_type in {SOURCE_TYPE_DOCX, SOURCE_TYPE_XLSX}:
+        label = registration.source_type.upper()
+        office_extensions = {
             ".doc",
+            ".docx",
             ".docm",
             ".dot",
             ".dotm",
             ".dotx",
             ".xlsx",
             ".xlsm",
+            ".xlsb",
             ".xls",
+            ".xlt",
+            ".xltx",
+            ".xltm",
+            ".xlam",
+            ".xla",
+            ".xlw",
             ".ppt",
             ".pptx",
             ".pptm",
+            ".pot",
+            ".potx",
+            ".potm",
+            ".pps",
+            ".ppsx",
+            ".ppsm",
             ".odt",
+            ".ods",
+            ".odp",
             ".rtf",
-        }:
-            raise AdapterSelectionError("DOCX selection conflicts with the Office filename type")
+        }
+        if Path(filename).suffix.lower() in office_extensions - set(registration.extensions):
+            raise AdapterSelectionError(
+                f"{label} selection conflicts with the Office filename type"
+            )
         if media_type not in {
             "",
             *registration.accepted_media_types,
@@ -239,7 +260,7 @@ def _validate_type_evidence(
             "application/zip",
             "application/x-zip-compressed",
         }:
-            raise AdapterSelectionError("DOCX selection conflicts with the reported media type")
+            raise AdapterSelectionError(f"{label} selection conflicts with the reported media type")
         return
     if registration.source_type not in {SOURCE_TYPE_TEXT, SOURCE_TYPE_MARKDOWN, SOURCE_TYPE_CSV}:
         return

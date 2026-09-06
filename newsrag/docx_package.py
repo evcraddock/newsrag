@@ -1,20 +1,15 @@
 from __future__ import annotations
 
-import io
-import posixpath
 import re
-import stat
-import unicodedata
 import zipfile
-import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote_to_bytes
 
 from lxml import etree  # type: ignore[import-untyped]
 
 from newsrag import sources as _sources
 from newsrag.adapters import AdapterError
+from newsrag.opc_package import OpcReader
 
 DOCX_PACKAGE_VERSION = "1"
 DOCX_MEDIA_TYPE = _sources.DOCX_MEDIA_TYPE
@@ -244,9 +239,7 @@ _DANGEROUS_ELEMENT_NAMESPACES = frozenset(
         "urn:schemas-microsoft-com:vml",
     }
 )
-_XML_DECLARATION_PATTERN = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _RELATIONSHIP_ID_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
-_PERCENT_ESCAPE_PATTERN = re.compile(r"%(?![0-9A-Fa-f]{2})")
 _DANGEROUS_FIELD_PATTERN = re.compile(
     r"(?<![A-Z])(?:DATABASE|DDEAUTO|DDE|INCLUDEPICTURE|INCLUDETEXT|LINK|RD|MACROBUTTON)"
 )
@@ -332,101 +325,30 @@ def load_docx_package(path: Path) -> DocxPackage:
     )
 
 
+def _opc_reader() -> OpcReader:
+    # Read module constants at call time to preserve existing boundary-test hooks.
+    return OpcReader(
+        format_name="DOCX",
+        max_source_bytes=DOCX_MAX_SOURCE_BYTES,
+        max_members=DOCX_MAX_MEMBERS,
+        max_expanded_bytes=DOCX_MAX_EXPANDED_BYTES,
+        max_part_bytes=DOCX_MAX_PART_BYTES,
+        max_compression_ratio=DOCX_MAX_COMPRESSION_RATIO,
+        max_xml_elements=DOCX_MAX_XML_ELEMENTS,
+        max_xml_depth=DOCX_MAX_XML_DEPTH,
+    )
+
+
 def _read_bounded_package(path: Path) -> bytes:
-    try:
-        path_stat = path.stat()
-        if not stat.S_ISREG(path_stat.st_mode):
-            raise AdapterError("DOCX artifact must be a regular file")
-        if path_stat.st_size > DOCX_MAX_SOURCE_BYTES:
-            raise AdapterError(
-                f"DOCX artifact exceeds the {DOCX_MAX_SOURCE_BYTES}-byte raw input limit"
-            )
-        with path.open("rb") as package_file:
-            package = package_file.read(DOCX_MAX_SOURCE_BYTES + 1)
-    except AdapterError:
-        raise
-    except OSError as exc:
-        raise AdapterError(f"Failed reading DOCX artifact {path} ({type(exc).__name__})") from exc
-    if len(package) > DOCX_MAX_SOURCE_BYTES:
-        raise AdapterError(
-            f"DOCX artifact exceeds the {DOCX_MAX_SOURCE_BYTES}-byte raw input limit"
-        )
-    if not package:
-        raise AdapterError("DOCX artifact is empty")
-    if not package.startswith(b"PK\x03\x04"):
-        raise AdapterError("DOCX artifact is not a ZIP package")
-    return package
+    return _opc_reader().read_bounded_package(path)
 
 
 def _read_zip_members(package: bytes) -> dict[str, bytes]:
-    payloads: dict[str, bytes] = {}
-    aliases: dict[str, str] = {}
-    total_expanded = 0
-    try:
-        with zipfile.ZipFile(io.BytesIO(package), mode="r") as archive:
-            members = archive.infolist()
-            if len(members) > DOCX_MAX_MEMBERS:
-                raise AdapterError(f"DOCX package exceeds the {DOCX_MAX_MEMBERS}-member limit")
-            for member in members:
-                part_name = _validate_zip_member(member, aliases)
-                if member.is_dir():
-                    continue
-                total_expanded += member.file_size
-                if total_expanded > DOCX_MAX_EXPANDED_BYTES:
-                    raise AdapterError(
-                        "DOCX package exceeds the "
-                        f"{DOCX_MAX_EXPANDED_BYTES}-byte total expansion limit"
-                    )
-                payload, actual_size = _read_zip_member(archive, member, total_expanded)
-                if actual_size != member.file_size:
-                    raise AdapterError(f"DOCX part {part_name!r} expanded to an unexpected size")
-                payloads[part_name] = payload
-    except AdapterError:
-        raise
-    except (EOFError, NotImplementedError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
-        raise AdapterError(
-            f"DOCX artifact has an invalid ZIP package ({type(exc).__name__})"
-        ) from exc
-    if not payloads:
-        raise AdapterError("DOCX ZIP package contains no parts")
-    return payloads
+    return _opc_reader().read_zip_members(package)
 
 
 def _validate_zip_member(member: zipfile.ZipInfo, aliases: dict[str, str]) -> str:
-    original_name = getattr(member, "orig_filename", member.filename)
-    path_to_validate = original_name[:-1] if member.is_dir() else original_name
-    part_name = _normalize_member_name(path_to_validate, "ZIP member")
-    alias = _part_alias(part_name)
-    previous = aliases.get(alias)
-    if previous is not None:
-        raise AdapterError(
-            f"DOCX package contains duplicate or aliased parts {previous!r} and {original_name!r}"
-        )
-    aliases[alias] = original_name
-    mode = member.external_attr >> 16
-    if stat.S_IFMT(mode) == stat.S_IFLNK:
-        raise AdapterError(f"DOCX ZIP member {original_name!r} is a symbolic link")
-    if member.flag_bits & 0x1:
-        raise AdapterError(f"DOCX ZIP member {original_name!r} is encrypted")
-    if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
-        raise AdapterError(
-            f"DOCX ZIP member {original_name!r} uses an unsupported compression method"
-        )
-    if member.is_dir() and (member.file_size != 0 or member.CRC != 0):
-        raise AdapterError(f"DOCX ZIP directory member {original_name!r} contains payload data")
-    if member.file_size > DOCX_MAX_PART_BYTES:
-        raise AdapterError(
-            f"DOCX part {original_name!r} exceeds the {DOCX_MAX_PART_BYTES}-byte part limit"
-        )
-    if member.file_size and (
-        member.compress_size == 0
-        or member.file_size / member.compress_size > DOCX_MAX_COMPRESSION_RATIO
-    ):
-        raise AdapterError(
-            f"DOCX part {original_name!r} exceeds the {DOCX_MAX_COMPRESSION_RATIO}:1 "
-            "compression-ratio limit"
-        )
-    return part_name
+    return _opc_reader().validate_zip_member(member, aliases)
 
 
 def _read_zip_member(
@@ -434,116 +356,27 @@ def _read_zip_member(
     member: zipfile.ZipInfo,
     declared_total: int,
 ) -> tuple[bytes, int]:
-    chunks: list[bytes] = []
-    actual_size = 0
-    try:
-        with archive.open(member, mode="r") as member_file:
-            while chunk := member_file.read(64 * 1024):
-                actual_size += len(chunk)
-                if actual_size > DOCX_MAX_PART_BYTES:
-                    raise AdapterError(
-                        f"DOCX part {member.filename!r} exceeds the actual expanded-size limit"
-                    )
-                actual_total = declared_total - member.file_size + actual_size
-                if actual_total > DOCX_MAX_EXPANDED_BYTES:
-                    raise AdapterError("DOCX package exceeds the actual total expansion limit")
-                chunks.append(chunk)
-    except AdapterError:
-        raise
-    except (EOFError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
-        raise AdapterError(
-            f"DOCX part {member.filename!r} failed CRC or expanded-size validation"
-        ) from exc
-    return b"".join(chunks), actual_size
+    return _opc_reader().read_zip_member(archive, member, declared_total)
 
 
 def _normalize_member_name(value: str, context: str) -> str:
-    if not value or value.startswith(("/", "\\")):
-        raise AdapterError(f"DOCX {context} has an unsafe absolute or empty path")
-    if "\\" in value or "\x00" in value or _PERCENT_ESCAPE_PATTERN.search(value):
-        raise AdapterError(f"DOCX {context} has an unsafe path {value!r}")
-    try:
-        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise AdapterError(f"DOCX {context} has a non-UTF-8 part name") from exc
-    decoded = unicodedata.normalize("NFC", decoded)
-    if (
-        decoded.startswith("/")
-        or "\\" in decoded
-        or "\x00" in decoded
-        or "?" in decoded
-        or "#" in decoded
-    ):
-        raise AdapterError(f"DOCX {context} has an unsafe path {value!r}")
-    segments = decoded.split("/")
-    if any(
-        not segment
-        or segment in {".", ".."}
-        or ":" in segment
-        or any(ord(character) < 32 or ord(character) == 127 for character in segment)
-        for segment in segments
-    ):
-        raise AdapterError(f"DOCX {context} has an unsafe traversal or aliased path {value!r}")
-    return decoded
+    return _opc_reader().normalize_member_name(value, context)
 
 
 def _part_alias(part_name: str) -> str:
-    return unicodedata.normalize("NFC", part_name).casefold()
+    return _opc_reader().part_alias(part_name)
 
 
 def _required_part(payloads: dict[str, bytes], part_name: str) -> bytes:
-    match = next((name for name in payloads if _part_alias(name) == _part_alias(part_name)), None)
-    if match is None:
-        raise AdapterError(f"DOCX package is missing required part {part_name!r}")
-    if match != part_name:
-        raise AdapterError(f"DOCX required part must use canonical name {part_name!r}")
-    return payloads[match]
+    return _opc_reader().required_part(payloads, part_name)
 
 
 def _parse_xml(payload: bytes, part_name: str) -> etree._Element:
-    if _XML_DECLARATION_PATTERN.search(payload):
-        raise AdapterError(f"DOCX XML part {part_name!r} contains a forbidden DTD or entity")
-    parser = etree.XMLParser(
-        load_dtd=False,
-        no_network=True,
-        recover=False,
-        remove_comments=True,
-        remove_pis=True,
-        resolve_entities=False,
-        huge_tree=False,
-    )
-    try:
-        root = etree.fromstring(payload, parser=parser)
-    except (ValueError, etree.ParserError, etree.XMLSyntaxError) as exc:
-        raise AdapterError(f"DOCX XML part {part_name!r} is malformed") from exc
-    document_info = root.getroottree().docinfo
-    if document_info.doctype or document_info.internalDTD is not None:
-        raise AdapterError(f"DOCX XML part {part_name!r} contains a forbidden DTD or entity")
-    if any(isinstance(node, etree._Entity) for node in root.iter()):
-        raise AdapterError(f"DOCX XML part {part_name!r} contains an unresolved entity")
-    if not isinstance(root.tag, str):
-        raise AdapterError(f"DOCX XML part {part_name!r} has no document element")
-    return root
+    return _opc_reader().parse_xml(payload, part_name)
 
 
 def _validate_xml_tree(root: etree._Element, part_name: str, current_count: int) -> int:
-    element_count = current_count
-    stack: list[tuple[etree._Element, int]] = [(root, 1)]
-    while stack:
-        element, depth = stack.pop()
-        if not isinstance(element.tag, str):
-            continue
-        element_count += 1
-        if element_count > DOCX_MAX_XML_ELEMENTS:
-            raise AdapterError(
-                f"DOCX XML exceeds the {DOCX_MAX_XML_ELEMENTS}-element cumulative limit"
-            )
-        if depth > DOCX_MAX_XML_DEPTH:
-            raise AdapterError(
-                f"DOCX XML part {part_name!r} exceeds the {DOCX_MAX_XML_DEPTH}-level depth limit"
-            )
-        stack.extend((child, depth + 1) for child in element if isinstance(child.tag, str))
-    return element_count
+    return _opc_reader().validate_xml_tree(root, part_name, current_count)
 
 
 def _validate_content_types(
@@ -717,14 +550,7 @@ def _validate_relationships(
 
 
 def _source_for_relationship_part(part_name: str) -> str:
-    if part_name == "_rels/.rels":
-        return ""
-    directory, separator, filename = part_name.rpartition("/")
-    if not separator or not directory.endswith("/_rels") or not filename.endswith(".rels"):
-        raise AdapterError(f"DOCX relationship part {part_name!r} has an invalid package location")
-    source_directory = directory.removesuffix("/_rels")
-    source_filename = filename.removesuffix(".rels")
-    return f"{source_directory}/{source_filename}"
+    return _opc_reader().source_for_relationship_part(part_name)
 
 
 def _parse_relationships(
@@ -831,28 +657,11 @@ def _validate_xml_relationship_references(
 
 
 def _resolve_relationship_target(source_part: str, target: str) -> str:
-    if not target or "?" in target or "#" in target or "\\" in target:
-        raise AdapterError(f"DOCX relationship has unsafe internal target {target!r}")
-    is_absolute = target.startswith("/")
-    candidate = target[1:] if is_absolute else target
-    if _PERCENT_ESCAPE_PATTERN.search(candidate):
-        raise AdapterError(f"DOCX relationship has unsafe internal target {target!r}")
-    try:
-        decoded = unquote_to_bytes(candidate).decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise AdapterError("DOCX relationship target is not valid UTF-8") from exc
-    if "\\" in decoded or "\x00" in decoded or decoded.startswith("/"):
-        raise AdapterError(f"DOCX relationship has unsafe internal target {target!r}")
-    base_directory = "" if is_absolute else posixpath.dirname(source_part)
-    resolved = posixpath.normpath(posixpath.join(base_directory, decoded))
-    if resolved in {"", ".", ".."} or resolved.startswith("../"):
-        raise AdapterError(f"DOCX relationship target traverses outside the package: {target!r}")
-    return _normalize_member_name(resolved, "relationship target")
+    return _opc_reader().resolve_relationship_target(source_part, target)
 
 
 def _match_part_name(payloads: dict[str, bytes], requested: str) -> str | None:
-    alias = _part_alias(requested)
-    return next((part_name for part_name in payloads if _part_alias(part_name) == alias), None)
+    return _opc_reader().match_part_name(payloads, requested)
 
 
 def _validate_root_relationship(

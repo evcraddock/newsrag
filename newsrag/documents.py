@@ -14,6 +14,7 @@ from newsrag.sources import (
     SOURCE_TYPE_MARKDOWN,
     SOURCE_TYPE_PDF,
     SOURCE_TYPE_TEXT,
+    SOURCE_TYPE_XLSX,
     SUPPORTED_SOURCE_TYPES,
     media_types_for_source_type,
     source_type_for_media_type,
@@ -579,8 +580,10 @@ def format_document_list(page: DocumentListPage) -> str:
         ]
         if document.table_descriptors:
             parts.append(
-                f"sheets={len(document.table_descriptors)} tables={len(document.table_descriptors)} excluded_hidden=0"
+                f"sheets={len(document.table_descriptors)} tables={len(document.table_descriptors)} "
+                + _hidden_inventory(document.table_descriptors)
             )
+            parts.extend(_table_extent_label(table) for table in document.table_descriptors)
         lines.append(" | ".join(parts))
 
     return "\n".join(lines)
@@ -610,15 +613,12 @@ def format_document_detail(document: DocumentDetail) -> str:
             [
                 f"sheets: {len(document.table_descriptors)}",
                 f"tables: {len(document.table_descriptors)}",
-                "excluded_hidden: 0",
+                _hidden_inventory(document.table_descriptors, separator=": "),
             ]
             if document.table_descriptors
             else []
         ),
-        *(
-            f"table {table['sheet_index']}: rows {table['row_start']}–{table['row_end']}, columns {table['column_start']}–{table['column_end']}"
-            for table in document.table_descriptors
-        ),
+        *(_table_extent_label(table) for table in document.table_descriptors),
         "metadata:",
     ]
 
@@ -773,12 +773,46 @@ def _row_to_summary(row: sqlite3.Row, database_path: Path) -> DocumentSummary:
     )
 
 
+def _hidden_inventory(tables: tuple[dict[str, Any], ...], *, separator: str = "=") -> str:
+    counts = {"sheets": 0, "rows": 0, "columns": 0}
+    for table in tables:
+        metadata = table.get("metadata", {})
+        counts["sheets"] += metadata.get("sheet_state", "visible") != "visible"
+        for axis in ("rows", "columns"):
+            counts[axis] += sum(
+                end - start + 1 for start, end in metadata.get(f"hidden_{axis}", [])
+            )
+    return " ".join(
+        f"excluded_hidden{separator}{sum(counts.values())}"
+        if key == "total"
+        else f"excluded_hidden_{key}{separator}{counts[key]}"
+        for key in ("total", "sheets", "rows", "columns")
+    )
+
+
+def _table_extent_label(table: dict[str, Any]) -> str:
+    from newsrag.tabular import column_label
+
+    name = table.get("sheet_name")
+    label = f"table {table['sheet_index']}"
+    if name is not None:
+        label += f" sheet {json.dumps(name, ensure_ascii=False)}"
+    if table["row_start"] is None:
+        return label + ": empty"
+    start = f"{column_label(table['column_start'])}{table['row_start']}"
+    end = f"{column_label(table['column_end'])}{table['row_end']}"
+    return (
+        f"{label}: extent {start}:{end}, rows {table['row_start']}–{table['row_end']}, "
+        f"columns {table['column_start']}–{table['column_end']}"
+    )
+
+
 def _table_inventory(database_path: Path, row: sqlite3.Row) -> tuple[dict[str, Any], ...]:
     with sqlite3.connect(database_path) as connection:
         return tuple(
             json.loads(item[0])
             for item in connection.execute(
-                "SELECT descriptor_json FROM source_tables WHERE document_id = ? AND processing_generation_id IS ? ORDER BY table_id",
+                "SELECT descriptor_json FROM source_tables WHERE document_id = ? AND processing_generation_id IS ? ORDER BY json_extract(descriptor_json, '$.sheet_index')",
                 (row["id"], row["current_processing_generation_id"]),
             )
         )
@@ -797,7 +831,7 @@ def _row_source_extent(row: sqlite3.Row) -> tuple[str, str, int]:
         return source_type, "lines", int(row["markdown_line_count"])
     if source_type == SOURCE_TYPE_DOCX:
         return source_type, "blocks", int(row["docx_block_count"])
-    if source_type == SOURCE_TYPE_CSV:
+    if source_type in {SOURCE_TYPE_CSV, SOURCE_TYPE_XLSX}:
         return source_type, "rows", int(row["source_unit_count"])
     return media_type or "unknown", "units", int(row["source_unit_count"])
 

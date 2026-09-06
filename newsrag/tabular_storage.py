@@ -16,9 +16,11 @@ from newsrag.tabular import (
     TableError,
     TablePassage,
     TableRegion,
+    hidden_exclusion_annotations,
     positive_integer,
     render_cells,
     serialized,
+    table_location_label,
     validate_region,
 )
 
@@ -250,10 +252,31 @@ class ResolvedTableRegion:
     source_unit_end_id: str
     cells: tuple[Cell, ...]
     annotations: tuple[str, ...] = ()
+    location_label: str = ""
 
     @property
     def text(self) -> str:
         return render_cells(self.cells)
+
+    @property
+    def qualifications(self) -> tuple[str, ...]:
+        """Compact value qualifications for discovery citations even when a quote is literal."""
+        from newsrag.tabular import column_label
+
+        result = list(self.annotations)
+        for cell in self.cells:
+            coordinate = f"{column_label(cell.column)}{cell.row}"
+            formula = cell.metadata.get("formula")
+            if isinstance(formula, dict):
+                result.append(
+                    f"{coordinate}: formula-cache; freshness not verified"
+                    if formula.get("cache_present")
+                    else f"{coordinate}: formula-cache unavailable"
+                )
+            merge = cell.metadata.get("evidence_merge")
+            if merge is not None:
+                result.append(f"{coordinate}: merged anchor: {TableRegion.from_dict(merge).label}")
+        return tuple(result)
 
     def reference(self) -> dict[str, Any]:
         return {
@@ -345,16 +368,16 @@ def resolve_table_region(
         and source_unit_end_id != end_id
     ):
         raise TableError("Evidence rectangle does not match its source-unit endpoints")
-    annotations = []
-    for value in table.metadata.get("merges", []):
-        merge = TableRegion.from_dict(value)
-        if (
-            region.row_start <= merge.row_start <= region.row_end
-            and region.column_start <= merge.column_start <= region.column_end
-        ):
-            annotations.append(f"merged anchor: {merge.label}")
+    annotations = hidden_exclusion_annotations(table, region)
     return ResolvedTableRegion(
-        document_id, generation_id, region, start_id, end_id, resolved, tuple(annotations)
+        document_id,
+        generation_id,
+        region,
+        start_id,
+        end_id,
+        resolved,
+        annotations,
+        table_location_label(table, region),
     )
 
 

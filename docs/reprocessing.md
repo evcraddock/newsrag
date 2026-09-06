@@ -9,12 +9,14 @@ newsrag reprocess <document-id>
 newsrag reprocess <document-id-1> <document-id-2>
 newsrag reprocess <pdf-document-id> --pdf-extractor pdfplumber
 newsrag reprocess <csv-document-id> --csv-header absent --csv-delimiter semicolon
+newsrag reprocess <xlsx-document-id> --xlsx-header-rows '{"FY 2026":4}'
+newsrag reprocess <xlsx-document-id> --xlsx-header-rows '{}'
 newsrag jobs list
 newsrag jobs retry <failed-job-id>
 newsrag documents generations <document-id>
 ```
 
-Each request accepts 1–20 explicit published document IDs. Historical source revisions may be selected explicitly. There are no directory, manifest, wildcard, automatic, scheduled, or unbounded corpus modes. Duplicate IDs within a request are deduplicated. The whole batch is validated before any new jobs are inserted, including unknown documents and incompatible PDF-only options. Each accepted document has its own independently completing job; a failure does not roll back other successful documents in the batch.
+Each request accepts 1–20 explicit published document IDs. Historical source revisions may be selected explicitly. There are no directory, manifest, wildcard, automatic, scheduled, or unbounded corpus modes. Duplicate IDs within a request are deduplicated. The whole batch is validated before any new jobs are inserted, including unknown documents and incompatible PDF/CSV/XLSX recipe options. Each accepted document has its own independently completing job; a failure does not roll back other successful documents in the batch.
 
 A repeated request returns an existing pending/running job for the same document and options. Different options for an already active target fail clearly rather than silently replacing the target. Enqueueing does not load an embedding model or read source contents. The worker needs the configured processing tools and embedding service.
 
@@ -56,6 +58,6 @@ Stop all old NewsRAG daemons before upgrading a corpus to schema 8, then restart
 
 Migration creates one legacy processing generation per existing published document, preserves original document/source-unit/derived row IDs, text, FTS entries, embedding records, normalized paths, revision history, and staged artifacts, and assigns generation membership. It changes source-unit ordinal uniqueness without renumbering old citations. Unknown legacy processing fingerprints are marked `legacy:unknown`, not fabricated. Migration is idempotent and validates generation ownership.
 
-Schema 8 adds generation-owned tabular descriptors/cells, exact focus/context selectors, and nullable discovery fields without modifying legacy text or inventing table locations. [CSV recipes](csv.md) inherit omitted settings, validate overrides against the whole batch, and retain old selectors. Refresh captures the active generation's requested recipe; each new artifact gets its own validated observed interpretation.
+Schema 8 adds generation-owned tabular descriptors/cells, exact focus/context selectors, and nullable discovery fields without modifying legacy text or inventing table locations. [CSV recipes](csv.md) inherit omitted settings, validate overrides against the whole batch, and retain old selectors. Refresh captures the active generation's requested recipe; each new artifact gets its own validated observed interpretation. [XLSX recipes](xlsx.md) replace the entire per-sheet header map when supplied; `{}` clears overrides, while omission inherits the active recipe. XLSX uses the same schema and generation-owned tables/cells. Shared tabular renderer version 2 adds cache/merge/visibility qualifications to new processing outputs without rewriting existing generations or saved packets.
 
 No automatic enrichment, source reassignment, metadata editing, retention/deletion, manual rollback, or automatic reprocessing is added. Use disposable corpora for migration and failure testing before upgrading an installed corpus.

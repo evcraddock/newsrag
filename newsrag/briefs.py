@@ -200,7 +200,7 @@ def format_generated_brief(brief: GeneratedBrief) -> str:
             f"status: {brief.record.status}",
         ]
     )
-    if document.source_type == "csv":
+    if document.source_type in {"csv", "xlsx"}:
         return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 

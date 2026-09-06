@@ -28,6 +28,8 @@ from newsrag.sources import (
     MARKDOWN_MEDIA_TYPE,
     TEXT_MAX_SOURCE_BYTES,
     TEXT_MEDIA_TYPE,
+    XLSX_MAX_SOURCE_BYTES,
+    XLSX_MEDIA_TYPE,
     normalize_url_reference,
 )
 
@@ -904,6 +906,8 @@ def _effective_source_limit(
         limits.append(TEXT_MAX_SOURCE_BYTES)
     if apply_reported_media_limit and normalized_media_type == DOCX_MEDIA_TYPE:
         limits.append(DOCX_MAX_SOURCE_BYTES)
+    if apply_reported_media_limit and normalized_media_type == XLSX_MEDIA_TYPE:
+        limits.append(XLSX_MAX_SOURCE_BYTES)
     return min(limits)
 
 

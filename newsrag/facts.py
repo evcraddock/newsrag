@@ -17,6 +17,7 @@ from newsrag.discovery import (
 from newsrag.source_locations import (
     SourceLocationError,
     format_evidence_location,
+    format_inert_tabular_text,
     resolve_source_range,
 )
 from newsrag.tabular_evidence import TableEvidence
@@ -188,13 +189,14 @@ def extract_facts_from_sources(sources: Sequence[FactSource]) -> list[FactDraft]
                 drafts.append(
                     FactDraft(
                         item_type="table_values",
-                        label=focus.region.label,
+                        label=focus.location_label or focus.region.label,
                         value={
                             "representation": "extractive-table",
                             "region": focus.region.to_dict(),
                             "text": focus.text,
+                            "annotations": list(focus.annotations),
                         },
-                        summary=focus.text,
+                        summary="\n".join((focus.text, *focus.annotations)),
                         confidence=1.0,
                         evidence=DiscoveryEvidenceDraft(
                             document_id=source.document_id,
@@ -305,6 +307,8 @@ def format_fact_extraction_result(result: FactExtractionResult) -> str:
                 compact_pdf=True,
             )
         lines.append(f"- {item.item_type}: {item.label} confidence={item.confidence:.2f}{citation}")
+    if any(evidence.table_region is not None for item in items for evidence in item.evidence):
+        return "\n".join(format_inert_tabular_text(line) for line in lines)
     return "\n".join(lines)
 
 
