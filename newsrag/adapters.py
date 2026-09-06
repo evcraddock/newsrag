@@ -12,6 +12,7 @@ from newsrag.sources import (
     SOURCE_TYPE_TEXT,
     TEXT_MEDIA_TYPE,
 )
+from newsrag.tabular import Table
 
 
 class AdapterError(Exception):
@@ -63,6 +64,7 @@ class AdapterResult:
     extractor: ExtractorIdentity
     derived_artifact_path: Path | None = None
     metadata_candidates: dict[str, str] = field(default_factory=dict)
+    tables: tuple[Table, ...] = ()
 
 
 class SourceAdapter(Protocol):

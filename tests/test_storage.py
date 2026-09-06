@@ -225,7 +225,7 @@ def test_schema_upgrade_resets_only_regenerable_discovery_data(tmp_path: Path) -
         "document_briefs_fts": 0,
         "discovery_items_fts": 0,
     }
-    assert schema_version == "7"
+    assert schema_version == "8"
 
 
 def test_initialize_storage_backfills_passages_from_existing_chunks(tmp_path: Path) -> None:
