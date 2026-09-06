@@ -112,8 +112,9 @@ class SourceAdapterRegistry:
         source_type_hint: str | None,
         reported_media_type: str | None,
         filename: str,
+        fallback_source_type: str | None = None,
     ) -> RegisteredSourceAdapter:
-        """Select an adapter using hint, media type, signature, then extension."""
+        """Use fresh type evidence before an accepted fallback or weak extension."""
 
         if source_type_hint is not None:
             normalized_hint = source_type_hint.strip().lower()
@@ -159,6 +160,14 @@ class SourceAdapterRegistry:
         selected = _one_adapter_match(signature_matches, evidence="content signature")
         if selected is not None:
             return selected
+
+        if fallback_source_type is not None:
+            return self.select(
+                artifact_path=artifact_path,
+                source_type_hint=fallback_source_type,
+                reported_media_type=reported_media_type,
+                filename=filename,
+            )
 
         extension = Path(filename).suffix.lower()
         extension_matches = tuple(

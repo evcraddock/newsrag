@@ -765,6 +765,78 @@ def test_refresh_index_failure_keeps_previous_revision_and_real_vectors(
     assert _keyword_results(corpus.paths.database, "Unpublishedcandidate") == []
 
 
+@pytest.mark.parametrize("kind", ["local", "url", "url_weak_extension"])
+def test_explicit_text_refresh_retains_type_evidence_and_acquisition_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    original = b"Originaltext notice.\n"
+    revised = b"Revisedtext notice.\n"
+    if kind == "local":
+        source = tmp_path / "extensionless"
+        source.write_bytes(original)
+        corpus = _corpus(tmp_path / "corpus")
+        reference = str(source)
+    else:
+        reference = "https://example.gov/export" + (".pdf" if kind == "url_weak_extension" else "")
+        transport = HttpTransport(
+            [
+                HttpResponse(200, {"content-type": "application/octet-stream"}, (original,)),
+                HttpResponse(200, {"content-type": "application/octet-stream"}, (revised,)),
+                HttpResponse(
+                    200,
+                    {"content-type": "application/octet-stream", "content-length": "33"},
+                    (b"x" * 33,),
+                ),
+            ]
+        )
+        corpus = _corpus(
+            tmp_path / "corpus",
+            acquirer=SafeSourceArtifactAcquirer(
+                resolver=_public_resolver,
+                transport=transport,
+            ),
+        )
+    ingested = corpus.ingest(reference, source_type="text")
+    assert ingested.status == "done", ingested.error
+    assert ingested.result is not None
+    source_id = str(ingested.result["source_id"])
+    if kind == "local":
+        source.write_bytes(revised)
+    monkeypatch.setattr("newsrag.refresh.TEXT_MAX_SOURCE_BYTES", 32)
+    refreshed = corpus.run(enqueue_refresh(corpus.paths.database, source_id))
+    assert refreshed.status == "done", refreshed.error
+    assert refreshed.result is not None and refreshed.result["outcome"] == "revision_created"
+    assert refreshed.payload["base"]["source_type"] == "text"
+    assert len(_keyword_results(corpus.paths.database, "Revisedtext")) == 1
+    assert len(_keyword_results(corpus.paths.database, "Originaltext", include_history=True)) == 1
+    if kind == "local":
+        source.write_bytes(b"x" * 33)
+    oversized = corpus.run(enqueue_refresh(corpus.paths.database, source_id))
+    assert oversized.status == "failed"
+    assert "size_limit" in str(oversized.error)
+    assert corpus.rows("SELECT COUNT(*) FROM source_revisions") == [(2,)]
+    assert corpus.rows("SELECT COUNT(*) FROM source_artifacts") == [(2,)]
+
+
+def test_known_text_refresh_still_recognizes_a_strong_new_format(tmp_path: Path) -> None:
+    corpus = _corpus(tmp_path / "corpus")
+    source = tmp_path / "extensionless"
+    source.write_bytes(b"Original notice.")
+    ingested = corpus.ingest(str(source), source_type="text")
+    assert ingested.result is not None
+    source.write_bytes(b"%PDF-1.4\nchanged format")
+    refreshed = corpus.run(
+        enqueue_refresh(corpus.paths.database, str(ingested.result["source_id"]))
+    )
+    assert refreshed.status == "done", refreshed.error
+    assert refreshed.result is not None
+    assert corpus.rows(
+        "SELECT media_type FROM source_artifacts WHERE id = ?", (refreshed.result["artifact_id"],)
+    ) == [("application/pdf",)]
+
+
 def test_reported_text_media_type_applies_ten_mib_url_acquisition_cap(
     tmp_path: Path,
 ) -> None:

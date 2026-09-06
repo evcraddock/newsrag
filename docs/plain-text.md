@@ -59,6 +59,6 @@ Markdown parsing is outside this adapter. `.md` files are not automatically scan
 
 ## Lifecycle behavior
 
-Exact-byte duplicates retain first-successful-import-wins behavior. Ordinary ingestion of changed bytes stages them; explicit refresh may publish a new source revision. Historical reactivation reuses the original revision without reindexing. Current-only and `--include-history` source-revision scopes apply to text as to other formats.
+Exact-byte duplicates retain first-successful-import-wins behavior. Ordinary ingestion of changed bytes stages them; explicit refresh may publish a new source revision. Refresh retains the accepted text type and 10 MiB acquisition limit even for extensionless files and generic-content-type URLs originally accepted through an explicit text hint. Fresh recognized media types and content signatures take precedence over that fallback, so supported format changes still work; the fallback never bypasses text validation. Historical reactivation reuses the original revision without reindexing. Current-only and `--include-history` source-revision scopes apply to text as to other formats.
 
 Reprocessing preserves the original document/artifact/revision identity, charset choice, and older processing generations. New line units receive generation-specific IDs without rewriting old line text or citation anchors. Failed processing cannot replace currently searchable evidence. Existing packets remain unchanged. See [Reprocessing](reprocessing.md) for bounded batches, saved-configuration retries, and failure recovery.
