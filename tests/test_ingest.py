@@ -240,7 +240,7 @@ def test_ingest_command_enqueues_url_for_background_acquisition(tmp_path: Path) 
     assert "path" not in jobs[0].payload
     assert jobs[0].payload["metadata"]["body"] == "City Council"
     assert jobs[0].payload["metadata"]["document_type"] == "agenda_packet"
-    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert not (paths.data_dir / "downloaded-pdfs").exists()
     assert list(paths.source_artifacts.iterdir()) == []
 
 
@@ -275,7 +275,7 @@ def test_enqueue_ingest_url_does_not_fetch_before_daemon_processing(tmp_path: Pa
 
     assert first_job.payload["url"] == url
     assert second_job.payload["url"] == url
-    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert not (paths.data_dir / "downloaded-pdfs").exists()
     assert list(paths.source_artifacts.iterdir()) == []
 
 
@@ -1360,7 +1360,7 @@ def test_same_bytes_from_different_urls_ignore_the_second_source(tmp_path: Path)
     assert second_result is not None and second_result["outcome"] == "duplicate_ignored"
     assert get_job(paths.database, second_job.id).payload == {}
     assert sources == [(first_url,)]
-    assert list(paths.downloaded_pdfs.iterdir()) == []
+    assert not (paths.data_dir / "downloaded-pdfs").exists()
     assert len(list(paths.source_artifacts.iterdir())) == 1
     assert len(adapter.inputs) == 1
 

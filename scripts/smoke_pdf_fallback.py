@@ -88,7 +88,12 @@ def smoke(scratch: Path, port: int, source_pdf: Path | None) -> None:
             time.sleep(0.1)
         raise RuntimeError("Disposable PDF daemon did not finish within 90 seconds")
 
-    run("status", "--initialize")
+    for _ in range(2):
+        status = run("status", "--initialize")
+        assert "source_pdfs:" not in status and "downloaded_pdfs:" not in status
+        assert not (data / "source-pdfs").exists()
+        assert not (data / "downloaded-pdfs").exists()
+        assert (data / "ocr-pdfs").is_dir()
     started = False
     try:
         subprocess.run(

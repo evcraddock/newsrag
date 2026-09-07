@@ -29,8 +29,6 @@ class StoragePaths:
     """Resolved storage paths for one NewsRAG data directory."""
 
     data_dir: Path
-    source_pdfs: Path
-    downloaded_pdfs: Path
     ocr_pdfs: Path
     lancedb: Path
     logs: Path
@@ -73,8 +71,6 @@ class StorageStatusReport:
 
 
 DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
-    ("source_pdfs", "source-pdfs"),
-    ("downloaded_pdfs", "downloaded-pdfs"),
     ("ocr_pdfs", "ocr-pdfs"),
     ("lancedb", "lancedb"),
     ("logs", "logs"),
@@ -420,8 +416,6 @@ def build_storage_paths(data_dir: Path) -> StoragePaths:
     directory_paths = {name: data_dir / relative_path for name, relative_path in DIRECTORY_NAMES}
     return StoragePaths(
         data_dir=data_dir,
-        source_pdfs=directory_paths["source_pdfs"],
-        downloaded_pdfs=directory_paths["downloaded_pdfs"],
         ocr_pdfs=directory_paths["ocr_pdfs"],
         lancedb=directory_paths["lancedb"],
         logs=directory_paths["logs"],
@@ -585,8 +579,6 @@ def format_status_report(report: StorageStatusReport, *, data_dir: Path) -> str:
 
 def _directory_checks(paths: StoragePaths) -> tuple[tuple[str, Path], ...]:
     return (
-        ("source_pdfs", paths.source_pdfs),
-        ("downloaded_pdfs", paths.downloaded_pdfs),
         ("ocr_pdfs", paths.ocr_pdfs),
         ("lancedb", paths.lancedb),
         ("logs", paths.logs),

@@ -1,6 +1,6 @@
 # PDF sources and OCR recovery
 
-NewsRAG normally runs `ocrmypdf --skip-text --quiet` on a saved original PDF and extracts page text from the normalized result. Page numbers and citations keep their original, one-based order.
+NewsRAG retains original PDFs in the shared `artifacts/sources/` directory, alongside other source types. It normally runs `ocrmypdf --skip-text --quiet` on that saved original, writes the normalized output under `ocr-pdfs/`, and extracts page text from the normalized result. Page numbers and citations keep their original, one-based order.
 
 ## Extractor selection
 
