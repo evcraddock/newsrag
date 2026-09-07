@@ -6,8 +6,32 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-06
+
 ### Added
+- Added static HTML, plain-text, Markdown, DOCX, CSV, and XLSX source adapters alongside PDF, with source-native citations and shared retrieval, discovery, and packet generation.
+- Added exact tabular cell evidence, separately attributed headers/context, worksheet coordinates, merged-cell anchors, and stored formula-cache qualifications. Hidden spreadsheet content is excluded from new evidence; formulas are never executed.
+- Added source refresh with retained revision history and current/historical evidence selection.
+- Added saved-artifact reprocessing with versioned processing generations, recipe-aware retries, and preserved historical evidence.
 - Added inclusive UTC ingestion-date filters to `newsrag documents list` with `--ingested-since` and `--ingested-until`.
+- Added daemon progress logging and disposable CLI/daemon verification workflows.
+
+### Changed
+- Unified local-path and public HTTP(S) ingestion, including mixed-source directories and manifests, with validated source selection and bounded acquisition.
+- Added exact-byte duplicate identity and source/artifact provenance throughout inventory, search, discovery, and source packets.
+- Updated repository development commands to use a repo-local corpus.
+- Advanced corpus storage to schema 8 for source identity, revision history, processing generations, and shared tabular evidence.
+
+### Fixed
+- Recover existing text from the original PDF when OCRmyPDF exits with status 4; `auto` extraction also tries pdfplumber after primary-extractor errors. Failed recovery reports both stages with actionable guidance and never publishes partial OCR output.
+- Treat search terms as literal text rather than FTS syntax to prevent query crashes.
+- Preserve plain-text extraction limits during refresh and scope briefs and failed vector cleanup to their processing generation.
+
+### Upgrade notes
+- Stop old daemons before upgrading an existing corpus and back up the entire data directory, including SQLite, LanceDB, and saved artifacts. Do not mix old and new workers.
+- Storage initialization upgrades existing corpora automatically; many CLI commands and daemon startup initialize storage. There is no automatic downgrade, and SQLite/LanceDB changes are not one cross-store transaction.
+- Upgrades from schemas 1–4 reset regenerable discovery records. Upgrades from schemas 1–2 or unversioned corpora consolidate exact-byte duplicate documents. Migration does not automatically rerun OCR or generate new embeddings.
+- New or intentionally reset corpora initialize directly at schema 8. See [reprocessing and upgrade guidance](docs/reprocessing.md) and [PDF recovery](docs/pdf.md).
 
 ## [0.4.0] - 2026-09-02
 
