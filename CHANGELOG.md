@@ -6,11 +6,18 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-07
+
 ### Changed
-- Generated PDF outputs now use format-neutral `artifacts/derived/<processing-generation-id>/` storage. Initialization safely copies and verifies legacy OCR files before reconciling active/historical references, including legacy absolute paths, without deleting old copies. See [upgrade and recovery](docs/derived-artifacts.md).
+- Store generated PDF outputs in `artifacts/derived/<processing-generation-id>/`.
+- Safely migrate legacy OCR references using verified copies, preserving historical evidence, citations, and legacy files.
 
 ### Fixed
-- Removed obsolete `source-pdfs/` and `downloaded-pdfs/` directories from storage initialization and health checks. PDF originals use `artifacts/sources/`.
+- Stop creating or requiring obsolete `source-pdfs/` and `downloaded-pdfs/` directories. Originals remain in `artifacts/sources/`.
+
+### Upgrade notes
+- Stop old workers and back up the entire corpus before upgrading.
+- Initialization performs the transition automatically. Allow space for retained legacy files and new copies; follow the documented [recovery steps](docs/derived-artifacts.md) if interrupted.
 
 ## [0.5.0] - 2026-09-06
 
