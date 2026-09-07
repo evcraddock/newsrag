@@ -47,6 +47,8 @@ def smoke(scratch: Path, port: int, source_pdf: Path | None) -> None:
     shim.write_text(
         f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
         "if '--version' in sys.argv:\n    print('disposable exit-code smoke runner')\n    sys.exit(0)\n"
+        f"if Path({str(code_file)!r}).read_text() == '0':\n"
+        "    Path(sys.argv[-1]).write_bytes(Path(sys.argv[-2]).read_bytes())\n    sys.exit(0)\n"
         "Path(sys.argv[-1]).write_bytes(b'PARTIAL OCR OUTPUT MUST NOT BE INDEXED')\n"
         "sys.stderr.write('simulated OCR validation failure\\n')\n"
         f"sys.exit(int(Path({str(code_file)!r}).read_text()))\n"
@@ -93,7 +95,8 @@ def smoke(scratch: Path, port: int, source_pdf: Path | None) -> None:
         assert "source_pdfs:" not in status and "downloaded_pdfs:" not in status
         assert not (data / "source-pdfs").exists()
         assert not (data / "downloaded-pdfs").exists()
-        assert (data / "ocr-pdfs").is_dir()
+        assert not (data / "ocr-pdfs").exists()
+        assert (data / "artifacts" / "derived").is_dir()
     started = False
     try:
         subprocess.run(
@@ -166,8 +169,43 @@ def smoke(scratch: Path, port: int, source_pdf: Path | None) -> None:
         assert rows(
             "SELECT COUNT(*) FROM source_units WHERE normalized_text LIKE '%PARTIAL OCR OUTPUT%'"
         ) == [(0,)]
+        # Deterministic successful normalization also exercises every derived-output writer.
+        code_file.write_text("0")
+        normalized_source = scratch / "normalized.pdf"
+        make_pdf(normalized_source, "Council approved shared artifact storage.")
+        original_bytes = normalized_source.read_bytes()
+        run("ingest", str(normalized_source))
+        wait_jobs(allow_failure=True)
+        normalized_document, normalized_source_id, stored = rows(
+            "SELECT d.id, a.source_id, a.stored_path FROM documents d "
+            "JOIN source_artifacts a ON a.id = d.artifact_id WHERE d.source_path = ?",
+            (str(normalized_source),),
+        )[0]
+        assert Path(stored).parent == data / "artifacts" / "sources"
+        assert Path(stored).read_bytes() == original_bytes
+        normalized_source.unlink()
+        run("reprocess", normalized_document, "--pdf-extractor", "pdfplumber")
+        wait_jobs(allow_failure=True)
+        assert rows(
+            "SELECT COUNT(*) FROM processing_generations WHERE document_id = ?",
+            (normalized_document,),
+        ) == [(2,)]
+        make_pdf(normalized_source, "Council refreshed shared artifact storage.")
+        run("refresh", normalized_source_id)
+        wait_jobs(allow_failure=True)
+        normalized_outputs = rows(
+            "SELECT id, normalized_path FROM processing_generations WHERE normalized_path IS NOT NULL"
+        )
+        assert len(normalized_outputs) == 3
+        for generation, reference in normalized_outputs:
+            output = Path(reference)
+            assert output.parent == data / "artifacts" / "derived" / generation
+            assert output.read_bytes() in (original_bytes, normalized_source.read_bytes())
+        assert Path(stored).read_bytes() == original_bytes
+        assert not (data / "ocr-pdfs").exists()
         print(
-            "PDF fallback smoke passed: auto/pdfplumber, original provenance, citations/packets, duplicates, saved-byte reprocessing, atomic empty-text failure, non-4 rejection and retry."
+            "PDF smoke passed: fallback/retry, citations/packets, duplicates, saved-byte reprocessing, "
+            "and successful normalized ingestion/reprocessing/refresh in shared generation storage."
         )
     finally:
         socket = scratch / ".overmind.sock"

@@ -868,7 +868,7 @@ class IngestionPipeline:
                         ),
                         source_url=decision.document_source_url,
                         acquired_at=decision.acquired_at,
-                        work_dir=self.storage_paths.ocr_pdfs,
+                        work_dir=self.storage_paths.derived_artifacts,
                         metadata=document_metadata,
                         adapter_options=(
                             {"csv": normalize_csv_options(job.payload.get("csv", {}))}

@@ -36,12 +36,12 @@ The required corpus layout is:
 newsrag.sqlite3
 artifacts/sources/    # retained originals for every source type, including PDF
 artifacts/staging/    # temporary acquisition/processing inputs
-ocr-pdfs/            # derived normalized/OCR PDFs
+artifacts/derived/    # generated outputs, isolated by processing generation
 lancedb/             # vector indexes
 logs/                # operational logs
 ```
 
-Initialization and health checks do not create or require separate `source-pdfs/` or `downloaded-pdfs/` directories. Original PDFs use `artifacts/sources/`; `ocr-pdfs/` remains the location for normalized output.
+Initialization and health checks do not create or require separate `source-pdfs/`, `downloaded-pdfs/`, or `ocr-pdfs/` directories. Original PDFs use `artifacts/sources/`; normalized outputs use `artifacts/derived/<processing-generation-id>/`. Existing legacy OCR references are reconciled by a copy-and-verify transition that retains old files for saved packets. See [derived storage upgrade and recovery](derived-artifacts.md).
 
 Configuration is user-global, for example `~/.config/newsrag/config.yaml`. The global config stores daemon settings, embedding provider/model defaults, watched folder registrations, and user-level defaults. CLI flags can override config values for a specific command.
 

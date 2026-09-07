@@ -1,6 +1,8 @@
 # PDF sources and OCR recovery
 
-NewsRAG retains original PDFs in the shared `artifacts/sources/` directory, alongside other source types. It normally runs `ocrmypdf --skip-text --quiet` on that saved original, writes the normalized output under `ocr-pdfs/`, and extracts page text from the normalized result. Page numbers and citations keep their original, one-based order.
+NewsRAG retains original PDFs in the shared `artifacts/sources/` directory, alongside other source types. It normally runs `ocrmypdf --skip-text --quiet` on that saved original, writes the normalized output under `artifacts/derived/<processing-generation-id>/`, and extracts page text from the normalized result. Page numbers and citations keep their original, one-based order.
+
+Existing corpora retain their legacy normalized outputs while initialization copies and reconciles references into shared derived storage. Stop old workers and back up the corpus before upgrading; see [derived artifact upgrade and recovery](derived-artifacts.md).
 
 ## Extractor selection
 
@@ -43,6 +45,6 @@ Failed attempts do not publish partial document evidence. Reprocessing preserves
 
 ## Disposable smoke verification
 
-`uv run python scripts/smoke_pdf_fallback.py` starts the real CLI/daemon using `make dev`, a temporary corpus/configuration, an isolated Overmind socket, and localhost mock embeddings. A private OCR command shim deterministically emits statuses 4 and 5; PyMuPDF and pdfplumber remain real. It exercises extraction, page citations, packets, duplicate handling, saved-byte reprocessing, empty-text atomic failure, non-4 rejection, and retry recovery. It does not touch installed corpora/services.
+`uv run python scripts/smoke_pdf_fallback.py` starts the real CLI/daemon using `make dev`, a temporary corpus/configuration, an isolated Overmind socket, and localhost mock embeddings. A private OCR command shim deterministically emits statuses 4 and 5 and can copy the original PDF to simulate successful normalization; PyMuPDF and pdfplumber remain real. It exercises extraction, page citations, packets, duplicate handling, saved-byte reprocessing, empty-text atomic failure, non-4 rejection, and retry recovery. It also verifies successful normalized ingestion, saved-byte reprocessing, and refresh use shared generation storage without changing retained originals. It does not touch installed corpora/services.
 
 Optionally pass `--source-pdf /path/to/agenda.pdf` to exercise the same exit-4 recovery with an additional real PDF. This injects the normalization failure for repeatability; it does not assert that the current installed OCRmyPDF naturally fails on that file.

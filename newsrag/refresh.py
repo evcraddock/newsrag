@@ -287,7 +287,7 @@ class RefreshPipeline:
                     media_type=media_type,
                     source_url=source_url,
                     acquired_at=str(artifact["acquired_at"]),
-                    work_dir=self.ingestion.storage_paths.ocr_pdfs,
+                    work_dir=self.ingestion.storage_paths.derived_artifacts,
                     metadata=metadata,
                     adapter_options=options,
                     user_metadata=base["user_metadata"],

@@ -36,13 +36,16 @@ from newsrag.jobs import (
     mark_job_failed,
     retry_failed_job,
 )
+from newsrag.packets import load_packet_source_provenance
+from newsrag.refresh import REFRESH_JOB_KIND, RefreshPipeline, enqueue_refresh
 from newsrag.reprocess import (
     REPROCESS_JOB_KIND,
     ReprocessingError,
     ReprocessingPipeline,
     enqueue_reprocessing,
 )
-from newsrag.search import LanceDbPassageVectorStore
+from newsrag.search import LanceDbPassageVectorSearcher, LanceDbPassageVectorStore, SearchEngine
+from newsrag.source_locations import resolve_source_range
 from newsrag.storage import StoragePaths, initialize_storage
 
 
@@ -684,9 +687,123 @@ def test_pdf_normalized_outputs_are_isolated_by_generation(corpus: Corpus) -> No
         )[0][0]
     )
     assert old_path != new_path
-    assert old_generation in old_path.parts
-    assert new_generation in new_path.parts
+    assert old_path.parent == corpus.paths.derived_artifacts / old_generation
+    assert new_path.parent == corpus.paths.derived_artifacts / new_generation
+    assert not (corpus.paths.data_dir / "ocr-pdfs").exists()
     assert old_path.read_bytes() == new_path.read_bytes()
+
+
+def test_legacy_transition_preserves_pdf_citations_and_saved_artifact_reprocessing(
+    corpus: Corpus,
+) -> None:
+    engine = SearchEngine(
+        database_path=corpus.paths.database,
+        vector_searcher=LanceDbPassageVectorSearcher(corpus.paths.lancedb),
+        vector_store=LanceDbPassageVectorStore(corpus.paths.lancedb),
+        embedding_provider=corpus.embeddings,
+    )
+    historical = engine.search("preserved evidence")
+    corpus.embeddings.metadata = EmbeddingMetadata("fake", "model", "2")
+    assert corpus.rebuild().status == "done"
+    current = engine.search("preserved evidence")
+    assert historical and current
+    assert historical[0].processing_generation_id != current[0].processing_generation_id
+    # Represent a pre-upgrade corpus with real published PDF evidence and old packet paths.
+    legacy_paths = []
+    with sqlite3.connect(corpus.paths.database) as connection:
+        for generation, reference in connection.execute(
+            "SELECT id, normalized_path FROM processing_generations"
+        ).fetchall():
+            path = Path(reference)
+            legacy = corpus.paths.data_dir / "ocr-pdfs" / generation / path.name
+            legacy.parent.mkdir(parents=True)
+            path.rename(legacy)
+            legacy_paths.append(legacy)
+            connection.execute(
+                "UPDATE processing_generations SET normalized_path = ? WHERE id = ?",
+                (str(legacy), generation),
+            )
+            connection.execute(
+                "UPDATE documents SET normalized_path = ? WHERE normalized_path = ?",
+                (str(legacy), reference),
+            )
+    tables = (
+        "sources",
+        "source_artifacts",
+        "source_revisions",
+        "source_units",
+        "pages",
+        "chunks",
+        "passages",
+        "chunks_fts",
+        "passages_fts",
+        "embedding_records",
+    )
+    before = {table: corpus.rows(f"SELECT * FROM {table}") for table in tables}
+    original = Path(corpus.rows("SELECT stored_path FROM source_artifacts")[0][0])
+    original_bytes = original.read_bytes()
+    old_provenance = load_packet_source_provenance(corpus.paths.database, historical)[
+        corpus.document_id
+    ]
+
+    initialize_storage(corpus.paths.data_dir)
+
+    assert before == {table: corpus.rows(f"SELECT * FROM {table}") for table in tables}
+    assert engine.search("preserved evidence") == current
+    for results in (historical, current):
+        provenance = load_packet_source_provenance(corpus.paths.database, results)[
+            corpus.document_id
+        ]
+        assert provenance.processing_generation_id == results[0].processing_generation_id
+        assert provenance.normalized_path is not None
+        assert Path(provenance.normalized_path).parent == corpus.paths.derived_artifacts / str(
+            provenance.processing_generation_id
+        )
+        assert Path(provenance.normalized_path).read_bytes() == original_bytes
+        with sqlite3.connect(corpus.paths.database) as connection:
+            resolved = resolve_source_range(
+                connection,
+                document_id=corpus.document_id,
+                source_unit_start_id=str(results[0].source_unit_start_id),
+                source_unit_end_id=str(results[0].source_unit_end_id),
+                processing_generation_id=results[0].processing_generation_id,
+            )
+        assert results[0].citation == f"{results[0].title} — {resolved.location_label}"
+        assert resolved.text == results[0].text
+    assert old_provenance.normalized_path is not None
+    assert Path(old_provenance.normalized_path).read_bytes() == original_bytes
+    assert all(path.read_bytes() == original_bytes for path in legacy_paths)
+    assert original.parent == corpus.paths.source_artifacts
+    assert original.read_bytes() == original_bytes
+    corpus.source_path.unlink()
+    corpus.ingestion.acquirer = ExplodingAcquirer()
+    assert corpus.rebuild(pdf_extractor="pdfplumber").status == "done"
+    assert original.read_bytes() == original_bytes
+
+
+def test_pdf_refresh_writes_shared_generation_output_and_keeps_original(corpus: Corpus) -> None:
+    original = Path(corpus.rows("SELECT stored_path FROM source_artifacts")[0][0])
+    original_bytes = original.read_bytes()
+    old_generation = _generation(corpus)
+    corpus.source_path.write_bytes(b"%PDF-1.4\nrefreshed PDF evidence")
+    corpus.runner.handlers[REFRESH_JOB_KIND] = RefreshPipeline(corpus.ingestion).handle_job
+    completed = corpus.run(enqueue_refresh(corpus.paths.database, corpus.source_id))
+    assert completed.status == "done", completed.error
+    outputs = corpus.rows("SELECT id, normalized_path FROM processing_generations")
+    assert len(outputs) == 2
+    for generation, reference in outputs:
+        output = Path(reference)
+        assert output.parent == corpus.paths.derived_artifacts / generation
+        expected = (
+            original_bytes if generation == old_generation else corpus.source_path.read_bytes()
+        )
+        assert output.read_bytes() == expected
+    assert original.read_bytes() == original_bytes
+    assert not (corpus.paths.data_dir / "ocr-pdfs").exists()
+    assert all(
+        Path(row[0]).parent == corpus.paths.source_artifacts
+        for row in corpus.rows("SELECT stored_path FROM source_artifacts")
+    )
 
 
 def test_committed_receipt_survives_late_failure_acknowledgement_and_replay(

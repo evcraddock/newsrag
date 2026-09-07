@@ -9,6 +9,11 @@ from pathlib import Path
 import lancedb  # type: ignore[import-untyped]
 import pyarrow as pa
 
+from newsrag.derived_artifacts import (
+    DerivedArtifactError,
+    inspect_derived_transition,
+    transition_derived_artifacts,
+)
 from newsrag.jobs import DONE, FAILED, PENDING, RUNNING
 from newsrag.passages import build_passage_rows
 from newsrag.sources import (
@@ -29,7 +34,7 @@ class StoragePaths:
     """Resolved storage paths for one NewsRAG data directory."""
 
     data_dir: Path
-    ocr_pdfs: Path
+    derived_artifacts: Path
     lancedb: Path
     logs: Path
     artifacts: Path
@@ -71,7 +76,7 @@ class StorageStatusReport:
 
 
 DIRECTORY_NAMES: tuple[tuple[str, str], ...] = (
-    ("ocr_pdfs", "ocr-pdfs"),
+    ("derived_artifacts", "artifacts/derived"),
     ("lancedb", "lancedb"),
     ("logs", "logs"),
     ("artifacts", "artifacts"),
@@ -416,7 +421,7 @@ def build_storage_paths(data_dir: Path) -> StoragePaths:
     directory_paths = {name: data_dir / relative_path for name, relative_path in DIRECTORY_NAMES}
     return StoragePaths(
         data_dir=data_dir,
-        ocr_pdfs=directory_paths["ocr_pdfs"],
+        derived_artifacts=directory_paths["derived_artifacts"],
         lancedb=directory_paths["lancedb"],
         logs=directory_paths["logs"],
         artifacts=directory_paths["artifacts"],
@@ -443,6 +448,10 @@ def initialize_storage(data_dir: Path) -> StoragePaths:
         _delete_orphan_document_vectors(paths.database, paths.lancedb)
         _backfill_vector_source_unit_ranges(paths.database, paths.lancedb)
     _set_schema_version(paths.database)
+    try:
+        transition_derived_artifacts(paths.database, paths.data_dir, paths.derived_artifacts)
+    except DerivedArtifactError as exc:
+        raise StorageError(f"Cannot complete derived artifact transition: {exc}") from exc
     return paths
 
 
@@ -511,6 +520,10 @@ def get_storage_status(data_dir: Path) -> StorageStatusReport:
         checks.append(StorageCheck("database", "ok", f"schema ready at {paths.database}"))
         checks.append(_job_queue_check(paths.database))
         checks.append(_watcher_health_check(paths.database))
+        transition_status, transition_detail = inspect_derived_transition(
+            paths.database, paths.data_dir, paths.derived_artifacts
+        )
+        checks.append(StorageCheck("derived_transition", transition_status, transition_detail))
 
     return StorageStatusReport(checks=tuple(checks))
 
@@ -579,7 +592,7 @@ def format_status_report(report: StorageStatusReport, *, data_dir: Path) -> str:
 
 def _directory_checks(paths: StoragePaths) -> tuple[tuple[str, Path], ...]:
     return (
-        ("ocr_pdfs", paths.ocr_pdfs),
+        ("derived_artifacts", paths.derived_artifacts),
         ("lancedb", paths.lancedb),
         ("logs", paths.logs),
         ("artifacts", paths.artifacts),

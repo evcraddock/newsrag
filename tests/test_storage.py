@@ -32,7 +32,9 @@ def test_initialize_storage_creates_layout_and_schema(tmp_path: Path) -> None:
     assert paths.data_dir == data_dir
     assert not (data_dir / "source-pdfs").exists()
     assert not (data_dir / "downloaded-pdfs").exists()
-    assert paths.ocr_pdfs.is_dir()
+    assert not (data_dir / "ocr-pdfs").exists()
+    assert paths.derived_artifacts == data_dir / "artifacts" / "derived"
+    assert paths.derived_artifacts.is_dir()
     assert paths.lancedb.is_dir()
     assert paths.logs.is_dir()
     assert paths.artifacts.is_dir()
@@ -46,7 +48,7 @@ def test_initialize_storage_is_idempotent(tmp_path: Path) -> None:
     data_dir = tmp_path / ".newsrag"
 
     first_paths = initialize_storage(data_dir)
-    ocr_output = first_paths.ocr_pdfs / "normalized.pdf"
+    ocr_output = first_paths.derived_artifacts / "normalized.pdf"
     ocr_output.write_bytes(b"existing normalized output")
     second_paths = initialize_storage(data_dir)
 
@@ -1395,7 +1397,8 @@ def test_status_command_reports_storage_health(tmp_path: Path) -> None:
     assert "source_pdfs:" not in third_result.stdout
     assert "downloaded_pdfs:" not in third_result.stdout
     assert "source_artifacts: ok" in third_result.stdout
-    assert "ocr_pdfs: ok" in third_result.stdout
+    assert "ocr_pdfs:" not in third_result.stdout
+    assert "derived_artifacts: ok" in third_result.stdout
     assert "jobs: ok" in third_result.stdout
     assert "watcher: ok" in third_result.stdout
     assert "summary: ok" in third_result.stdout

@@ -160,6 +160,8 @@ newsrag jobs retry <failed-job-id>
 
 Reprocessing retains old citation anchors and stages a complete replacement processing generation before making it active. Unchanged processing fingerprints produce a verified no-op. Failed runs leave existing searchable evidence intact; retries retain their saved configuration and base generation. See [Reprocessing](docs/reprocessing.md) for batch limits, compatible embedding models, and recovery behavior.
 
+Generated outputs now use `artifacts/derived/<processing-generation-id>/`, separate from retained originals in `artifacts/sources/`. Existing `ocr-pdfs/` references transition automatically during initialization using verified copies and transactional reference updates; legacy files are retained. Back up the entire corpus and follow [derived storage upgrade/recovery steps](docs/derived-artifacts.md) before upgrading.
+
 Stop all old daemons before upgrading a corpus to schema 8, then restart them using the new version. Migration preserves existing document and citation IDs, source history, and derived evidence. Legacy descriptive metadata is inherited conservatively; unknown legacy processing configurations are marked explicitly rather than invented.
 
 List documents ingested during an inclusive UTC calendar-date range:
