@@ -6,6 +6,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Fixed
+- Removed obsolete `source-pdfs/` and `downloaded-pdfs/` directories from storage initialization and health checks. PDF originals use `artifacts/sources/`; `ocr-pdfs/` remains unchanged.
+
 ## [0.5.0] - 2026-09-06
 
 ### Added

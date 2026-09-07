@@ -30,6 +30,19 @@ newsrag jobs retry <job-id>
 
 NewsRAG uses configurable local storage with a data directory defaulting to the user data directory (`$XDG_DATA_HOME/newsrag`, or `~/.local/share/newsrag` when `XDG_DATA_HOME` is unset). A user can override the active data directory with a CLI flag or configured default for a separate corpus. The data directory contains the corpus-local SQLite database, LanceDB vector index directory, immutable content-addressed source artifacts, OCR-normalized PDFs, processing artifacts, and local logs relevant to that corpus.
 
+The required corpus layout is:
+
+```text
+newsrag.sqlite3
+artifacts/sources/    # retained originals for every source type, including PDF
+artifacts/staging/    # temporary acquisition/processing inputs
+ocr-pdfs/            # derived normalized/OCR PDFs
+lancedb/             # vector indexes
+logs/                # operational logs
+```
+
+Initialization and health checks do not create or require separate `source-pdfs/` or `downloaded-pdfs/` directories. Original PDFs use `artifacts/sources/`; `ocr-pdfs/` remains the location for normalized output.
+
 Configuration is user-global, for example `~/.config/newsrag/config.yaml`. The global config stores daemon settings, embedding provider/model defaults, watched folder registrations, and user-level defaults. CLI flags can override config values for a specific command.
 
 The daemon is global and may manage many data directories over time. Search behavior for multiple corpora is deferred until there is more than one corpus in active use; MVP search targets the selected/current data directory.
