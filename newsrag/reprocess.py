@@ -251,7 +251,7 @@ class ReprocessingPipeline:
                         media_type=input_media_type,
                         source_url=document["source_url"],
                         acquired_at=str(document["acquired_at"]),
-                        work_dir=self.ingestion.storage_paths.ocr_pdfs,
+                        work_dir=self.ingestion.storage_paths.derived_artifacts,
                         metadata=json.loads(document["metadata_json"]),
                         adapter_options=options,
                         user_metadata=json.loads(document["user_metadata_json"] or "{}"),
